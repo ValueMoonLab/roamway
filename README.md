@@ -293,8 +293,8 @@ roamway 不做联邦：一台机器一个 daemon，各自监听端口，跨机�
 roamway serve --bind 0.0.0.0:8796 --token T
 
 # B 机派活到 A
-roamway run --host http://10.0.0.5:8796 --token T \
-  --agent codex --workspace /srv/repo "跑一下测试"
+roamway run --host http://192.168.1.50:8796 --token T \
+  --agent codex --workspace /srv/repo "跑一下测试"   # 192.168.1.50 换成你的 daemon 地址
 ```
 
 哪台机器有数据、有 GPU、有专用凭据，就把 daemon 放哪台。公网暴露请放在 TLS 反代后面。
