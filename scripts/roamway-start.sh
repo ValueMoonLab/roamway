@@ -8,5 +8,5 @@ LOG="${ROAMWAY_LOG:-$HOME/.roamway/serve.log}"
 
 pgrep -f "roamway serve --bind $BIND" >/dev/null && exit 0
 mkdir -p "$DATA"
-[ -n "$TOKEN" ] && set -- --token "$TOKEN"
+[ -n "$TOKEN" ] && export ROAMWAY_TOKEN="$TOKEN"
 setsid nohup "$BIN" serve --bind "$BIND" --data "$DATA" "$@" >>"$LOG" 2>&1 </dev/null &

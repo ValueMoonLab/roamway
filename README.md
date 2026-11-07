@@ -305,7 +305,7 @@ roamway run --host http://192.168.1.50:8796 --token T \
 - token 走明文 HTTP，只适合可信内网；公网请套 TLS 反代（Caddy / Nginx / frp + TLS 都行）。
 - 没设 token 时**任何人都能派活**，只在完全隔离的环境里这么用。
 - `codex` 默认 `workspace-write` 沙箱。加 `--dangerously-bypass-approvals-and-sandbox` 等于把整台机器交给模型，别在有重要数据的主机上这么干。
-- token 会出现在进程命令行里；systemd 部署建议用 `Environment=` 或 `EnvironmentFile=`。
+- `--token` 会把 token 写进进程命令行（`ps` 可见）。长期部署请用 `ROAMWAY_TOKEN` 环境变量或 `EnvironmentFile=`，`scripts/roamway-start.sh` 已按这种方式处理。
 - 数据目录里有全量日志，按需 `chmod 700`。
 
 ## 和 Paseo 的差别
