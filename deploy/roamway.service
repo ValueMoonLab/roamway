@@ -1,0 +1,18 @@
+[Unit]
+Description=roamway multi-agent orchestrator
+After=network-online.target
+
+[Service]
+User=roamway
+Group=roamway
+Environment=ROAMWAY_TOKEN=change-me
+Environment=PATH=/home/roamway/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/local/bin/roamway serve --bind 127.0.0.1:8796 --data /var/lib/roamway
+Restart=always
+RestartSec=5
+LimitNOFILE=8192
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+[package]
+name = "roamway"
+version = "0.1.0"
+edition = "2021"
+description = "Mini multi-agent orchestrator for domestic LLM CLIs, designed for long-running unattended operation"
+
+[[bin]]
+name = "roamway"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json"] }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true
