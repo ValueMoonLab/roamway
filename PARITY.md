@@ -11,7 +11,7 @@
 | # | Paseo 命令 | 作用 | roamway | 差距 / 目标 | 阶段 |
 |---|---|---|---|---|---|
 | 1 | `paseo host` | Manage hosts connected to the selected | ❌ | 主机注册表：add/ls/rm/enable/disable | P2 |
-| 2 | `paseo host ls` | List saved hosts, including disabled and | ❌ | 主机 + 在线状态 + 重连字段 | P2 |
+| 2 | `paseo host ls` | List saved hosts, including disabled and | ✅ | 注册表 + 探测 + 退避 + token 掩码；实测 online/error/skipped/自动恢复 | P2 |
 | 3 | `paseo ls` | List agents. By default excludes archived | ⚠️ | 只列 run，不含 agent 概念/归档过滤；P3 改为 agent 维度 | P1 |
 | 4 | `paseo run` | Create and start an agent with a task | ⚠️ | 已支持 prompt/agent/timeout/workspace；缺 provider 指定、会话续跑、worktree 隔离 | P1 |
 | 5 | `paseo import` | Import an existing provider session as a | ❌ | 导入已有 provider 会话（依赖会话持久化） | P3 |
@@ -21,12 +21,12 @@
 | 9 | `paseo inspect` | Show detailed information about an agent | ❌ | agent 详情 | P3 |
 | 10 | `paseo wait` | Wait for an agent to become idle | ❌ | 等待进入 idle | P3 |
 | 11 | `paseo archive` | Archive an agent (soft-delete) | ❌ | 归档 agent（软删除） | P3 |
-| 12 | `paseo onboard` | Run first-time setup, start daemon, and | ❌ | 首次引导 + 起 daemon + 打印配对信息 | P2 |
+| 12 | `paseo onboard` | Run first-time setup, start daemon, and | ✅ | 生成 token + 前台/后台/crontab/host add 四段命令 | P2 |
 | 13 | `paseo start` | Start the local daemon from persistent | ⚠️ | `serve` 等价；缺持久化配置驱动的 `start` | P1 |
 | 14 | `paseo hooks` | Record agent hook activity | ❌ | 记录 agent hook 事件 | P5 |
 | 15 | `paseo status` | Observe the selected daemon and its | ⚠️ | `roamway status` 只看本机；缺 supervisor/endpoint 探测 | P1 |
-| 16 | `paseo restart` | Restart the selected daemon worker, | ❌ | 需 supervisor（systemd/LaunchAgent/cron）配合 | P2 |
-| 17 | `paseo reload` | Reload config.json without restarting | ❌ | 热加载 config 不重启 | P2 |
+| 16 | `paseo restart` | Restart the selected daemon worker, | ✅ | = daemon restart | P2 |
+| 17 | `paseo reload` | Reload config.json without restarting | ✅ | = daemon reload（重读 hosts.json） | P2 |
 | 18 | `paseo pair` | Print the daemon pairing QR code and link | ❌ | 配对二维码/链接（对应 ECDH 配对） | P6 |
 | 19 | `paseo agent` | Manage agents (advanced operations) | ❌ | agent 子命令族 | P3 |
 | 20 | `paseo agent ls` | List agents. By default excludes archived | ❌ | 按 agent 维度列出（含归档） | P3 |
@@ -42,14 +42,14 @@
 | 30 | `paseo agent detach` | Make a subagent independent without stopping or | ❌ | subagent 转独立 agent 不中断 | P3 |
 | 31 | `paseo agent update` | Update an agent's settings or metadata | ❌ | 更新设置/元数据 | P3 |
 | 32 | `paseo daemon` | Manage the Paseo daemon | ❌ | daemon 子命令族 | P2 |
-| 33 | `paseo daemon start` | Start the local daemon from persistent configuration | ❌ | 从配置拉起 | P2 |
+| 33 | `paseo daemon start` | Start the local daemon from persistent configuration | ✅ | 后台拉起 + pid 文件 + bind 落盘 | P2 |
 | 34 | `paseo daemon run` | Run a local daemon in the foreground with deployment | ⚠️ | `serve` 前台运行已具备，缺部署参数集 | P2 |
-| 35 | `paseo daemon status` | Observe the selected daemon and its published | ⚠️ | 本地健康有；缺已发布端点观测 | P2 |
-| 36 | `paseo daemon stop` | Stop the selected daemon | ❌ | 优雅停止（SIGTERM + 子进程回收） | P2 |
+| 35 | `paseo daemon status` | Observe the selected daemon and its published | ✅ | 读 pid/bind，无 pid 报 offline；--json | P2 |
+| 36 | `paseo daemon stop` | Stop the selected daemon | ✅ | SIGTERM/taskkill + 端口释放校验 | P2 |
 | 37 | `paseo daemon restart` | Restart the selected daemon worker, retaining its | ❌ | 重启 worker，保留 supervisor 启动 | P2 |
 | 38 | `paseo daemon reload` | Reload config.json without restarting | ❌ | 重载 config | P2 |
 | 39 | `paseo daemon pair` | Print the daemon pairing QR code and link | ❌ | 配对信息输出 | P6 |
-| 40 | `paseo daemon config` | Read or edit persistent local configuration (local | ❌ | 读写持久化配置 | P2 |
+| 40 | `paseo daemon config` | Read or edit persistent local configuration (local | ✅ | 打印数据目录/hosts.json/并发/版本 | P2 |
 | 41 | `paseo daemon set-password` | Save a hashed daemon password (local operation) | ❌ | 密码哈希存储 | P6 |
 | 42 | `paseo hub` | Manage Paseo Hub | ❌ | Hub 族 | P9 |
 | 43 | `paseo hub init` | Create and optionally deploy a safe starter Hub | ❌ | starter Hub | P9 |
@@ -148,6 +148,6 @@
 
 ## 五、当前整体完成度
 
-- CLI：**96 条中 ✅1 / ⚠️11 / ❌84**，即约 **1% 完全对齐、12.5% 可用**。
+- CLI：**96 条中 ✅9 / ⚠️10 / ❌77**，即约 **9.4% 完全对齐、19.8% 可用**。
 - 非 CLI：12 项里 **0 项对齐**，2 项部分（日志、调度语义）。
 - 结论：**作为 Paseo 的替代品，目前不成立**；P1 完成（正确性）后从 P2 开始按阶段推进。

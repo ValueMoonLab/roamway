@@ -1,3 +1,4 @@
+use crate::hosts;
 use crate::jobs;
 use crate::types::*;
 use serde::Deserialize;
@@ -13,7 +14,30 @@ use std::time::{Duration, Instant};
 
 pub fn serve(app: Arc<App>, bind: &str) -> std::io::Result<()> {
     let listener = TcpListener::bind(bind)?;
-    println!("roamway listening on http://{}", bind);
+    let actual = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| bind.to_string());
+    let data_dir = {
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        st.dir.clone()
+    };
+    let _ = std::fs::create_dir_all(&data_dir);
+    if let Err(e) = std::fs::write(data_dir.join("bind"), format!("{}\n", actual)) {
+        eprintln!("roamway: write bind failed: {}", e);
+    }
+    if let Some(t) = app.token.as_deref().filter(|t| !t.is_empty()) {
+        let token_path = data_dir.join("token");
+        if let Err(e) = std::fs::write(&token_path, format!("{}\n", t)) {
+            eprintln!("roamway: write token failed: {}", e);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    println!("roamway listening on http://{}", actual);
     for s in listener.incoming() {
         match s {
             Ok(stream) => {
@@ -313,6 +337,7 @@ fn route(app: &Arc<App>, req: &Req) -> (u16, Value) {
     match (m, segs.as_slice()) {
         ("GET", ["health"]) => (200, health(app)),
         ("GET", ["v1", "health"]) => (200, v1_health(app)),
+        ("GET", ["v1", "hosts"]) => list_hosts(app),
         ("GET", ["v1", "runs"]) => list_runs(app, req),
         ("POST", ["v1", "runs"]) => create_run(app, req),
         ("GET", ["v1", "runs", id]) => get_run(app, id),
@@ -351,6 +376,38 @@ fn route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         }
         _ => (404, json!({"error": "not found", "path": req.path})),
     }
+}
+
+fn list_hosts(app: &Arc<App>) -> (u16, Value) {
+    let dir = {
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        st.dir.clone()
+    };
+    let reg = hosts::Registry::load(&dir);
+    let hosts: Vec<Value> = reg
+        .hosts
+        .iter()
+        .map(|h| {
+            json!({
+                "id": h.id,
+                "name": h.name,
+                "endpoint": h.endpoint,
+                "token": hosts::mask(&h.token),
+                "enabled": h.enabled,
+                "created_at": h.created_at,
+                "last_probe": h.last_probe.as_ref().map(|p| json!({
+                    "at": p.at,
+                    "ok": p.ok,
+                    "latency_ms": p.latency_ms,
+                    "version": p.version,
+                    "error": p.error,
+                })),
+                "failures": h.failures,
+                "next_retry_at": h.next_retry_at,
+            })
+        })
+        .collect();
+    (200, json!({ "hosts": hosts }))
 }
 
 fn health(app: &Arc<App>) -> Value {

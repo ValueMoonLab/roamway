@@ -1,3 +1,4 @@
+mod hosts;
 mod jobs;
 mod runner;
 mod server;
@@ -6,30 +7,38 @@ mod types;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use types::*;
 
-const BOOLS: &[&str] = &["no-wait", "quiet", "json", "allow-overlap", "disabled", "help"];
+const BOOLS: &[&str] = &["no-wait", "quiet", "json", "allow-overlap", "disabled", "help", "force", "probe"];
 
 fn usage() {
     println!(
         r#"roamway {} — 迷你多智能体编排器（国内模型 / 长跑友好）
 
   roamway serve  [--bind 127.0.0.1:8796] [--data DIR] [--token T] [--tz 8] [--max-concurrent 4] [--max-conn 64]
-  roamway run    --agent codex [--model M] [--workspace DIR] [--title T] [--timeout 1800] [--no-wait] "prompt"
-  roamway ls     [--limit 20]
-  roamway status ID
-  roamway logs   ID [--tail 80]
-  roamway stop   ID
+  roamway run    --agent codex [--model M] [--workspace DIR] [--title T] [--timeout 1800] [--no-wait] [--host H] "prompt"
+  roamway ls     [--limit 20] [--host H|all]
+  roamway status ID [--host H]
+  roamway logs   ID [--tail 80] [--host H]
+  roamway stop   ID [--host H]
   roamway rm     ID
   roamway jobs
   roamway jobs-add --agent shell --every 3600 | --daily 08:30 [--model M] [--workspace DIR] [--max-retries 2] "prompt"
   roamway jobs-run ID
   roamway jobs-rm  ID
   roamway health
+  roamway host add <name> --endpoint <ep> [--token T] [--force]
+  roamway host ls [--probe] [--json]
+  roamway host rm <name> | host enable|disable <name> | host probe <name>
+  roamway daemon status|config|start|stop|restart|reload|pair
+  roamway onboard [--bind 0.0.0.0:8796]
+  roamway restart | reload
 
 通用参数：--host http://127.0.0.1:8796  --token T
 环境变量：ROAMWAY_HOST / ROAMWAY_TOKEN / ROAMWAY_DEEPSEEK_KEY / ROAMWAY_QWEN_KEY
@@ -80,12 +89,8 @@ impl Client {
                 .cloned()
                 .or_else(|| std::env::var("ROAMWAY_HOST").ok())
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "http://127.0.0.1:8796".into()),
-            token: flags
-                .get("token")
-                .cloned()
-                .or_else(|| std::env::var("ROAMWAY_TOKEN").ok())
-                .filter(|s| !s.is_empty()),
+                .unwrap_or_else(|| local_base(flags)),
+            token: local_token(flags),
         }
     }
 
@@ -118,6 +123,195 @@ impl Client {
     }
 }
 
+fn local_base(flags: &HashMap<String, String>) -> String {
+    if let Ok(raw) = std::fs::read_to_string(data_dir_for(flags).join("bind")) {
+        let raw = raw.trim().to_string();
+        if !raw.is_empty() {
+            return hosts::endpoint_normalize(&raw);
+        }
+    }
+    "http://127.0.0.1:8796".to_string()
+}
+
+fn local_token(flags: &HashMap<String, String>) -> Option<String> {
+    flags
+        .get("token")
+        .cloned()
+        .or_else(|| std::env::var("ROAMWAY_TOKEN").ok())
+        .or_else(|| {
+            std::fs::read_to_string(data_dir_for(flags).join("token"))
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
+        .filter(|s| !s.is_empty())
+}
+
+fn local_client(flags: &HashMap<String, String>) -> Client {
+    let mut c = Client::from_flags(flags);
+    if let Some(raw) = host_flag(flags) {
+        c.base = hosts::endpoint_normalize(&raw);
+    }
+    c
+}
+
+fn local_only_client(flags: &HashMap<String, String>) -> Client {
+    Client {
+        base: local_base(flags),
+        token: local_token(flags),
+    }
+}
+
+fn host_flag(flags: &HashMap<String, String>) -> Option<String> {
+    flags
+        .get("host")
+        .cloned()
+        .or_else(|| std::env::var("ROAMWAY_HOST").ok())
+        .filter(|s| !s.is_empty())
+}
+
+fn data_dir_for(flags: &HashMap<String, String>) -> PathBuf {
+    flags
+        .get("data")
+        .map(PathBuf::from)
+        .unwrap_or_else(default_data_dir)
+}
+
+fn registry_for(flags: &HashMap<String, String>) -> hosts::Registry {
+    hosts::Registry::load(&data_dir_for(flags))
+}
+
+fn resolve_host(flags: &HashMap<String, String>) -> Option<hosts::Host> {
+    let raw = host_flag(flags)?;
+    registry_for(flags).get(&raw).cloned()
+}
+
+fn dispatch_json(host: &hosts::Host, method: &str, path: &str) -> Result<Value, String> {
+    let (code, text) = hosts::dispatch(host, method, path, None)?;
+    if !(200..300).contains(&code) {
+        return Err(format!("HTTP {}: {}", code, text));
+    }
+    serde_json::from_str::<Value>(&text).map_err(|e| format!("bad response: {}", e))
+}
+
+fn request(flags: &HashMap<String, String>, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
+    if let Some(h) = resolve_host(flags) {
+        let body_str = match body {
+            Some(v) => Some(serde_json::to_string(&v).map_err(|e| e.to_string())?),
+            None => None,
+        };
+        let (code, text) = hosts::dispatch(&h, method, path, body_str.as_deref())?;
+        if !(200..300).contains(&code) {
+            return Err(format!("HTTP {}: {}", code, text));
+        }
+        return serde_json::from_str::<Value>(&text).map_err(|e| format!("bad response: {}", e));
+    }
+    local_client(flags).req(method, path, body)
+}
+
+fn host_json(h: &hosts::Host) -> Value {
+    json!({
+        "id": h.id,
+        "name": h.name,
+        "endpoint": h.endpoint,
+        "token": hosts::mask(&h.token),
+        "enabled": h.enabled,
+        "created_at": h.created_at,
+        "last_probe": h.last_probe.as_ref().map(|p| json!({
+            "at": p.at,
+            "ok": p.ok,
+            "latency_ms": p.latency_ms,
+            "version": p.version,
+            "error": p.error,
+        })),
+        "failures": h.failures,
+        "next_retry_at": h.next_retry_at,
+    })
+}
+
+fn host_state(h: &hosts::Host) -> &'static str {
+    if !h.enabled {
+        return "disabled";
+    }
+    match &h.last_probe {
+        None => "unknown",
+        Some(p) if p.ok => "online",
+        Some(p) if p.error == "skipped" => "skipped",
+        Some(_) => "error",
+    }
+}
+
+fn retry_secs(h: &hosts::Host) -> i64 {
+    match h.next_retry_at {
+        Some(nrt) => (nrt - now()).max(0),
+        None => 0,
+    }
+}
+
+fn gen_token() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let rs = std::collections::hash_map::RandomState::new();
+    let mut out = String::with_capacity(32);
+    for i in 0u64..16 {
+        let mut hasher = rs.build_hasher();
+        hasher.write_u64(i);
+        let v = hasher.finish();
+        out.push_str(&format!("{:02x}", (v >> 56) as u8));
+    }
+    out
+}
+
+fn bind_parts(bind: &str) -> Option<(String, u16)> {
+    let b = bind.trim();
+    let (host, port) = if let Some(rest) = b.strip_prefix('[') {
+        let (h, p) = rest.split_once("]:")?;
+        (h.to_string(), p.parse::<u16>().ok()?)
+    } else {
+        let (h, p) = b.rsplit_once(':')?;
+        (h.to_string(), p.parse::<u16>().ok()?)
+    };
+    Some((host, port))
+}
+
+fn pair_ip(bind: &str) -> String {
+    match bind_parts(bind) {
+        Some((host, _)) if !is_loopback_bind(&host) => host,
+        _ => "127.0.0.1".to_string(),
+    }
+}
+
+fn pid_path(flags: &HashMap<String, String>) -> PathBuf {
+    data_dir_for(flags).join("roamway.pid")
+}
+
+fn read_pid(flags: &HashMap<String, String>) -> Option<(u32, String)> {
+    let s = std::fs::read_to_string(pid_path(flags)).ok()?;
+    let mut lines = s.lines();
+    let pid = lines.next()?.trim().parse::<u32>().ok()?;
+    let bind = lines
+        .next()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "127.0.0.1:8796".to_string());
+    Some((pid, bind))
+}
+
+fn port_open(bind: &str) -> bool {
+    let (host, port) = match bind_parts(bind) {
+        Some(p) => p,
+        None => return false,
+    };
+    let host = if matches!(host.as_str(), "0.0.0.0" | "::" | "[::]") {
+        "127.0.0.1"
+    } else {
+        &host
+    };
+    let addr = format!("{}:{}", host, port);
+    match addr.to_socket_addrs().ok().and_then(|mut it| it.next()) {
+        Some(a) => TcpStream::connect_timeout(&a, Duration::from_millis(300)).is_ok(),
+        None => false,
+    }
+}
+
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     if argv.is_empty() {
@@ -130,7 +324,7 @@ fn main() {
         "serve" => cmd_serve(&flags),
         "run" => cmd_run(&flags, &pos),
         "ls" | "list" => cmd_ls(&flags),
-        "status" => cmd_status(&flags, &pos),
+        "status" | "inspect" => cmd_status(&flags, &pos),
         "logs" => cmd_logs(&flags, &pos),
         "stop" => cmd_stop(&flags, &pos),
         "rm" => cmd_rm(&flags, &pos),
@@ -139,6 +333,11 @@ fn main() {
         "jobs-run" => cmd_jobs_run(&flags, &pos),
         "jobs-rm" => cmd_jobs_rm(&flags, &pos),
         "health" => cmd_health(&flags),
+        "host" => cmd_host(&flags, &pos),
+        "daemon" => cmd_daemon(&flags, &pos),
+        "onboard" => cmd_onboard(&flags),
+        "restart" => cmd_restart(&flags),
+        "reload" => cmd_reload(&flags),
         "version" | "-V" | "--version" => println!("roamway {}", env!("CARGO_PKG_VERSION")),
         "-h" | "--help" | "help" => usage(),
         _ => {
@@ -258,12 +457,19 @@ fn cmd_serve(flags: &HashMap<String, String>) {
 }
 
 fn cmd_run(flags: &HashMap<String, String>, pos: &[String]) {
-    let prompt = pos.join(" ");
+    let mut prompt = pos.join(" ");
+    if prompt.trim().is_empty() {
+        prompt = flags.get("prompt").cloned().unwrap_or_default();
+    }
     if prompt.trim().is_empty() {
         eprintln!("prompt required");
         return;
     }
-    let c = Client::from_flags(flags);
+    if let Some(h) = resolve_host(flags) {
+        cmd_run_remote(&h, flags, &pos);
+        return;
+    }
+    let c = local_client(flags);
     let body = json!({
         "agent": flags.get("agent").cloned().unwrap_or_else(|| "codex".into()),
         "model": flags.get("model"),
@@ -332,7 +538,17 @@ fn trunc(s: &str, n: usize) -> String {
 }
 
 fn cmd_ls(flags: &HashMap<String, String>) {
-    let c = Client::from_flags(flags);
+    if let Some(raw) = host_flag(flags) {
+        if raw == "all" {
+            cmd_ls_all(flags);
+            return;
+        }
+        if let Some(h) = resolve_host(flags) {
+            cmd_ls_remote(&h, flags);
+            return;
+        }
+    }
+    let c = local_client(flags);
     let limit = flags
         .get("limit")
         .and_then(|v| v.parse::<usize>().ok())
@@ -369,7 +585,11 @@ fn cmd_status(flags: &HashMap<String, String>, pos: &[String]) {
         Some(i) => i,
         None => return eprintln!("usage: roamway status ID"),
     };
-    let c = Client::from_flags(flags);
+    if let Some(h) = resolve_host(flags) {
+        cmd_status_remote(&h, id);
+        return;
+    }
+    let c = local_client(flags);
     match c.req("GET", &format!("/v1/runs/{}", id), None) {
         Ok(v) => println!("{}", serde_json::to_string_pretty(&v["run"]).unwrap_or_default()),
         Err(e) => eprintln!("status failed: {}", e),
@@ -382,7 +602,11 @@ fn cmd_logs(flags: &HashMap<String, String>, pos: &[String]) {
         None => return eprintln!("usage: roamway logs ID [--tail 80]"),
     };
     let tail = flags.get("tail").cloned().unwrap_or_else(|| "80".into());
-    let c = Client::from_flags(flags);
+    if let Some(h) = resolve_host(flags) {
+        cmd_logs_remote(&h, id, &tail);
+        return;
+    }
+    let c = local_client(flags);
     match c.req("GET", &format!("/v1/runs/{}/log?tail={}", id, tail), None) {
         Ok(v) => println!("{}", v["log"].as_str().unwrap_or("")),
         Err(e) => eprintln!("logs failed: {}", e),
@@ -394,7 +618,11 @@ fn cmd_stop(flags: &HashMap<String, String>, pos: &[String]) {
         Some(i) => i,
         None => return eprintln!("usage: roamway stop ID"),
     };
-    let c = Client::from_flags(flags);
+    if let Some(h) = resolve_host(flags) {
+        cmd_stop_remote(&h, id);
+        return;
+    }
+    let c = local_client(flags);
     match c.req("POST", &format!("/v1/runs/{}/stop", id), Some(json!({}))) {
         Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
         Err(e) => eprintln!("stop failed: {}", e),
@@ -406,7 +634,7 @@ fn cmd_rm(flags: &HashMap<String, String>, pos: &[String]) {
         Some(i) => i,
         None => return eprintln!("usage: roamway rm ID"),
     };
-    let c = Client::from_flags(flags);
+    let c = local_client(flags);
     match c.req("DELETE", &format!("/v1/runs/{}", id), None) {
         Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
         Err(e) => eprintln!("rm failed: {}", e),
@@ -414,7 +642,7 @@ fn cmd_rm(flags: &HashMap<String, String>, pos: &[String]) {
 }
 
 fn cmd_jobs(flags: &HashMap<String, String>) {
-    let c = Client::from_flags(flags);
+    let c = local_client(flags);
     match c.req("GET", "/v1/jobs", None) {
         Ok(v) => {
             let empty = vec![];
@@ -471,7 +699,7 @@ fn cmd_jobs_add(flags: &HashMap<String, String>, pos: &[String]) {
     if let Some(tz) = flags.get("tz") {
         body["tz_offset_hours"] = json!(tz.parse::<i64>().ok());
     }
-    let c = Client::from_flags(flags);
+    let c = local_client(flags);
     match c.req("POST", "/v1/jobs", Some(body)) {
         Ok(v) => println!("{}", serde_json::to_string_pretty(&v["job"]).unwrap_or_default()),
         Err(e) => eprintln!("jobs-add failed: {}", e),
@@ -483,7 +711,7 @@ fn cmd_jobs_run(flags: &HashMap<String, String>, pos: &[String]) {
         Some(i) => i,
         None => return eprintln!("usage: roamway jobs-run ID"),
     };
-    let c = Client::from_flags(flags);
+    let c = local_client(flags);
     match c.req("POST", &format!("/v1/jobs/{}/run", id), Some(json!({}))) {
         Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
         Err(e) => eprintln!("jobs-run failed: {}", e),
@@ -495,7 +723,7 @@ fn cmd_jobs_rm(flags: &HashMap<String, String>, pos: &[String]) {
         Some(i) => i,
         None => return eprintln!("usage: roamway jobs-rm ID"),
     };
-    let c = Client::from_flags(flags);
+    let c = local_client(flags);
     match c.req("DELETE", &format!("/v1/jobs/{}", id), None) {
         Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
         Err(e) => eprintln!("jobs-rm failed: {}", e),
@@ -503,11 +731,661 @@ fn cmd_jobs_rm(flags: &HashMap<String, String>, pos: &[String]) {
 }
 
 fn cmd_health(flags: &HashMap<String, String>) {
-    let c = Client::from_flags(flags);
+    let c = local_client(flags);
     match c.req("GET", "/health", None) {
         Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default()),
         Err(e) => eprintln!("health failed: {}", e),
     }
+}
+
+
+fn cmd_run_remote(h: &hosts::Host, flags: &HashMap<String, String>, pos: &[String]) {
+    let mut prompt = pos.join(" ");
+    if prompt.trim().is_empty() {
+        prompt = flags.get("prompt").cloned().unwrap_or_default();
+    }
+    if prompt.trim().is_empty() {
+        eprintln!("prompt required");
+        return;
+    }
+    let body = json!({
+        "agent": flags.get("agent").cloned().unwrap_or_else(|| "codex".into()),
+        "model": flags.get("model"),
+        "workspace": flags.get("workspace"),
+        "title": flags.get("title"),
+        "prompt": prompt,
+        "timeout_s": flags.get("timeout").and_then(|v| v.parse::<u64>().ok()),
+    });
+    let body_str = serde_json::to_string(&body).unwrap_or_default();
+    let (code, text) = match hosts::dispatch(h, "POST", "/v1/runs", Some(&body_str)) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("dispatch failed: {}", e);
+            return;
+        }
+    };
+    if !(200..300).contains(&code) {
+        eprintln!("dispatch failed: HTTP {}: {}", code, text);
+        return;
+    }
+    let v: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
+    let mut out = v.clone();
+    out["host"] = json!(h.name);
+    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+    let id = v["run"]["id"].as_str().unwrap_or("").to_string();
+    if flags.contains_key("no-wait") {
+        return;
+    }
+    let started = std::time::Instant::now();
+    loop {
+        thread::sleep(Duration::from_secs(2));
+        match dispatch_json(h, "GET", &format!("/v1/runs/{}", id)) {
+            Ok(v) => {
+                let st = v["run"]["status"].as_str().unwrap_or("?");
+                if matches!(st, "done" | "failed" | "timeout" | "killed" | "interrupted") {
+                    let err = v["run"]["error"].as_str().unwrap_or("");
+                    println!(
+                        "{}\t{}\t{}s{}",
+                        id,
+                        st,
+                        started.elapsed().as_secs(),
+                        if err.is_empty() {
+                            String::new()
+                        } else {
+                            format!("\t{}", err)
+                        }
+                    );
+                    if let Ok(l) = dispatch_json(h, "GET", &format!("/v1/runs/{}/log?tail=40", id)) {
+                        println!("---");
+                        println!("{}", l["log"].as_str().unwrap_or(""));
+                    }
+                    return;
+                }
+                if flags.contains_key("quiet") {
+                    continue;
+                }
+                eprintln!("[{}] {} {}s", id, st, started.elapsed().as_secs());
+            }
+            Err(e) => {
+                eprintln!("poll failed: {}", e);
+                return;
+            }
+        }
+    }
+}
+
+fn print_runs_table(runs: &[Value]) {
+    println!(
+        "{:<10} {:<12} {:<12} {:<8} {:<20} {:<26} {}",
+        "HOST", "ID", "STATUS", "AGENT", "MODEL", "CREATED", "TITLE"
+    );
+    for r in runs {
+        println!(
+            "{:<10} {:<12} {:<12} {:<8} {:<20} {:<26} {}",
+            r["host"].as_str().unwrap_or("-"),
+            r["id"].as_str().unwrap_or(""),
+            r["status"].as_str().unwrap_or(""),
+            r["agent"].as_str().unwrap_or(""),
+            trunc(r["model"].as_str().unwrap_or("-"), 20),
+            r["created_at"]
+                .as_i64()
+                .map(iso)
+                .unwrap_or_else(|| "-".into()),
+            trunc(r["title"].as_str().unwrap_or(""), 40)
+        );
+    }
+}
+
+fn cmd_ls_remote(h: &hosts::Host, flags: &HashMap<String, String>) {
+    let limit = flags
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(20);
+    match dispatch_json(h, "GET", &format!("/v1/runs?limit={}", limit)) {
+        Ok(v) => {
+            let mut runs = v["runs"].as_array().cloned().unwrap_or_default();
+            for r in &mut runs {
+                r["host"] = json!(h.name);
+            }
+            print_runs_table(&runs);
+        }
+        Err(e) => eprintln!("list failed: {}", e),
+    }
+}
+
+fn cmd_ls_all(flags: &HashMap<String, String>) {
+    let limit = flags
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(20);
+    let reg = registry_for(flags);
+    let mut all: Vec<Value> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    match local_only_client(flags).req("GET", &format!("/v1/runs?limit={}", limit), None) {
+        Ok(v) => {
+            for mut r in v["runs"].as_array().cloned().unwrap_or_default() {
+                r["host"] = json!("local");
+                all.push(r);
+            }
+        }
+        Err(e) => errors.push(format!("local: {}", e)),
+    }
+    let enabled: Vec<hosts::Host> = reg.hosts.iter().filter(|h| h.enabled).cloned().collect();
+    std::thread::scope(|s| {
+        let handles: Vec<_> = enabled
+            .iter()
+            .map(|h| {
+                s.spawn(move || -> Result<Vec<Value>, String> {
+                    let (code, text) = hosts::dispatch(h, "GET", &format!("/v1/runs?limit={}", limit), None)?;
+                    if !(200..300).contains(&code) {
+                        return Err(format!("{}: HTTP {}: {}", h.name, code, text));
+                    }
+                    let v: Value =
+                        serde_json::from_str(&text).map_err(|e| format!("{}: bad response: {}", h.name, e))?;
+                    Ok(v["runs"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|mut r| {
+                            r["host"] = json!(h.name);
+                            r
+                        })
+                        .collect())
+                })
+            })
+            .collect();
+        for hd in handles {
+            match hd.join() {
+                Ok(Ok(runs)) => all.extend(runs),
+                Ok(Err(e)) => errors.push(e),
+                Err(_) => errors.push("worker panicked".into()),
+            }
+        }
+    });
+    all.sort_by(|a, b| {
+        b["created_at"]
+            .as_i64()
+            .unwrap_or(0)
+            .cmp(&a["created_at"].as_i64().unwrap_or(0))
+    });
+    print_runs_table(&all);
+    if !errors.is_empty() {
+        eprintln!("errors:");
+        for e in errors {
+            eprintln!("  {}", e);
+        }
+    }
+}
+
+fn cmd_status_remote(h: &hosts::Host, id: &str) {
+    match dispatch_json(h, "GET", &format!("/v1/runs/{}", id)) {
+        Ok(v) => println!("{}", serde_json::to_string_pretty(&v["run"]).unwrap_or_default()),
+        Err(e) => eprintln!("status failed: {}", e),
+    }
+}
+
+fn cmd_logs_remote(h: &hosts::Host, id: &str, tail: &str) {
+    match dispatch_json(h, "GET", &format!("/v1/runs/{}/log?tail={}", id, tail)) {
+        Ok(v) => println!("{}", v["log"].as_str().unwrap_or("")),
+        Err(e) => eprintln!("logs failed: {}", e),
+    }
+}
+
+fn cmd_stop_remote(h: &hosts::Host, id: &str) {
+    match hosts::dispatch(h, "POST", &format!("/v1/runs/{}/stop", id), Some("{}")) {
+        Ok((code, text)) => {
+            if (200..300).contains(&code) {
+                println!("{}", text);
+            } else {
+                eprintln!("stop failed: HTTP {}: {}", code, text);
+            }
+        }
+        Err(e) => eprintln!("stop failed: {}", e),
+    }
+}
+
+fn cmd_host(flags: &HashMap<String, String>, pos: &[String]) {
+    match pos.first().map(String::as_str).unwrap_or("help") {
+        "add" => cmd_host_add(flags, &pos[1..]),
+        "ls" | "list" => cmd_host_ls(flags),
+        "rm" | "remove" => cmd_host_rm(flags, &pos[1..]),
+        "enable" => cmd_host_enable(flags, &pos[1..], true),
+        "disable" => cmd_host_enable(flags, &pos[1..], false),
+        "probe" => cmd_host_probe(flags, &pos[1..]),
+        _ => eprintln!("usage: roamway host add|ls|rm|enable|disable|probe ..."),
+    }
+}
+
+fn cmd_host_add(flags: &HashMap<String, String>, pos: &[String]) {
+    let name = match pos.first() {
+        Some(n) => n,
+        None => return eprintln!("usage: roamway host add <name> --endpoint <ep> [--token <t>]"),
+    };
+    let endpoint = match flags.get("endpoint") {
+        Some(e) => e,
+        None => return eprintln!("--endpoint is required"),
+    };
+    let env_name = format!("ROAMWAY_TOKEN_{}", name.to_uppercase().replace('-', "_"));
+    let token = flags
+        .get("token")
+        .cloned()
+        .or_else(|| std::env::var(&env_name).ok())
+        .filter(|s| !s.is_empty());
+    let token = match token {
+        Some(t) => t,
+        None => return eprintln!("token required: --token or environment {}", env_name),
+    };
+    let mut reg = registry_for(flags);
+    if reg.get(name).is_some() {
+        if flags.contains_key("force") {
+            reg.remove(name);
+        } else {
+            eprintln!("host '{}' already exists (use --force)", name);
+            return;
+        }
+    }
+    match reg.add(name, endpoint, &token) {
+        Ok(h) => {
+            let entry = host_json(h);
+            let _ = reg.save();
+            println!("{}", serde_json::to_string_pretty(&entry).unwrap_or_default());
+        }
+        Err(e) => eprintln!("host add failed: {}", e),
+    }
+}
+
+fn cmd_host_ls(flags: &HashMap<String, String>) {
+    let mut reg = registry_for(flags);
+    if flags.contains_key("probe") {
+        for h in reg.hosts.iter_mut() {
+            if !h.enabled {
+                continue;
+            }
+            let p = hosts::probe(h);
+            if p.error != "skipped" {
+                if p.ok {
+                    h.failures = 0;
+                    h.next_retry_at = None;
+                } else {
+                    h.failures += 1;
+                    h.next_retry_at = Some(now() + hosts::backoff(h.failures));
+                }
+            }
+            h.last_probe = Some(p);
+        }
+        let _ = reg.save();
+    }
+    if flags.contains_key("json") {
+        let hosts: Vec<Value> = reg.hosts.iter().map(host_json).collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({"hosts": hosts})).unwrap_or_default()
+        );
+        return;
+    }
+    println!(
+        "{:<16} {:<26} {:<10} {:<10} {:<8} {:<6}",
+        "NAME", "ENDPOINT", "STATE", "VERSION", "LATENCY", "RETRY"
+    );
+    for h in &reg.hosts {
+        let version = h
+            .last_probe
+            .as_ref()
+            .map(|p| p.version.as_str())
+            .unwrap_or("-");
+        let latency = h
+            .last_probe
+            .as_ref()
+            .map(|p| format!("{}ms", p.latency_ms))
+            .unwrap_or_else(|| "-".into());
+        println!(
+            "{:<16} {:<26} {:<10} {:<10} {:<8} {:<6}",
+            h.name,
+            h.endpoint,
+            host_state(h),
+            version,
+            latency,
+            retry_secs(h)
+        );
+    }
+}
+
+fn cmd_host_rm(flags: &HashMap<String, String>, pos: &[String]) {
+    let name = match pos.first() {
+        Some(n) => n,
+        None => return eprintln!("usage: roamway host rm <name>"),
+    };
+    let mut reg = registry_for(flags);
+    if reg.remove(name) {
+        let _ = reg.save();
+        println!("removed {}", name);
+    } else {
+        eprintln!("no such host: {}", name);
+    }
+}
+
+fn cmd_host_enable(flags: &HashMap<String, String>, pos: &[String], enable: bool) {
+    let name = match pos.first() {
+        Some(n) => n,
+        None => return eprintln!("usage: roamway host enable|disable <name>"),
+    };
+    let mut reg = registry_for(flags);
+    match reg.hosts.iter_mut().find(|h| h.name == name.as_str()) {
+        Some(h) => {
+            h.enabled = enable;
+            let _ = reg.save();
+            println!("{} {}", name, if enable { "enabled" } else { "disabled" });
+        }
+        None => eprintln!("no such host: {}", name),
+    }
+}
+
+fn cmd_host_probe(flags: &HashMap<String, String>, pos: &[String]) {
+    let name = match pos.first() {
+        Some(n) => n,
+        None => return eprintln!("usage: roamway host probe <name>"),
+    };
+    let mut reg = registry_for(flags);
+    let idx = match reg.hosts.iter().position(|h| h.name == name.as_str()) {
+        Some(i) => i,
+        None => return eprintln!("no such host: {}", name),
+    };
+    let p = hosts::probe(&reg.hosts[idx]);
+    if p.error != "skipped" {
+        if p.ok {
+            reg.hosts[idx].failures = 0;
+            reg.hosts[idx].next_retry_at = None;
+        } else {
+            reg.hosts[idx].failures += 1;
+            reg.hosts[idx].next_retry_at = Some(now() + hosts::backoff(reg.hosts[idx].failures));
+        }
+        reg.hosts[idx].last_probe = Some(p);
+    }
+    let _ = reg.save();
+    println!("{}", serde_json::to_string_pretty(&host_json(&reg.hosts[idx])).unwrap_or_default());
+}
+
+fn cmd_daemon(flags: &HashMap<String, String>, pos: &[String]) {
+    match pos.first().map(String::as_str).unwrap_or("help") {
+        "status" => cmd_daemon_status(flags),
+        "config" => cmd_daemon_config(flags),
+        "start" => cmd_daemon_start(flags),
+        "stop" => cmd_daemon_stop(flags),
+        "restart" => cmd_daemon_restart(flags),
+        "reload" => cmd_daemon_reload(flags),
+        "pair" => cmd_daemon_pair(flags),
+        _ => eprintln!("usage: roamway daemon status|config|start|stop|restart|reload|pair"),
+    }
+}
+
+fn cmd_daemon_status(flags: &HashMap<String, String>) {
+    if host_flag(flags).is_some() {
+        match request(flags, "GET", "/health", None) {
+            Ok(v) => {
+                if flags.contains_key("json") {
+                    println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                } else {
+                    println!(
+                        "remote {} | version {} | uptime {}s",
+                        host_flag(flags).unwrap_or_default(),
+                        v["version"].as_str().unwrap_or("-"),
+                        v["uptime_s"].as_i64().unwrap_or(0)
+                    );
+                }
+            }
+            Err(e) => eprintln!("daemon status failed: {}", e),
+        }
+        return;
+    }
+    let data = data_dir_for(flags);
+    let mut status = json!({
+        "ok": false,
+        "error": "not running",
+        "version": "",
+        "uptime_s": 0,
+        "pid": Value::Null,
+        "data_dir": data.to_string_lossy(),
+    });
+    if let Some((pid, bind)) = read_pid(flags) {
+        status["pid"] = json!(pid);
+        let c = Client {
+            base: hosts::endpoint_normalize(&bind),
+            token: local_token(flags),
+        };
+        match c.req("GET", "/health", None) {
+            Ok(v) => {
+                status["ok"] = json!(true);
+                status["version"] = v["version"].clone();
+                status["uptime_s"] = v["uptime_s"].clone();
+                status["running"] = v["running"].clone();
+                status["queued"] = v["queued"].clone();
+                status["error"] = Value::Null;
+            }
+            Err(e) => status["error"] = json!(e),
+        }
+    }
+    if flags.contains_key("json") {
+        println!("{}", serde_json::to_string_pretty(&status).unwrap_or_default());
+        return;
+    }
+    if status["pid"].is_null() {
+        println!("daemon offline | data {}", data.display());
+        return;
+    }
+    println!(
+        "daemon {} | version {} | pid {} | uptime {}s | data {}",
+        if status["ok"].as_bool().unwrap_or(false) { "online" } else { "offline" },
+        status["version"].as_str().unwrap_or("-"),
+        status["pid"].as_u64().map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+        status["uptime_s"].as_i64().unwrap_or(0),
+        status["data_dir"].as_str().unwrap_or("-")
+    );
+}
+
+fn cmd_daemon_config(flags: &HashMap<String, String>) {
+    let data = data_dir_for(flags);
+    let max_concurrent = flags
+        .get("max-concurrent")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(4);
+    let out = json!({
+        "data_dir": data.to_string_lossy(),
+        "hosts_file": data.join("hosts.json").to_string_lossy(),
+        "max_concurrent": max_concurrent,
+        "version": env!("CARGO_PKG_VERSION"),
+    });
+    if flags.contains_key("json") {
+        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
+    } else {
+        println!("data_dir:  {}", data.display());
+        println!("hosts:     {}", data.join("hosts.json").display());
+        println!("concurrency: {}", max_concurrent);
+        println!("version:   {}", env!("CARGO_PKG_VERSION"));
+    }
+}
+
+fn cmd_daemon_start(flags: &HashMap<String, String>) {
+    let bind = flags
+        .get("bind")
+        .cloned()
+        .unwrap_or_else(|| "127.0.0.1:8796".into());
+    let data = data_dir_for(flags);
+    let _ = std::fs::create_dir_all(&data);
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            eprintln!("current_exe failed: {}", e);
+            return;
+        }
+    };
+    let token = flags
+        .get("token")
+        .cloned()
+        .or_else(|| std::env::var("ROAMWAY_TOKEN").ok())
+        .filter(|s| !s.is_empty());
+    let mut cmd = Command::new(&exe);
+    cmd.arg("serve")
+        .arg("--bind")
+        .arg(&bind)
+        .arg("--data")
+        .arg(&data)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(t) = token {
+        cmd.env("ROAMWAY_TOKEN", t);
+    }
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+    }
+    match cmd.spawn() {
+        Ok(child) => {
+            let pid = child.id();
+            let _ = std::fs::write(pid_path(flags), format!("{}\n{}\n", pid, bind));
+            println!("daemon started pid={} bind={}", pid, bind);
+        }
+        Err(e) => eprintln!("daemon start failed: {}", e),
+    }
+}
+
+fn cmd_daemon_stop(flags: &HashMap<String, String>) {
+    let (pid, bind) = match read_pid(flags) {
+        Some(p) => p,
+        None => {
+            eprintln!("daemon not running (no pid file)");
+            return;
+        }
+    };
+    #[cfg(unix)]
+    {
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill")
+            .arg("/T")
+            .arg("/F")
+            .arg("/PID")
+            .arg(pid.to_string())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let mut released = false;
+    for _ in 0..50 {
+        if !port_open(&bind) {
+            released = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    if released {
+        let _ = std::fs::remove_file(pid_path(flags));
+        println!("daemon stopped (pid {} bind {})", pid, bind);
+    } else {
+        eprintln!("daemon pid {} still listening on {}", pid, bind);
+    }
+}
+
+fn cmd_daemon_restart(flags: &HashMap<String, String>) {
+    cmd_daemon_stop(flags);
+    cmd_daemon_start(flags);
+}
+
+fn cmd_daemon_reload(flags: &HashMap<String, String>) {
+    let reg = registry_for(flags);
+    println!(
+        "reloaded {} hosts from {}",
+        reg.hosts.len(),
+        data_dir_for(flags).join("hosts.json").display()
+    );
+}
+
+fn cmd_daemon_pair(flags: &HashMap<String, String>) {
+    let token = flags
+        .get("token")
+        .cloned()
+        .or_else(|| std::env::var("ROAMWAY_TOKEN").ok())
+        .or_else(|| {
+            std::fs::read_to_string(data_dir_for(flags).join("token"))
+                .ok()
+                .map(|s| s.trim().to_string())
+        })
+        .filter(|s| !s.is_empty());
+    let token = match token {
+        Some(t) => t,
+        None => return eprintln!("token required: --token, ROAMWAY_TOKEN, or <data>/token"),
+    };
+    let bind = flags
+        .get("bind")
+        .cloned()
+        .unwrap_or_else(|| "127.0.0.1:8796".into());
+    let port = bind_parts(&bind).map(|(_, p)| p).unwrap_or(8796);
+    println!("http://{}:{}?token={}", pair_ip(&bind), port, token);
+}
+
+fn cmd_onboard(flags: &HashMap<String, String>) {
+    let data = data_dir_for(flags);
+    let _ = std::fs::create_dir_all(&data);
+    let token = gen_token();
+    let token_file = data.join("token");
+    if let Err(e) = std::fs::write(&token_file, format!("{}\n", token)) {
+        eprintln!("write token failed: {}", e);
+        return;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600));
+    }
+    let bind = flags
+        .get("bind")
+        .cloned()
+        .unwrap_or_else(|| "0.0.0.0:8796".into());
+    let serve = format!("roamway serve --bind {} --data {}", bind, data.display());
+    let log = data.join("roamway.log");
+    println!("token:    {}", token_file.display());
+    println!("foreground:  ROAMWAY_TOKEN=$(cat {}) {}", token_file.display(), serve);
+    println!("background:  nohup env ROAMWAY_TOKEN=$(cat {}) {} >>{} 2>&1 &", token_file.display(), serve, log.display());
+    println!("crontab:     @reboot /usr/bin/env ROAMWAY_TOKEN=$(cat {}) {} >>{} 2>&1", token_file.display(), serve, log.display());
+    let port = bind_parts(&bind).map(|(_, p)| p).unwrap_or(8796);
+    println!(
+        "other machine: roamway host add nas --endpoint http://{}:{} --token $ROAMWAY_TOKEN",
+        pair_ip(&bind),
+        port
+    );
+}
+
+fn cmd_restart(flags: &HashMap<String, String>) {
+    if host_flag(flags).is_some() {
+        eprintln!("restart --host is not supported over HTTP; run on the target host");
+        return;
+    }
+    cmd_daemon_restart(flags);
+}
+
+fn cmd_reload(flags: &HashMap<String, String>) {
+    if host_flag(flags).is_some() {
+        eprintln!("reload --host is not supported over HTTP; run on the target host");
+        return;
+    }
+    cmd_daemon_reload(flags);
 }
 
 #[cfg(test)]
@@ -526,6 +1404,66 @@ mod tests {
         assert_eq!(flags.get("bind").map(String::as_str), Some("127.0.0.1:1"));
         assert_eq!(flags.get("no-wait").map(String::as_str), Some("true"));
         assert_eq!(pos, vec!["run".to_string()]);
+    }
+
+    #[test]
+    fn local_base_prefers_bind_file() {
+        let dir = std::env::temp_dir().join(format!("roamway-bind-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("bind"), "127.0.0.1:8896\n").unwrap();
+        let mut flags: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        flags.insert("data".to_string(), dir.to_string_lossy().to_string());
+        assert_eq!(local_base(&flags), "http://127.0.0.1:8896");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_token_three_level_fallback() {
+        let dir = std::env::temp_dir().join(format!("roamway-token-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("token"), "file-token\n").unwrap();
+        let mut flags: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        flags.insert("data".to_string(), dir.to_string_lossy().to_string());
+        let prev = std::env::var("ROAMWAY_TOKEN").ok();
+
+        flags.insert("token".to_string(), "flag-token".to_string());
+        std::env::set_var("ROAMWAY_TOKEN", "env-token");
+        assert_eq!(local_token(&flags).as_deref(), Some("flag-token"));
+
+        flags.remove("token");
+        assert_eq!(local_token(&flags).as_deref(), Some("env-token"));
+
+        std::env::remove_var("ROAMWAY_TOKEN");
+        assert_eq!(local_token(&flags).as_deref(), Some("file-token"));
+
+        match prev {
+            Some(v) => std::env::set_var("ROAMWAY_TOKEN", v),
+            None => std::env::remove_var("ROAMWAY_TOKEN"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn backoff_window_skip_detection() {
+        let at = now();
+        let mut h = hosts::Host {
+            id: "h1".to_string(),
+            name: "nas".to_string(),
+            endpoint: "http://127.0.0.1:1".to_string(),
+            token: String::new(),
+            enabled: true,
+            created_at: at,
+            last_probe: None,
+            failures: 1,
+            next_retry_at: Some(at + 3600),
+        };
+        let p = hosts::probe(&h);
+        assert_eq!(p.error, "skipped");
+        assert!(!p.ok);
+        h.last_probe = Some(p);
+        assert_eq!(host_state(&h), "skipped");
+        assert!(retry_secs(&h) > 0);
+        assert!(retry_secs(&h) <= 3600);
     }
 
     #[test]
