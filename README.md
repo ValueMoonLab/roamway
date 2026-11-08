@@ -1,6 +1,6 @@
 # roamway
 
-[![CI](https://github.com/ValueMoon-Lab/roamway/actions/workflows/ci.yml/badge.svg)](https://github.com/ValueMoon-Lab/roamway/actions/workflows/ci.yml)
+[![CI](https://github.com/ValueMoonLab/roamway/actions/workflows/ci.yml/badge.svg)](https://github.com/ValueMoonLab/roamway/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 
@@ -43,7 +43,7 @@ roamway 只做这些，外加一个够用的调度器和 HTTP 接口。约 1,000
 
 ```bash
 # 1. 构建（Rust 1.75+）
-git clone https://github.com/ValueMoon-Lab/roamway.git
+git clone https://github.com/ValueMoonLab/roamway.git
 cd roamway
 cargo build --release
 ./target/release/roamway --help
