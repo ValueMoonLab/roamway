@@ -5,3 +5,8 @@
 *.pem
 config.local.*
 .DS_Store
+
+# codex local build artifacts
+.cargo-test-home/
+.linker/
+.tmp-rust-lld.exe

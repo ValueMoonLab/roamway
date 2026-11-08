@@ -1,10 +1,9 @@
-use crate::jobs::{backoff, next_after};
 use crate::types::*;
 use serde_json::json;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -14,13 +13,36 @@ pub fn start(app: Arc<App>, run_id: String) {
     thread::spawn(move || execute(app, run_id));
 }
 
+/// stop 后的守卫：只有状态仍为 Queued 且没有取消标记时才允许开始执行
+fn run_is_startable(status: RunStatus, cancel: &AtomicBool) -> bool {
+    status == RunStatus::Queued && !cancel.load(Ordering::Relaxed)
+}
+
+fn remove_cancel(app: &Arc<App>, id: &str) {
+    if let Ok(mut c) = app.cancels.lock() {
+        c.remove(id);
+    }
+}
+
 fn execute(app: Arc<App>, id: String) {
+    let cancel = {
+        let mut c = app.cancels.lock().unwrap_or_else(|e| e.into_inner());
+        c.entry(id.clone())
+            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+            .clone()
+    };
     let (run, log_path) = {
-        let mut st = app.store.lock().unwrap();
+        let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
         let idx = match st.state.runs.iter().position(|r| r.id == id) {
             Some(i) => i,
             None => return,
         };
+        // 被 stop 抢先改掉的任务绝不复活：状态必须是 Queued 且无取消标记
+        if !run_is_startable(st.state.runs[idx].status, &cancel) {
+            drop(st);
+            remove_cancel(&app, &id);
+            return;
+        }
         st.state.runs[idx].status = RunStatus::Running;
         st.state.runs[idx].started_at = Some(now());
         let r = st.state.runs[idx].clone();
@@ -29,9 +51,10 @@ fn execute(app: Arc<App>, id: String) {
         (r, lp)
     };
 
-    let cancel = Arc::new(AtomicBool::new(false));
-    if let Ok(mut c) = app.cancels.lock() {
-        c.insert(id.clone(), cancel.clone());
+    // spawn 前再查一次取消标志
+    if cancel.load(Ordering::Relaxed) {
+        finalize(&app, &id, RunStatus::Killed, None, None);
+        return;
     }
 
     {
@@ -72,7 +95,7 @@ fn env_list(key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn build_command(run: &Run) -> Command {
+fn build_command(run: &Run) -> Result<Command, String> {
     let (prog, args): (String, Vec<String>) = match run.agent.as_str() {
         "shell" => {
             if cfg!(windows) {
@@ -110,7 +133,7 @@ fn build_command(run: &Run) -> Command {
             ("hermes".into(), a)
         }
         "claude" => ("claude".into(), vec!["-p".into(), run.prompt.clone()]),
-        other => (other.to_string(), vec![run.prompt.clone()]),
+        other => return Err(format!("unknown agent: {}", other)),
     };
 
     let mut c = Command::new(prog);
@@ -118,7 +141,110 @@ fn build_command(run: &Run) -> Command {
     if !run.workspace.is_empty() && Path::new(&run.workspace).is_dir() {
         c.current_dir(&run.workspace);
     }
-    c
+    configure_process(&mut c);
+    Ok(c)
+}
+
+#[cfg(unix)]
+fn configure_process(c: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    c.process_group(0);
+}
+
+#[cfg(windows)]
+fn configure_process(c: &mut Command) {
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    use std::os::windows::process::CommandExt;
+    c.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+}
+
+/// 终止子进程及其整个进程组/进程树，先 SIGTERM（Windows 无此步），超时后 SIGKILL。
+pub fn kill_tree(child: &mut Child) {
+    kill_process_group(child.id());
+    let _ = child.wait();
+}
+
+#[cfg(unix)]
+pub fn kill_process_group(pid: u32) {
+    let pid = pid as i32;
+    if pid <= 1 {
+        return;
+    }
+    unsafe {
+        let _ = libc::kill(-pid, libc::SIGTERM);
+        for _ in 0..20 {
+            if libc::kill(-pid, 0) != 0 {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+        let _ = libc::kill(-pid, libc::SIGKILL);
+    }
+}
+
+#[cfg(windows)]
+pub fn kill_process_group(pid: u32) {
+    const CREATE_NO_WINDOW: u32 = 0x08000000;
+    use std::os::windows::process::CommandExt;
+    let pid_s = pid.to_string();
+    let _ = Command::new("taskkill")
+        .args(["/T", "/F", "/PID", pid_s.as_str()])
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// 判断 pid 是否仍属于我们记录的 run：先看进程是否存在，Linux 上再对比
+/// /proc 里的启动时间，降低 PID 复用导致的误杀。
+#[cfg(not(unix))]
+pub fn pid_is_our_run(_pid: u32, _started_at: Option<i64>) -> bool {
+    false
+}
+
+#[cfg(unix)]
+pub fn pid_is_our_run(pid: u32, _started_at: Option<i64>) -> bool {
+    if unsafe { libc::kill(pid as i32, 0) } != 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Some(ts) = _started_at {
+            if let Some(proc_ts) = proc_start_epoch(pid) {
+                return start_times_near(proc_ts, ts);
+            }
+        }
+    }
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn start_times_near(proc_start: i64, recorded: i64) -> bool {
+    (proc_start - recorded).abs() <= 30
+}
+
+#[cfg(target_os = "linux")]
+fn proc_start_epoch(pid: u32) -> Option<i64> {
+    let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
+    // starttime 是 field 22；comm（field 2）可能带空格/括号，先按 ')' 切开
+    let start = stat
+        .rsplit(')')
+        .next()?
+        .split_whitespace()
+        .nth(19)?
+        .parse::<u64>()
+        .ok()? as i64;
+    let btime = std::fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find(|l| l.starts_with("btime "))?
+        .split_whitespace()
+        .nth(1)?
+        .parse::<i64>()
+        .ok()?;
+    Some(btime + start / 100)
 }
 
 fn run_cli(
@@ -127,7 +253,10 @@ fn run_cli(
     log_path: &Path,
     cancel: &Arc<AtomicBool>,
 ) -> (RunStatus, Option<i32>, Option<String>) {
-    let mut cmd = build_command(run);
+    let mut cmd = match build_command(run) {
+        Ok(c) => c,
+        Err(e) => return (RunStatus::Failed, None, Some(e)),
+    };
     let out = match File::create(log_path) {
         Ok(f) => f,
         Err(e) => return (RunStatus::Failed, None, Some(format!("log: {}", e))),
@@ -140,28 +269,33 @@ fn run_cli(
         .stderr(Stdio::from(out2))
         .stdin(Stdio::null());
 
+    if cancel.load(Ordering::Relaxed) {
+        return (RunStatus::Killed, None, None);
+    }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return (RunStatus::Failed, None, Some(format!("spawn: {}", e))),
     };
     {
-        let mut st = app.store.lock().unwrap();
+        let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(r) = st.state.runs.iter_mut().find(|r| r.id == run.id) {
             r.pid = Some(child.id());
         }
         st.save();
     }
+    if cancel.load(Ordering::Relaxed) {
+        kill_tree(&mut child);
+        return (RunStatus::Killed, None, None);
+    }
 
     let started = Instant::now();
     loop {
         if cancel.load(Ordering::Relaxed) {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_tree(&mut child);
             return (RunStatus::Killed, None, None);
         }
         if run.timeout_s > 0 && started.elapsed().as_secs() >= run.timeout_s {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_tree(&mut child);
             return (
                 RunStatus::Timeout,
                 None,
@@ -178,7 +312,7 @@ fn run_cli(
             }
             Ok(None) => thread::sleep(Duration::from_millis(300)),
             Err(e) => {
-                let _ = child.kill();
+                kill_tree(&mut child);
                 return (RunStatus::Failed, None, Some(e.to_string()));
             }
         }
@@ -278,38 +412,41 @@ fn run_api(
 }
 
 fn finalize(app: &Arc<App>, id: &str, status: RunStatus, code: Option<i32>, err: Option<String>) {
-    let mut st = app.store.lock().unwrap();
+    let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
     let idx = match st.state.runs.iter().position(|r| r.id == id) {
         Some(i) => i,
         None => return,
     };
-    {
+    let job_id = {
         let r = &mut st.state.runs[idx];
-        r.status = status;
-        r.exit_code = code;
-        r.ended_at = Some(now());
-        if err.is_some() {
-            r.error = err;
+        if r.status == RunStatus::Killed {
+            // stop 已判 killed：自然退出/超时都不允许覆盖
+            if r.ended_at.is_none() {
+                r.ended_at = Some(now());
+            }
+        } else {
+            r.status = status;
+            r.exit_code = code;
+            r.ended_at = Some(now());
+            if err.is_some() {
+                r.error = err;
+            }
         }
-    }
-    let job_id = st.state.runs[idx].job_id.clone();
+        r.job_id.clone()
+    };
     if let Some(jid) = job_id {
         let bad = matches!(status, RunStatus::Failed | RunStatus::Timeout);
         let t = now();
-        let tz = st.state.jobs.iter().find(|j| j.id == jid).map(|j| j.tz_offset_hours).unwrap_or(app.tz_offset_hours);
+        let tz = st
+            .state
+            .jobs
+            .iter()
+            .find(|j| j.id == jid)
+            .map(|j| j.tz_offset_hours)
+            .unwrap_or(app.tz_offset_hours);
         if let Some(j) = st.state.jobs.iter_mut().find(|j| j.id == jid) {
             if bad {
-                j.attempts += 1;
-                j.last_error = Some(format!("{:?}", status));
-                if j.attempts <= j.max_retries {
-                    j.next_at = t + backoff(j.attempts);
-                } else {
-                    if j.max_retries > 0 {
-                        j.enabled = false;
-                    }
-                    j.attempts = 0;
-                    j.next_at = next_after(j, t, tz);
-                }
+                crate::jobs::apply_failure(j, t, tz, &format!("{:?}", status));
             } else {
                 j.attempts = 0;
                 j.last_error = None;
@@ -318,7 +455,56 @@ fn finalize(app: &Arc<App>, id: &str, status: RunStatus, code: Option<i32>, err:
     }
     st.save();
     drop(st);
-    if let Ok(mut c) = app.cancels.lock() {
-        c.remove(id);
+    remove_cancel(app, id);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_run(agent: &str) -> Run {
+        Run {
+            id: "run_000001".into(),
+            title: String::new(),
+            agent: agent.to_string(),
+            model: None,
+            workspace: String::new(),
+            prompt: "echo hi".into(),
+            status: RunStatus::Queued,
+            created_at: 0,
+            started_at: None,
+            ended_at: None,
+            exit_code: None,
+            error: None,
+            timeout_s: 10,
+            job_id: None,
+            pid: None,
+            attempts: 0,
+        }
+    }
+
+    #[test]
+    fn unknown_agent_rejected_by_builder() {
+        assert!(build_command(&sample_run("rm -rf /")).is_err());
+        assert!(build_command(&sample_run("shell")).is_ok());
+        assert!(build_command(&sample_run("codex")).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn start_times_near_tolerance() {
+        assert!(start_times_near(1_700_000_000, 1_700_000_010));
+        assert!(start_times_near(1_700_000_000, 1_700_000_000));
+        assert!(!start_times_near(1_700_000_000, 1_700_000_100));
+    }
+
+    #[test]
+    fn stop_guard_prevents_starting() {
+        let cancel = AtomicBool::new(false);
+        assert!(run_is_startable(RunStatus::Queued, &cancel));
+        assert!(!run_is_startable(RunStatus::Killed, &cancel));
+        assert!(!run_is_startable(RunStatus::Running, &cancel));
+        cancel.store(true, Ordering::Relaxed);
+        assert!(!run_is_startable(RunStatus::Queued, &cancel));
     }
 }

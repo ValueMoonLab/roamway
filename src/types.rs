@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -50,6 +51,13 @@ pub fn parse_hhmm(s: &str) -> Option<(i64, i64)> {
         return None;
     }
     Some((h, m))
+}
+
+/// 允许通过 HTTP 提交的 agent 白名单，其余一律拒绝（防止任意命令执行）
+pub const KNOWN_AGENTS: &[&str] = &["shell", "codex", "hermes", "claude", "api:deepseek", "api:qwen"];
+
+pub fn is_known_agent(agent: &str) -> bool {
+    KNOWN_AGENTS.contains(&agent.trim())
 }
 
 /// 下一次「本地钟点」的时间戳（用固定时区偏移，不依赖系统 tz 数据）
@@ -162,6 +170,7 @@ pub struct State {
 pub struct Store {
     pub dir: PathBuf,
     pub state: State,
+    pub loaded_ok: bool,
 }
 
 impl Store {
@@ -169,14 +178,18 @@ impl Store {
         let _ = fs::create_dir_all(dir);
         let _ = fs::create_dir_all(dir.join("logs"));
         let p = dir.join("state.json");
-        let mut state: State = fs::read_to_string(&p)
-            .ok()
-            .and_then(|s| serde_json::from_str(&s).ok())
-            .unwrap_or_default();
+        let bak = dir.join("state.json.bak");
+        let (mut state, loaded_ok) = load_state(&p, &bak);
         // 重启后，上次遗留的 queued/running 一律标记 interrupted，绝不自动重放
         let mut dirty = false;
         for r in state.runs.iter_mut() {
             if !r.status.terminal() {
+                // 回收上次遗留的子进程（尽量先校验，降低 PID 复用误杀）
+                if let Some(pid) = r.pid {
+                    if crate::runner::pid_is_our_run(pid, r.started_at) {
+                        crate::runner::kill_process_group(pid);
+                    }
+                }
                 r.status = RunStatus::Interrupted;
                 r.ended_at = Some(now());
                 r.error = Some("daemon restarted while running".into());
@@ -186,6 +199,7 @@ impl Store {
         let store = Store {
             dir: dir.to_path_buf(),
             state,
+            loaded_ok,
         };
         if dirty {
             store.save();
@@ -195,11 +209,30 @@ impl Store {
 
     pub fn save(&self) {
         let p = self.dir.join("state.json");
+        let bak = self.dir.join("state.json.bak");
         let tmp = self.dir.join("state.json.tmp");
-        if let Ok(s) = serde_json::to_string_pretty(&self.state) {
-            if fs::write(&tmp, s).is_ok() {
-                let _ = fs::rename(&tmp, &p);
+        let s = match serde_json::to_string_pretty(&self.state) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("roamway: serialize state failed: {}", e);
+                return;
             }
+        };
+        // 先写 tmp 并刷盘；成功后滚旧文件为 .bak，再原子替换正式文件。
+        let result = (|| -> std::io::Result<()> {
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(s.as_bytes())?;
+            f.sync_all()?;
+            drop(f);
+            if p.exists() {
+                fs::rename(&p, &bak)?;
+            }
+            fs::rename(&tmp, &p)?;
+            sync_parent_dir(&p)?;
+            Ok(())
+        })();
+        if let Err(e) = result {
+            eprintln!("roamway: save state failed: {}", e);
         }
     }
 
@@ -213,19 +246,71 @@ impl Store {
     }
 }
 
+fn load_state(p: &Path, bak: &Path) -> (State, bool) {
+    match fs::read(p) {
+        Ok(bytes) if bytes.is_empty() => (State::default(), true),
+        Ok(bytes) => match serde_json::from_slice::<State>(&bytes) {
+            Ok(st) => (st, true),
+            Err(e) => {
+                eprintln!("roamway: state.json parse failed: {}", e);
+                let ts = now();
+                let corrupt = p.with_file_name(format!("state.json.corrupt-{}", ts));
+                let _ = fs::rename(p, &corrupt);
+                recover_from_backup(bak)
+            }
+        },
+        Err(_) => recover_from_backup(bak),
+    }
+}
+
+fn recover_from_backup(bak: &Path) -> (State, bool) {
+    match fs::read(bak) {
+        Ok(bytes) => match serde_json::from_slice::<State>(&bytes) {
+            Ok(st) => {
+                eprintln!("roamway: recovered state from state.json.bak");
+                (st, true)
+            }
+            Err(e) => {
+                eprintln!("roamway: state.json.bak parse failed: {}", e);
+                (State::default(), false)
+            }
+        },
+        Err(e) => {
+            eprintln!("roamway: no usable state ({}); starting empty", e);
+            (State::default(), false)
+        }
+    }
+}
+
+#[cfg(unix)]
+fn sync_parent_dir(p: &Path) -> std::io::Result<()> {
+    if let Some(parent) = p.parent() {
+        let d = fs::File::open(parent)?;
+        d.sync_all()?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn sync_parent_dir(_p: &Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 pub struct App {
     pub store: Mutex<Store>,
     pub token: Option<String>,
     pub started: i64,
     pub cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,
     pub tz_offset_hours: i64,
+    pub max_concurrent: usize,
+    pub max_conn: usize,
+    pub conns: AtomicUsize,
 }
 
 impl App {
     pub fn save(&self) {
-        if let Ok(st) = self.store.lock() {
-            st.save();
-        }
+        let st = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        st.save();
     }
 }
 
@@ -264,5 +349,109 @@ mod tests {
         assert!(!RunStatus::Running.terminal());
         assert!(RunStatus::Done.terminal());
         assert!(RunStatus::Interrupted.terminal());
+    }
+
+    #[test]
+    fn agent_whitelist() {
+        for a in ["shell", "codex", "hermes", "claude", "api:deepseek", "api:qwen"] {
+            assert!(is_known_agent(a));
+        }
+        assert!(!is_known_agent("rm -rf /"));
+        assert!(!is_known_agent(""));
+    }
+
+    #[test]
+    fn load_state_recovers_from_backup() {
+        let dir = std::env::temp_dir().join(format!("roamway-load-{}", now()));
+        let _ = fs::create_dir_all(&dir);
+        let p = dir.join("state.json");
+        let bak = dir.join("state.json.bak");
+        fs::write(&p, "{ bad json").unwrap();
+        fs::write(&bak, r#"{"runs":[],"jobs":[],"seq":0}"#).unwrap();
+        let (state, ok) = load_state(&p, &bak);
+        assert!(ok);
+        assert!(state.runs.is_empty());
+        assert!(!p.exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_state_corrupts_and_starts_empty() {
+        let dir = std::env::temp_dir().join(format!("roamway-corrupt-{}", now()));
+        let _ = fs::create_dir_all(&dir);
+        let p = dir.join("state.json");
+        let bak = dir.join("state.json.bak");
+        fs::write(&p, "{ bad json").unwrap();
+        let (state, ok) = load_state(&p, &bak);
+        assert!(!ok);
+        assert!(state.runs.is_empty());
+        let corrupt_exists = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().starts_with("state.json.corrupt-"));
+        assert!(corrupt_exists);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_rotates_previous_state_into_backup() {
+        let dir = std::env::temp_dir().join(format!("roamway-save-{}", now()));
+        let _ = fs::create_dir_all(&dir);
+        let store = Store {
+            dir: dir.clone(),
+            state: State {
+                seq: 7,
+                ..Default::default()
+            },
+            loaded_ok: true,
+        };
+        store.save();
+        assert!(dir.join("state.json").exists());
+        let store2 = Store {
+            dir: dir.clone(),
+            state: State {
+                seq: 9,
+                ..Default::default()
+            },
+            loaded_ok: true,
+        };
+        store2.save();
+        assert!(dir.join("state.json.bak").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_marks_stale_runs_interrupted() {
+        let dir = std::env::temp_dir().join(format!("roamway-interrupted-{}", now()));
+        let _ = fs::create_dir_all(&dir);
+        let run = Run {
+            id: "run_000001".into(),
+            title: String::new(),
+            agent: "shell".into(),
+            model: None,
+            workspace: String::new(),
+            prompt: "echo hi".into(),
+            status: RunStatus::Queued,
+            created_at: now(),
+            started_at: None,
+            ended_at: None,
+            exit_code: None,
+            error: None,
+            timeout_s: 60,
+            job_id: None,
+            pid: None,
+            attempts: 0,
+        };
+        let state = State {
+            runs: vec![run],
+            jobs: vec![],
+            seq: 1,
+        };
+        fs::write(dir.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+        let store = Store::load(&dir);
+        assert_eq!(store.state.runs.len(), 1);
+        assert_eq!(store.state.runs[0].status, RunStatus::Interrupted);
+        assert!(store.state.runs[0].ended_at.is_some());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -18,6 +18,8 @@ for _ in $(seq 1 50); do
 done
 curl -sf -H "x-roamway-token: $TOK" "$BASE/health" >/dev/null || fail "daemon did not come up"
 code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/health")
+[ "$code" = "200" ] || fail "health should be public (got $code)"
+code=$(curl -s -o /dev/null -w '%{http_code}' "$BASE/v1/runs")
 [ "$code" = "401" ] || fail "auth not enforced (got $code)"
 
 out=$("$BIN" run --host "$BASE" --token "$TOK" --agent shell --title smoke "echo roamway-ok")

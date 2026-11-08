@@ -95,6 +95,12 @@ Linux / macOS / Windows（Git Bash 或 PowerShell 均可）。Linux 2 核 2G 足
 
 `codex` / `hermes` / `claude` 是可选依赖，只装你要用的那个；`shell` 和 `api:*` 不需要任何 CLI。
 
+#### macOS
+
+- Apple Silicon 使用 `aarch64-apple-darwin`，Intel 使用 `x86_64-apple-darwin`，都走同一份 `cargo build --release`。
+- 国内用 rsproxy.cn 镜像实测：rustup 安装约 24 秒，首次构建约 95 秒。
+- 若 git 全局配置里残留失效的 `http.proxy`，cargo 拉取依赖时会报 spurious network error；在 `~/.cargo/config.toml` 里加 `[http] proxy = ""` 可解决。
+
 ## 核心概念
 
 | 概念 | 含义 |
@@ -118,7 +124,7 @@ queued ──▶ running ──▶ done
 ## CLI
 
 ```
-roamway serve    [--bind 127.0.0.1:8796] [--data DIR] [--token T] [--tz 8]
+roamway serve    [--bind 127.0.0.1:8796] [--data DIR] [--token T] [--tz 8] [--max-concurrent 4] [--max-conn 64]
 roamway run      --agent AGENT [--model M] [--workspace DIR] [--title T]
                  [--timeout 1800] [--no-wait] "prompt"
 roamway ls       [--limit 20]
@@ -156,7 +162,7 @@ ROAMWAY_CODEX_ARGS="--dangerously-bypass-approvals-and-sandbox" roamway serve ..
 
 `hermes` 同理，用 `ROAMWAY_HERMES_ARGS` 追加参数（例如 `--yolo`）。
 
-想接别的 CLI（aider、cline、自写脚本）：`agent` 填可执行文件名即可，prompt 作为唯一参数追加，退出码 0 视为成功。
+出于安全考虑，`agent` 采用白名单：只接受 `codex`、`hermes`、`claude`、`shell`、`api:deepseek`、`api:qwen`。要接入新 CLI，请在 `src/types.rs` 的 `KNOWN_AGENTS` 与 `src/runner.rs` 的 `build_command` 里各加一条映射后重新编译。
 
 ## 环境变量
 
@@ -181,12 +187,13 @@ ROAMWAY_DEEPSEEK_URL=http://127.0.0.1:11434/v1/chat/completions \
 
 ## HTTP API
 
-除 `/health` 外都要带 `x-roamway-token: <T>` 头，或 `?token=<T>`。
+`GET /health` 免鉴权；其余路由在配置了 token 时只接受 `x-roamway-token: <T>` 请求头（不再支持 `?token=` query 参数）。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| GET | `/health` | 版本、各状态 run 数、job 数、数据目录 |
-| GET | `/v1/runs?limit=50` | 最近 run（倒序） |
+| GET | `/health` | 免鉴权；`{ok, version, uptime_s, running, queued}` |
+| GET | `/v1/health` | 需鉴权；版本、各状态 run/job 计数、数据目录 |
+| GET | `/v1/runs?limit=50&offset=0` | 最近 run（倒序）；`limit` 1..=200，不返回 prompt 全文 |
 | POST | `/v1/runs` | 新建 run |
 | GET | `/v1/runs/{id}` | run 详情 |
 | GET | `/v1/runs/{id}/log?tail=200` | 日志尾部 |
@@ -197,6 +204,8 @@ ROAMWAY_DEEPSEEK_URL=http://127.0.0.1:11434/v1/chat/completions \
 | POST | `/v1/jobs/{id}/run` | 立即触发一次 |
 | POST | `/v1/jobs/{id}/enable` / `disable` | 开关 |
 | DELETE | `/v1/jobs/{id}` | 删除 |
+
+`POST /v1/runs/{id}/stop` 对运行中的 `api:*` run 返回 `409 {"error":"api run not cancellable"}`（直连 API 无法中断）；`queued` 的 `api:*` run 仍可取消，其余 run 会先写取消标志再改状态，避免停止后复活。
 
 派活：
 
@@ -234,7 +243,7 @@ curl -s -H "x-roamway-token: $TOK" -H 'content-type: application/json' \
 | 不重叠 | scheduler 检查同 job 是否有未结束的 run |
 | 不撑爆磁盘 | 只保留最近 800 条 run，日志随之删除；单次读取封顶 200 KB |
 | 单次不超时 | `timeout_s` 到点 kill，标 `timeout` |
-| 可观测 | `~/.roamway/heartbeat` 每 5 秒刷新；`/health` 汇总计数 |
+| 可观测 | `~/.roamway/heartbeat` 每 5 秒刷新；`/health` 与 `/v1/health` 汇总计数 |
 
 ## 部署
 
@@ -303,7 +312,7 @@ roamway run --host http://192.168.1.50:8796 --token T \
 
 - 默认只绑 `127.0.0.1`；`--bind 0.0.0.0` 是你主动开放给局域网。
 - token 走明文 HTTP，只适合可信内网；公网请套 TLS 反代（Caddy / Nginx / frp + TLS 都行）。
-- 没设 token 时**任何人都能派活**，只在完全隔离的环境里这么用。
+- 没设 token 且 `--bind` 非 loopback（`127.0.0.1`/`::1`）时 daemon 拒绝启动（退出码 2）；只在 loopback 绑定下才允许无 token 运行。
 - `codex` 默认 `workspace-write` 沙箱。加 `--dangerously-bypass-approvals-and-sandbox` 等于把整台机器交给模型，别在有重要数据的主机上这么干。
 - `--token` 会把 token 写进进程命令行（`ps` 可见）。长期部署请用 `ROAMWAY_TOKEN` 环境变量或 `EnvironmentFile=`，`scripts/roamway-start.sh` 已按这种方式处理。
 - 数据目录里有全量日志，按需 `chmod 700`。
@@ -315,7 +324,7 @@ roamway run --host http://192.168.1.50:8796 --token T \
 | 定位 | 人在环的多 agent 工作台 | 无人值守的任务执行器 |
 | 界面 | Web UI / WSS | HTTP + CLI |
 | 多机 | 联邦、host 列表 | 各自独立 daemon，互相调 |
-| 定时任务 | 无 | 有，带退避与上限 |
+| 定时任务 | 0.15+ 支持 cron schedule | 有，带退避与上限 |
 | 重启语义 | 取决于前端 | 明确不重放 |
 | 体积 | Node 生态 | 2 MB 单文件 |
 
@@ -344,7 +353,7 @@ docs/architecture.md  设计取舍
 
 - [ ] Windows 原生预编译产物
 - [ ] 任务依赖（A 成功后再跑 B）
-- [ ] 并发上限（全局 / 每 agent）
+- [x] 并发上限（全局 / 每 agent）
 - [ ] `/metrics`（Prometheus 文本格式）
 - [ ] 只读 Web 面板
 

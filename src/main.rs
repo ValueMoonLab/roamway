@@ -6,6 +6,7 @@ mod types;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -17,7 +18,7 @@ fn usage() {
     println!(
         r#"roamway {} — 迷你多智能体编排器（国内模型 / 长跑友好）
 
-  roamway serve  [--bind 127.0.0.1:8796] [--data DIR] [--token T] [--tz 8]
+  roamway serve  [--bind 127.0.0.1:8796] [--data DIR] [--token T] [--tz 8] [--max-concurrent 4] [--max-conn 64]
   roamway run    --agent codex [--model M] [--workspace DIR] [--title T] [--timeout 1800] [--no-wait] "prompt"
   roamway ls     [--limit 20]
   roamway status ID
@@ -154,6 +155,21 @@ fn default_data_dir() -> PathBuf {
     PathBuf::from(home).join(".roamway")
 }
 
+fn is_loopback_bind(bind: &str) -> bool {
+    let bind = bind.trim();
+    if bind == "127.0.0.1" || bind == "::1" || bind == "localhost" {
+        return true;
+    }
+    if let Some(rest) = bind.strip_prefix('[') {
+        let host = rest.split(']').next().unwrap_or("");
+        return host == "::1";
+    }
+    match bind.rsplit_once(':') {
+        Some((host, _)) => matches!(host, "127.0.0.1" | "localhost" | "::1"),
+        None => false,
+    }
+}
+
 fn cmd_serve(flags: &HashMap<String, String>) {
     // 守护进程常见坑：非登录 shell 的 PATH 找不到 ~/.npm-global/bin 里的 codex
     if let Ok(home) = std::env::var("HOME") {
@@ -178,23 +194,48 @@ fn cmd_serve(flags: &HashMap<String, String>) {
         .get("tz")
         .and_then(|v| v.parse().ok())
         .unwrap_or(8);
+    let max_concurrent: usize = flags
+        .get("max-concurrent")
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(4);
+    let max_conn: usize = flags
+        .get("max-conn")
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(64);
+
+    // 无 token 且绑定非 loopback 时拒绝启动，避免把任意命令执行暴露给整个网络
+    if token.is_none() && !is_loopback_bind(&bind) {
+        eprintln!(
+            "roamway: refusing to serve without --token on non-loopback bind {}; use 127.0.0.1/::1 or set ROAMWAY_TOKEN",
+            bind
+        );
+        std::process::exit(2);
+    }
 
     let store = Store::load(&data);
+    let loaded_ok = store.loaded_ok;
     let app = Arc::new(App {
         store: Mutex::new(store),
         token: token.clone(),
         started: now(),
         cancels: Mutex::new(HashMap::new()),
         tz_offset_hours: tz,
+        max_concurrent,
+        max_conn,
+        conns: AtomicUsize::new(0),
     });
-    app.save();
+    if loaded_ok {
+        app.save();
+    }
 
     jobs::start_scheduler(app.clone());
 
     let hb = app.clone();
     thread::spawn(move || loop {
         let p = {
-            let st = hb.store.lock().unwrap();
+            let st = hb.store.lock().unwrap_or_else(|e| e.into_inner());
             st.dir.join("heartbeat")
         };
         let _ = std::fs::write(&p, format!("{}\n", iso(now())));
@@ -202,11 +243,13 @@ fn cmd_serve(flags: &HashMap<String, String>) {
     });
 
     println!(
-        "roamway {} | data={} | auth={} | tz=+{}",
+        "roamway {} | data={} | auth={} | tz=+{} | max-concurrent={} | max-conn={}",
         env!("CARGO_PKG_VERSION"),
         data.display(),
         if token.is_some() { "token" } else { "off" },
-        tz
+        tz,
+        max_concurrent,
+        max_conn
     );
     if let Err(e) = server::serve(app, &bind) {
         eprintln!("serve failed: {}", e);
@@ -464,5 +507,38 @@ fn cmd_health(flags: &HashMap<String, String>) {
     match c.req("GET", "/health", None) {
         Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default()),
         Err(e) => eprintln!("health failed: {}", e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flags_parse_pairs_and_bools() {
+        let args = [
+            "--bind".to_string(),
+            "127.0.0.1:1".to_string(),
+            "--no-wait".to_string(),
+            "run".to_string(),
+        ];
+        let (flags, pos) = parse_flags(&args);
+        assert_eq!(flags.get("bind").map(String::as_str), Some("127.0.0.1:1"));
+        assert_eq!(flags.get("no-wait").map(String::as_str), Some("true"));
+        assert_eq!(pos, vec!["run".to_string()]);
+    }
+
+    #[test]
+    fn loopback_bind_detection() {
+        assert!(is_loopback_bind("127.0.0.1:8796"));
+        assert!(is_loopback_bind("127.0.0.1"));
+        assert!(is_loopback_bind("::1"));
+        assert!(is_loopback_bind("[::1]:8796"));
+        assert!(is_loopback_bind("::1:8796"));
+        assert!(is_loopback_bind("localhost:8796"));
+        assert!(!is_loopback_bind("0.0.0.0:8796"));
+        assert!(!is_loopback_bind("192.168.1.50:8796"));
+        assert!(!is_loopback_bind("::"));
+        assert!(!is_loopback_bind("[::]:8796"));
     }
 }

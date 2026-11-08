@@ -24,17 +24,34 @@ pub fn next_after(j: &Job, t: i64, tz: i64) -> i64 {
     t + 86400
 }
 
+/// 把失败后的重试语义收敛到这一个纯函数里，方便单测。
+/// max_retries=0 表示"不额外重试"，按原周期继续；>0 才做退避重试并最终自停。
+pub fn apply_failure(j: &mut Job, t: i64, tz: i64, reason: &str) {
+    j.attempts += 1;
+    j.last_error = Some(reason.to_string());
+    if j.attempts <= j.max_retries {
+        j.next_at = t + backoff(j.attempts);
+    } else {
+        if j.max_retries > 0 {
+            j.enabled = false;
+        }
+        j.attempts = 0;
+        j.next_at = next_after(j, t, tz);
+    }
+}
+
 pub fn start_scheduler(app: Arc<App>) {
     thread::spawn(move || loop {
         thread::sleep(Duration::from_secs(1));
         for id in collect_due(&app) {
             spawn_from_job(app.clone(), &id);
         }
+        drain_queued(&app);
     });
 }
 
 fn collect_due(app: &Arc<App>) -> Vec<String> {
-    let mut st = app.store.lock().unwrap();
+    let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
     let t = now();
     let busy: Vec<String> = st
         .state
@@ -67,8 +84,8 @@ fn collect_due(app: &Arc<App>) -> Vec<String> {
 }
 
 pub fn spawn_from_job(app: Arc<App>, job_id: &str) {
-    let run_id = {
-        let mut st = app.store.lock().unwrap();
+    {
+        let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
         let t = now();
         let j = match st.state.jobs.iter().find(|j| j.id == job_id).cloned() {
             Some(j) => j,
@@ -102,13 +119,44 @@ pub fn spawn_from_job(app: Arc<App>, job_id: &str) {
         }
         prune(&mut st);
         st.save();
-        id
     };
-    runner::start(app, run_id);
+    drain_queued(&app);
+}
+
+/// 每轮从 Queued 里拾取，直到跑满 max_concurrent；手动 run 与 job run 一视同仁。
+/// 纯逻辑：在 max_concurrent 约束下，本轮应从 Queued 中拾取哪些 run。
+fn queued_to_start(state: &State, max_concurrent: usize) -> Vec<String> {
+    let running = state
+        .runs
+        .iter()
+        .filter(|r| r.status == RunStatus::Running)
+        .count();
+    let mut slots = max_concurrent.saturating_sub(running);
+    let mut ids = Vec::new();
+    for r in state.runs.iter() {
+        if slots == 0 {
+            break;
+        }
+        if r.status == RunStatus::Queued {
+            ids.push(r.id.clone());
+            slots -= 1;
+        }
+    }
+    ids
+}
+
+pub fn drain_queued(app: &Arc<App>) {
+    let ids = {
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        queued_to_start(&st.state, app.max_concurrent)
+    };
+    for id in ids {
+        runner::start(app.clone(), id);
+    }
 }
 
 /// 只保留最近 800 条运行记录，日志同步清理，避免长跑无限膨胀
-fn prune(st: &mut Store) {
+pub fn prune(st: &mut Store) {
     const MAX_RUNS: usize = 800;
     if st.state.runs.len() <= MAX_RUNS {
         return;
@@ -139,5 +187,125 @@ mod tests {
         assert_eq!(backoff(2), 60);
         assert_eq!(backoff(3), 120);
         assert_eq!(backoff(9), 3600);
+    }
+
+    fn sample_job(max_retries: u32) -> Job {
+        Job {
+            id: "job_000001".into(),
+            title: String::new(),
+            agent: "shell".into(),
+            model: None,
+            workspace: String::new(),
+            prompt: "echo hi".into(),
+            every_secs: Some(3600),
+            daily: None,
+            tz_offset_hours: 8,
+            timeout_s: 60,
+            max_retries,
+            enabled: true,
+            allow_overlap: false,
+            next_at: 1000,
+            last_run: None,
+            last_error: None,
+            attempts: 0,
+        }
+    }
+
+    #[test]
+    fn max_retries_zero_means_no_extra_retry() {
+        let mut j = sample_job(0);
+        apply_failure(&mut j, 1000, 8, "failed");
+        assert_eq!(j.attempts, 0);
+        assert!(j.enabled);
+        assert_eq!(j.next_at, 1000 + 3600);
+    }
+
+    #[test]
+    fn max_retries_exhaustion_disables_job() {
+        let mut j = sample_job(2);
+        apply_failure(&mut j, 1000, 8, "timeout");
+        assert_eq!(j.attempts, 1);
+        assert_eq!(j.next_at, 1000 + 30);
+        assert!(j.enabled);
+        apply_failure(&mut j, 1030, 8, "timeout");
+        assert_eq!(j.attempts, 2);
+        assert_eq!(j.next_at, 1030 + 60);
+        assert!(j.enabled);
+        apply_failure(&mut j, 1090, 8, "timeout");
+        assert_eq!(j.attempts, 0);
+        assert!(!j.enabled);
+        assert_eq!(j.next_at, 1090 + 3600);
+    }
+
+    #[test]
+    fn queued_to_start_respects_max_concurrent() {
+        let mk = |id: &str, status: RunStatus| Run {
+            id: id.into(),
+            title: String::new(),
+            agent: "shell".into(),
+            model: None,
+            workspace: String::new(),
+            prompt: String::new(),
+            status,
+            created_at: 0,
+            started_at: None,
+            ended_at: None,
+            exit_code: None,
+            error: None,
+            timeout_s: 60,
+            job_id: None,
+            pid: None,
+            attempts: 0,
+        };
+        let state = State {
+            runs: vec![
+                mk("a", RunStatus::Running),
+                mk("b", RunStatus::Queued),
+                mk("c", RunStatus::Queued),
+                mk("d", RunStatus::Queued),
+                mk("e", RunStatus::Queued),
+            ],
+            jobs: vec![],
+            seq: 0,
+        };
+        let picked = queued_to_start(&state, 2);
+        assert_eq!(picked, vec!["b".to_string()]);
+        let picked = queued_to_start(&state, 5);
+        assert_eq!(picked, vec!["b".to_string(), "c".to_string(), "d".to_string(), "e".to_string()]);
+    }
+
+    #[test]
+    fn prune_trims_terminal_runs() {
+        let mk = |i: usize| Run {
+            id: format!("run_{:06}", i),
+            title: String::new(),
+            agent: "shell".into(),
+            model: None,
+            workspace: String::new(),
+            prompt: String::new(),
+            status: RunStatus::Done,
+            created_at: 0,
+            started_at: None,
+            ended_at: None,
+            exit_code: None,
+            error: None,
+            timeout_s: 60,
+            job_id: None,
+            pid: None,
+            attempts: 0,
+        };
+        let dir = std::env::temp_dir().join(format!("roamway-prune-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut store = Store {
+            dir,
+            state: State {
+                runs: (0..805).map(mk).collect(),
+                jobs: vec![],
+                seq: 0,
+            },
+            loaded_ok: true,
+        };
+        prune(&mut store);
+        assert_eq!(store.state.runs.len(), 800);
     }
 }
