@@ -1892,7 +1892,7 @@ fn create_run(app: &Arc<App>, req: &Req) -> (u16, Value) {
             job_id: None,
             pid: None,
             attempts: 0,
-            agent_id: None,
+            agent_id: None,
             trigger_id: None,
             usage: None,
         };
@@ -2352,7 +2352,7 @@ mod tests {
             job_id: None,
             pid: None,
             attempts: 0,
-            agent_id: None,
+            agent_id: None,
             trigger_id: None,
             usage: None,
         };
