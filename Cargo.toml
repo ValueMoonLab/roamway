@@ -18,6 +18,7 @@ ureq = { version = "2", features = ["json"] }
 
 [profile.release]
 opt-level = "s"
-lto = true
+lto = "thin"
 codegen-units = 1
-strip = true
+# strip 必须留空：rustc 1.99 在 strip=symbols + LTO 的干净构建下会在 back/lto.rs
+# prepare_lto 处 ICE（couldn't open rlib）。二进制在部署脚本里另用 strip 处理。
