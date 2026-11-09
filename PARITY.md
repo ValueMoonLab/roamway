@@ -60,13 +60,13 @@
 | 12 | `paseo agent detach` | ✅ | `src/main.rs:fn cmd_agent_detach` | subagent 转独立 |
 | 13 | `paseo agent update` | ✅ | `src/main.rs:fn cmd_agent_update` | 更新元数据 |
 | 14 | `paseo daemon start` | ✅ | `src/main.rs:fn cmd_daemon_start` | 后台拉起 + pid/bind |
-| 15 | `paseo daemon run` | ⚠️ | `src/main.rs:fn cmd_serve` | 前台 `serve` 等价；缺 Paseo 部署参数集 |
+| 15 | `paseo daemon run` | ✅ | `src/main.rs:fn cmd_daemon_run` | 前台按 `resolve_config` 起生产 serve；`--foreground` 接受（serve 本就前台） |
 | 16 | `paseo daemon status` | ✅ | `src/main.rs:fn cmd_daemon_status` | 读 pid/bind，offline 判断 |
 | 17 | `paseo daemon stop` | ✅ | `src/main.rs:fn cmd_daemon_stop` | SIGTERM/taskkill + 端口校验 |
 | 18 | `paseo daemon restart` | ✅ | `src/main.rs:fn cmd_daemon_restart` | stop+start |
 | 19 | `paseo daemon reload` | ✅ | `src/main.rs:fn cmd_daemon_reload` | 重读 hosts.json |
 | 20 | `paseo daemon pair` | ✅ | `src/main.rs:fn cmd_daemon_pair` | 配对信息 |
-| 21 | `paseo daemon config` | ✅ | `src/main.rs:fn cmd_daemon_config` | 数据目录/hosts/并发/版本 |
+| 21 | `paseo daemon config` | ✅ | `src/config.rs:fn resolve_config` / 测试：`resolve_priority_flag_over_env_over_file_over_default` | 持久 config.json + get/set/unset + 来源列；选项全集见下 |
 | 22 | `paseo daemon set-password` | ✅ | `src/main.rs:fn cmd_daemon_set_password` | 密码哈希存储 |
 | 23 | `paseo hub init` | ✅ | `src/main.rs:fn cmd_hub_init` | starter Hub |
 | 24 | `paseo hub permissions` | ✅ | `src/main.rs:fn cmd_hub_permissions` | ls/grant/revoke |
@@ -154,3 +154,26 @@ P12 新增单测：`parse_labels_accepts_multi_and_rejects_missing_equals`、`ru
 | provider 会话续跑 | ⚠️ | `src/agents.rs:fn should_resume`、`src/runner.rs:fn apply_resume_note`、`src/server.rs:fn agent_session_route`、`src/main.rs:fn resume_target` / 测试：`should_resume_requires_resumable_kind_and_session`、`session_route_hits_session_endpoint_before_agent_route`、`resume_target_parses_agent_and_prompt_and_rejects_conflicts`、`apply_resume_note_marks_done_run_error_without_changing_status` | 首轮续跑 ✅（`run --resume/--continue` + `GET /v1/agents/{id}/session`）；unsupported 显式化 ✅（`run.resume_note="resume unsupported"`）；`--thinking` 等未对齐项仍在 |
 
 P13 新增单测：`should_resume_requires_resumable_kind_and_session`（`src/agents.rs`）；`apply_resume_note_marks_done_run_error_without_changing_status`、`apply_resume_note_on_non_done_run_keeps_error_untouched`（`src/runner.rs`）；`session_route_hits_session_endpoint_before_agent_route`、`session_route_missing_agent_returns_404`（`src/server.rs`）；`resume_target_parses_agent_and_prompt_and_rejects_conflicts`（`src/main.rs`）。
+
+## 六、P14 daemon 部署面
+
+`daemon config` 选项全集逐条对表（roamway 12 键）：
+
+| roamway key | 状态 | 说明 |
+|---|---|---|
+| `bind` | ✅ | `src/config.rs:fn resolve_config`；CLI `--bind` > `ROAMWAY_BIND` > file > default |
+| `max_concurrent` | ✅ | CLI `--max-concurrent` > `ROAMWAY_MAX_CONCURRENT` > file > default 4 |
+| `max_conn` | ✅ | CLI `--max-conn` > `ROAMWAY_MAX_CONN` > file > default 64 |
+| `tz_offset_hours` | ✅ | CLI `--tz` > `ROAMWAY_TZ` > file > default 8 |
+| `unix_socket` | ✅ | CLI `--unix-socket` > file |
+| `tls_cert` | ✅ | CLI `--tls-cert` > file |
+| `tls_key` | ✅ | CLI `--tls-key` > file |
+| `allow_hosts` | ✅ | CLI `--allow-host`（可重复）> `ROAMWAY_ALLOW_HOSTS`（逗号）> file |
+| `allow_origins` | ✅ | CLI `--allow-origin`（可重复）> file |
+| `require_approval` | ✅ | CLI `--require-approval`（scope 列表）> `ROAMWAY_REQUIRE_APPROVAL`（bool）> file（bool） |
+| `token_env` | ✅ | file；只存环境变量名，token 值永不落盘 |
+| `keep_runs` | ✅ | file；0 不修剪，默认 500（roamway 扩展，Paseo 无对应项） |
+
+Paseo 未对齐项：`daemon run` 的 `--thinking/--mode/--provider` 等 agent 参数继续走 `run` 的既有不支持面（exit 2），不在 daemon 配置面内。
+
+P14 新增单测（`src/config.rs`）：`resolve_priority_flag_over_env_over_file_over_default`、`resolve_env_comma_array_and_invalid_values`、`config_roundtrip_and_no_token_leak`、`config_load_bad_json_reports_line`、`config_rejects_forbidden_and_unknown_keys`、`config_key_whitelist`、`apply_set_validates_and_applies`、`trim_runs_keeps_newest_and_never_drops_running`。

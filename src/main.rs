@@ -1,5 +1,6 @@
 mod agents;
 mod auth;
+mod config;
 mod cron;
 mod hosts;
 mod hub;
@@ -64,7 +65,7 @@ fn usage() {
   roamway hub [init|permissions|projects|deploy|logout|status|token rotate]
   roamway health
   roamway host add|ls|rm|enable|disable|probe
-  roamway daemon status|config|start|stop|restart|reload|pair|set-password
+  roamway daemon status|config|start|stop|restart|reload|pair|set-password|run
   roamway token add|create --name N [--scope read|run|admin] [--ttl 24h] | ls|list | revoke <id>
   roamway approve <id> | deny <id> | approvals [--all]
   roamway onboard [--bind 0.0.0.0:8796]
@@ -818,7 +819,7 @@ fn print_command_help(cmd: &str) -> bool {
         "approve" => "roamway approve <id>",
         "deny" => "roamway deny <id>",
         "approvals" => "roamway approvals [--all]",
-        "daemon" => "roamway daemon status|config|start|stop|restart|reload|pair|set-password",
+        "daemon" => "roamway daemon status|config [get <key>|set <key> <value>|unset <key>]|start|stop|restart|reload|pair|set-password|run [--foreground]",
         "onboard" => "roamway onboard [--bind 0.0.0.0:8796]",
         "restart" => "roamway restart",
         "reload" => "roamway reload",
@@ -967,6 +968,15 @@ fn is_loopback_bind(bind: &str) -> bool {
     }
 }
 
+fn env_map() -> HashMap<String, String> {
+    std::env::vars().collect()
+}
+
+fn resolved_config(flags: &HashMap<String, String>) -> Result<config::EffectiveConfig, String> {
+    let file = config::load(&data_dir_for(flags))?;
+    config::resolve_config(flags, &env_map(), &file)
+}
+
 fn cmd_serve(flags: &HashMap<String, String>) {
     // 守护进程常见坑：非登录 shell 的 PATH 找不到 ~/.npm-global/bin 里的 codex
     if let Ok(home) = std::env::var("HOME") {
@@ -974,39 +984,30 @@ fn cmd_serve(flags: &HashMap<String, String>) {
         let cur = std::env::var("PATH").unwrap_or_default();
         std::env::set_var("PATH", format!("{}:{}", extra, cur));
     }
-    let bind = flags
-        .get("bind")
-        .cloned()
-        .unwrap_or_else(|| "127.0.0.1:8796".into());
-    let data = flags
-        .get("data")
-        .map(PathBuf::from)
-        .unwrap_or_else(default_data_dir);
+    let cfg = match resolved_config(flags) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{}", e);
+            fail(2);
+            return;
+        }
+    };
+    let bind = cfg.bind.clone();
+    let data = data_dir_for(flags);
     let token = flags
         .get("token")
         .cloned()
         .or_else(|| std::env::var("ROAMWAY_TOKEN").ok())
         .filter(|t| !t.is_empty());
-    let tz: i64 = flags
-        .get("tz")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(8);
-    let max_concurrent: usize = flags
-        .get("max-concurrent")
-        .and_then(|v| v.parse().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(4);
-    let max_conn: usize = flags
-        .get("max-conn")
-        .and_then(|v| v.parse().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(64);
-    let allow_hosts = flag_many(flags, "allow-host");
-    let allow_origins = flag_many(flags, "allow-origin");
-    let require_approval = flag_many(flags, "require-approval");
-    let unix_socket = flags.get("unix-socket").map(PathBuf::from);
-    let tls_cert = flags.get("tls-cert").map(PathBuf::from);
-    let tls_key = flags.get("tls-key").map(PathBuf::from);
+    let tz = cfg.tz_offset_hours;
+    let max_concurrent = cfg.max_concurrent;
+    let max_conn = cfg.max_conn;
+    let allow_hosts = cfg.allow_hosts.clone();
+    let allow_origins = cfg.allow_origins.clone();
+    let require_approval = cfg.require_approval.clone();
+    let unix_socket = cfg.unix_socket.clone().map(PathBuf::from);
+    let tls_cert = cfg.tls_cert.clone().map(PathBuf::from);
+    let tls_key = cfg.tls_key.clone().map(PathBuf::from);
     let bind_host = bind_parts(&bind).map(|(h, _)| h).unwrap_or_else(|| bind.clone());
 
     // 无 token 且绑定非 loopback 时拒绝启动，避免把任意命令执行暴露给整个网络
@@ -1020,7 +1021,10 @@ fn cmd_serve(flags: &HashMap<String, String>) {
         std::process::exit(2);
     }
 
-    let store = Store::load(&data);
+    let mut store = Store::load(&data);
+    if config::trim_runs(&mut store.state.runs, cfg.keep_runs) {
+        store.save();
+    }
     let loaded_ok = store.loaded_ok;
     let schedule_store = schedules::ScheduleStore::load(&data);
     // 受管终端：元数据落 data/terminals.json，运行态只在内存，重启后标 exited 不复活
@@ -3648,17 +3652,22 @@ fn cmd_agent_attach(flags: &HashMap<String, String>, pos: &[String]) {
     }
 }
 
+fn cmd_daemon_run(flags: &HashMap<String, String>) {
+    cmd_serve(flags);
+}
+
 fn cmd_daemon(flags: &HashMap<String, String>, pos: &[String]) {
     match pos.first().map(String::as_str).unwrap_or("help") {
         "status" => cmd_daemon_status(flags),
-        "config" => cmd_daemon_config(flags),
+        "config" => cmd_daemon_config(flags, pos),
         "start" => cmd_daemon_start(flags),
+        "run" => cmd_daemon_run(flags),
         "stop" => cmd_daemon_stop(flags),
         "restart" => cmd_daemon_restart(flags),
         "reload" => cmd_daemon_reload(flags),
         "pair" => cmd_daemon_pair(flags),
         "set-password" => cmd_daemon_set_password(flags),
-        _ => usage_error("usage: roamway daemon status|config|start|stop|restart|reload|pair|set-password"),
+        _ => usage_error("usage: roamway daemon status|config|start|stop|restart|reload|pair|set-password|run"),
     }
 }
 
@@ -3682,6 +3691,10 @@ fn cmd_daemon_status(flags: &HashMap<String, String>) {
         return;
     }
     let data = data_dir_for(flags);
+    let config_file = data.join("config.json");
+    let effective_bind = resolved_config(flags)
+        .map(|c| c.bind)
+        .unwrap_or_else(|_| "127.0.0.1:8796".to_string());
     let mut status = json!({
         "ok": false,
         "error": "not running",
@@ -3689,6 +3702,8 @@ fn cmd_daemon_status(flags: &HashMap<String, String>) {
         "uptime_s": 0,
         "pid": Value::Null,
         "data_dir": data.to_string_lossy(),
+        "config_file": config_file.to_string_lossy(),
+        "effective_bind": effective_bind.clone(),
     });
     if let Some((pid, bind)) = read_pid(flags) {
         status["pid"] = json!(pid);
@@ -3714,6 +3729,7 @@ fn cmd_daemon_status(flags: &HashMap<String, String>) {
     }
     if status["pid"].is_null() {
         println!("daemon offline | data {}", data.display());
+        println!("config {}  effective_bind {}", config_file.display(), effective_bind);
         return;
     }
     println!(
@@ -3724,36 +3740,137 @@ fn cmd_daemon_status(flags: &HashMap<String, String>) {
         status["uptime_s"].as_i64().unwrap_or(0),
         status["data_dir"].as_str().unwrap_or("-")
     );
+    println!("config {}  effective_bind {}", config_file.display(), effective_bind);
 }
 
-fn cmd_daemon_config(flags: &HashMap<String, String>) {
+fn cmd_daemon_config(flags: &HashMap<String, String>, pos: &[String]) {
     let data = data_dir_for(flags);
-    let max_concurrent = flags
-        .get("max-concurrent")
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|v| *v > 0)
-        .unwrap_or(4);
-    let out = json!({
-        "data_dir": data.to_string_lossy(),
-        "hosts_file": data.join("hosts.json").to_string_lossy(),
-        "max_concurrent": max_concurrent,
-        "version": env!("CARGO_PKG_VERSION"),
-    });
-    if flags.contains_key("json") {
-        println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
-    } else {
-        println!("data_dir:  {}", data.display());
-        println!("hosts:     {}", data.join("hosts.json").display());
-        println!("concurrency: {}", max_concurrent);
-        println!("version:   {}", env!("CARGO_PKG_VERSION"));
+    let sub = pos.get(1).map(String::as_str).unwrap_or("show");
+    match sub {
+        "get" => {
+            let key = match pos.get(2) {
+                Some(k) => k.as_str(),
+                None => {
+                    usage_error("usage: roamway daemon config get <key>");
+                    return;
+                }
+            };
+            if !config::config_key_allowed(key) {
+                usage_error(&format!("unknown config key '{}'", key));
+                return;
+            }
+            let cfg = match resolved_config(flags) {
+                Ok(c) => c,
+                Err(e) => {
+                    usage_error(&e);
+                    return;
+                }
+            };
+            if format_is_json(flags) {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "key": key,
+                        "value": cfg.display_value(key),
+                        "source": cfg.source_of(key),
+                    }))
+                    .unwrap_or_default()
+                );
+            } else {
+                println!("{}", cfg.display_value(key));
+            }
+        }
+        "set" => {
+            let (key, value) = match (pos.get(2), pos.get(3)) {
+                (Some(k), Some(v)) => (k.as_str(), v.as_str()),
+                _ => {
+                    usage_error("usage: roamway daemon config set <key> <value>");
+                    return;
+                }
+            };
+            let mut cfg = match config::load(&data) {
+                Ok(c) => c,
+                Err(e) => {
+                    usage_error(&e);
+                    return;
+                }
+            };
+            if let Err(e) = config::apply_set(&mut cfg, key, value) {
+                usage_error(&e);
+                return;
+            }
+            if let Err(e) = config::save(&cfg, &data) {
+                usage_error(&e);
+                return;
+            }
+            println!("set {} = {}", key, value);
+        }
+        "unset" => {
+            let key = match pos.get(2) {
+                Some(k) => k.as_str(),
+                None => {
+                    usage_error("usage: roamway daemon config unset <key>");
+                    return;
+                }
+            };
+            let mut cfg = match config::load(&data) {
+                Ok(c) => c,
+                Err(e) => {
+                    usage_error(&e);
+                    return;
+                }
+            };
+            if let Err(e) = config::apply_unset(&mut cfg, key) {
+                usage_error(&e);
+                return;
+            }
+            if let Err(e) = config::save(&cfg, &data) {
+                usage_error(&e);
+                return;
+            }
+            println!("unset {}", key);
+        }
+        _ => {
+            let cfg = match resolved_config(flags) {
+                Ok(c) => c,
+                Err(e) => {
+                    usage_error(&e);
+                    return;
+                }
+            };
+            if format_is_json(flags) {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "config": cfg.config_json(),
+                        "sources": cfg.sources_json(),
+                    }))
+                    .unwrap_or_default()
+                );
+            } else {
+                for key in config::CONFIG_KEYS {
+                    println!(
+                        "{:<18}{:<18}{}",
+                        key,
+                        cfg.display_value(key),
+                        cfg.source_of(key)
+                    );
+                }
+            }
+        }
     }
 }
 
 fn cmd_daemon_start(flags: &HashMap<String, String>) {
-    let bind = flags
-        .get("bind")
-        .cloned()
-        .unwrap_or_else(|| "127.0.0.1:8796".into());
+    let cfg = match resolved_config(flags) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{}", e);
+            fail(2);
+            return;
+        }
+    };
+    let bind = cfg.bind.clone();
     let data = data_dir_for(flags);
     let _ = std::fs::create_dir_all(&data);
     let exe = match std::env::current_exe() {
@@ -3774,7 +3891,31 @@ fn cmd_daemon_start(flags: &HashMap<String, String>) {
         .arg(&bind)
         .arg("--data")
         .arg(&data)
-        .stdin(Stdio::null())
+        .arg("--tz")
+        .arg(cfg.tz_offset_hours.to_string())
+        .arg("--max-concurrent")
+        .arg(cfg.max_concurrent.to_string())
+        .arg("--max-conn")
+        .arg(cfg.max_conn.to_string());
+    for host in &cfg.allow_hosts {
+        cmd.arg("--allow-host").arg(host);
+    }
+    for origin in &cfg.allow_origins {
+        cmd.arg("--allow-origin").arg(origin);
+    }
+    for scope in &cfg.require_approval {
+        cmd.arg("--require-approval").arg(scope);
+    }
+    if let Some(s) = cfg.unix_socket.as_ref() {
+        cmd.arg("--unix-socket").arg(s);
+    }
+    if let Some(s) = cfg.tls_cert.as_ref() {
+        cmd.arg("--tls-cert").arg(s);
+    }
+    if let Some(s) = cfg.tls_key.as_ref() {
+        cmd.arg("--tls-key").arg(s);
+    }
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     if let Some(t) = token {
@@ -3799,7 +3940,12 @@ fn cmd_daemon_start(flags: &HashMap<String, String>) {
         Ok(child) => {
             let pid = child.id();
             let _ = std::fs::write(pid_path(flags), format!("{}\n{}\n", pid, bind));
-            println!("daemon started pid={} bind={}", pid, bind);
+            println!(
+                "daemon started pid={} bind={} config={}",
+                pid,
+                bind,
+                data.join("config.json").display()
+            );
         }
         Err(e) => eprintln!("daemon start failed: {}", e),
     }

@@ -21,6 +21,21 @@ roamway start                # = daemon start，拉起后写入 pid 与 bind
 roamway status               # 看 daemon 状态
 ```
 
+部署参数可以写进 `config.json`，之后 `daemon start` / `daemon run` 直接复用（部署一次、复现多次）：
+
+```bash
+roamway daemon config set bind 127.0.0.1:8796
+roamway daemon config set max_concurrent 8
+roamway daemon start
+```
+
+查看生效值与来源：
+
+```bash
+roamway daemon config          # 每行带来源（flag/env/file/default）
+roamway daemon config get bind
+```
+
 ## 2. 首次配置（可选）
 
 ```bash
