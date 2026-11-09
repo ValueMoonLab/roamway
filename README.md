@@ -125,6 +125,8 @@ queued ──▶ running ──▶ done
 
 ```
 roamway serve    [--bind 127.0.0.1:8796] [--data DIR] [--token T] [--tz 8] [--max-concurrent 4] [--max-conn 64]
+                 [--tls-cert PEM --tls-key PEM] [--allow-host H] [--allow-origin O]
+                 [--unix-socket PATH] [--require-approval run|admin]
 roamway run      --agent AGENT [--model M] [--workspace DIR] [--title T]
                  [--timeout 1800] [--no-wait] "prompt"
 roamway ls       [--limit 20]
@@ -139,6 +141,11 @@ roamway jobs-add --agent AGENT (--every 3600 | --daily 08:30)
 roamway jobs-run JOB_ID
 roamway jobs-rm  JOB_ID
 roamway health
+roamway token create --name N [--scope read|run|admin] [--ttl 24h]
+roamway token ls | roamway token revoke ID
+roamway pair  [--json] [--host H]
+roamway daemon set-password [--stdin]
+roamway approve ID | roamway deny ID | roamway approvals [--all]
 ```
 
 通用参数：`--host http://127.0.0.1:8796`、`--token T`（也可用 `ROAMWAY_HOST` / `ROAMWAY_TOKEN`）。
@@ -187,7 +194,7 @@ ROAMWAY_DEEPSEEK_URL=http://127.0.0.1:11434/v1/chat/completions \
 
 ## HTTP API
 
-`GET /health` 免鉴权；其余路由在配置了 token 时只接受 `x-roamway-token: <T>` 请求头（不再支持 `?token=` query 参数）。
+`GET /health`、`POST /v1/auth/login`、`POST /v1/auth/pair` 免鉴权；其余路由在有鉴权配置时只接受 `x-roamway-token: <T>` 请求头（SSE 事件流仍允许 `?token=`）。无 token 且无多 token 时是开放模式，不要求鉴权。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
@@ -204,6 +211,10 @@ ROAMWAY_DEEPSEEK_URL=http://127.0.0.1:11434/v1/chat/completions \
 | POST | `/v1/jobs/{id}/run` | 立即触发一次 |
 | POST | `/v1/jobs/{id}/enable` / `disable` | 开关 |
 | DELETE | `/v1/jobs/{id}` | 删除 |
+| POST | `/v1/auth/login` | `{password}` → 24h 短期 token（需先 `daemon set-password`） |
+| POST | `/v1/auth/pair` | `{code}` → 长期 token（`pair` 生成 6 位码，60s 一次性） |
+| GET | `/v1/approvals?all=1` | 审批列表（默认仅 pending，`all` 含已决） |
+| POST | `/v1/approvals/{id}/approve` / `deny` | 批准 / 拒绝（需 admin scope） |
 
 `POST /v1/runs/{id}/stop` 对运行中的 `api:*` run 返回 `409 {"error":"api run not cancellable"}`（直连 API 无法中断）；`queued` 的 `api:*` run 仍可取消，其余 run 会先写取消标志再改状态，避免停止后复活。
 
@@ -299,7 +310,7 @@ roamway 不做联邦：一台机器一个 daemon，各自监听端口，跨机�
 
 ```bash
 # A 机
-roamway serve --bind 0.0.0.0:8796 --token T
+roamway serve --bind 0.0.0.0:8796 --token T --allow-host 192.168.1.50
 
 # B 机派活到 A
 roamway run --host http://192.168.1.50:8796 --token T \
@@ -311,7 +322,13 @@ roamway run --host http://192.168.1.50:8796 --token T \
 ## 安全
 
 - 默认只绑 `127.0.0.1`；`--bind 0.0.0.0` 是你主动开放给局域网。
-- token 走明文 HTTP，只适合可信内网；公网请套 TLS 反代（Caddy / Nginx / frp + TLS 都行）。
+- token 走明文 HTTP，只适合可信内网；公网请套 TLS 反代（Caddy / Nginx / frp + TLS 都行）。`--tls-cert/--tls-key` 当前为占位参数，TLS 直连尚未实现。
+- 鉴权分三层：无鉴权配置时开放模式；配置后无 token/无效 token 返回 `401`；scope 不足返回 `403`（`read`/`run`/`admin`，admin 包含全部）。
+- 多 token 落在 `<data>/tokens.json`，只存 sha256；密码只存 PBKDF2-HMAC-SHA256（`password.json`），配对码 6 位数字 60s、一次性消费。
+- `--allow-host` 可多次，配了 Host 白名单后不匹配返回 `421`；未配置时只允许 loopback 与显式 bind 地址。
+- CORS：只有配 `--allow-origin` 才发 `Access-Control-Allow-Origin`，并正确处理 `OPTIONS` 预检；所有响应带 `X-Content-Type-Options`/`X-Frame-Options`/`Referrer-Policy` 安全头。
+- `--require-approval run|admin`：命中 scope 的写请求先返回 `202` 入审批队列；`approve` 后用 `X-Approval: <id>` 重放且 body hash 一致才放行，改 body 返回 `409`；审批记录保留 7 天。
+- `tokens.json`/`password.json`/`approvals.json` 以 0600 落盘（Windows 忽略该位）；日志与 `token ls` 不输出明文 token 与密码。
 - 没设 token 且 `--bind` 非 loopback（`127.0.0.1`/`::1`）时 daemon 拒绝启动（退出码 2）；只在 loopback 绑定下才允许无 token 运行。
 - `codex` 默认 `workspace-write` 沙箱。加 `--dangerously-bypass-approvals-and-sandbox` 等于把整台机器交给模型，别在有重要数据的主机上这么干。
 - `--token` 会把 token 写进进程命令行（`ps` 可见）。长期部署请用 `ROAMWAY_TOKEN` 环境变量或 `EnvironmentFile=`，`scripts/roamway-start.sh` 已按这种方式处理。

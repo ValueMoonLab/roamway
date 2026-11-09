@@ -97,9 +97,13 @@ run 结束后: 成功 → next_at = now + every_secs
 
 ## 安全模型
 
-- 默认绑 `127.0.0.1`。放开到 `0.0.0.0` 是显式动作。
-- 无 token 且绑定非 loopback 时拒绝启动（退出码 2）；单 token 比较用常量时间函数，避免计时侧信道。
-- 不做 RBAC、不做用户体系：这是单用户工具，多用户请放反代后面。
+- 默认绑 `127.0.0.1`。放开到 `0.0.0.0` 是显式动作，未配置 token 且绑定非 loopback 时拒绝启动（退出码 2）。
+- 鉴权三种入口：多 token（`<data>/tokens.json`，存 sha256、scope、`expires_at`）、密码登录（PBKDF2-HMAC-SHA256，`password.json`，`POST /v1/auth/login` 换 24h 短期 token）、一次性配对码（`pair` → `POST /v1/auth/pair` 换长期 token）。`--token`/`ROAMWAY_TOKEN` 仍是单 token 兼容入口。
+- scope 三层：`read`（GET/HEAD/OPTIONS）、`run`（建 run/agent）、`admin`（hosts/schedules/daemon/stop 等）；`admin` 包含全部；scope 不足返回 `403`。
+- 所有响应带 `X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer`；Host 白名单不匹配返回 `421`，CORS 仅在配置 `--allow-origin` 时允许并处理 OPTIONS 预检。
+- 审批流：`--require-approval run|admin` 命中写请求时先落 `approvals.json`（记录 method/path/body_hash/token_id/status），返回 `202 + approval_id`；`approve` 后客户端以 `X-Approval` 重放，body hash 一致才执行，不一致返回 `409`；记录保留 7 天。
+- 敏感文件（`tokens.json`/`password.json`/`approvals.json`）0600 落盘（Unix）；密码只存 PBKDF2 salt/hash/iterations，token 只存 sha256，日志不输出 token/密码/内网 IP/宿主绝对路径。
+- 不做完整 RBAC 与 Web 用户体系：这是单用户工具，需要多用户请放反代后面。`--tls-cert`/`--tls-key` 当前为占位，TLS 直连未实现，公网请走 TLS 反代。
 - agent 子进程以 daemon 用户身份运行。要隔离就用容器或独立系统用户，别指望 roamway 做沙箱。
 - agent 采用白名单（`shell`/`codex`/`hermes`/`claude`/`api:deepseek`/`api:qwen`），其余一律 400，避免把字段直接当可执行文件名。
 - `codex` 的 `workspace-write` 是 codex 自己的能力，不是 roamway 的；`shell` agent 没有任何沙箱。

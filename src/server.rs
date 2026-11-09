@@ -1,4 +1,5 @@
 use crate::agents;
+use crate::auth;
 use crate::hosts;
 use crate::jobs;
 use crate::schedules;
@@ -32,15 +33,31 @@ pub fn serve(app: Arc<App>, bind: &str) -> std::io::Result<()> {
     }
     if let Some(t) = app.token.as_deref().filter(|t| !t.is_empty()) {
         let token_path = data_dir.join("token");
-        if let Err(e) = std::fs::write(&token_path, format!("{}\n", t)) {
+        if let Err(e) = auth::write_private(&token_path, format!("{}\n", t).as_bytes()) {
             eprintln!("roamway: write token failed: {}", e);
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&token_path, std::fs::Permissions::from_mode(0o600));
-        }
     }
+    if app.tls_cert.is_some() || app.tls_key.is_some() {
+        // TODO: TLS is intentionally not implemented yet. rustls-pemfile is not
+        // available in the offline vendor cache; wiring rustls without it would
+        // risk the default build. Serving plain HTTP keeps previous behavior.
+        eprintln!("roamway: warning: --tls-cert/--tls-key requested but TLS is not implemented in this build; serving plain HTTP");
+    }
+
+    #[cfg(unix)]
+    if let Some(path) = app.unix_socket.clone() {
+        let listener = match bind_unix_listener(&path) {
+            Ok(l) => l,
+            Err(e) => {
+                eprintln!("roamway: unix socket bind failed: {}", e);
+                return Err(e);
+            }
+        };
+        println!("roamway listening on unix://{}", path.display());
+        let a = app.clone();
+        thread::spawn(move || serve_unix(a, listener));
+    }
+
     println!("roamway listening on http://{}", actual);
     for s in listener.incoming() {
         match s {
@@ -67,6 +84,40 @@ pub fn serve(app: Arc<App>, bind: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn bind_unix_listener(path: &Path) -> std::io::Result<std::os::unix::net::UnixListener> {
+    let listener = std::os::unix::net::UnixListener::bind(path)?;
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    Ok(listener)
+}
+
+#[cfg(unix)]
+fn serve_unix(app: Arc<App>, listener: std::os::unix::net::UnixListener) {
+    for s in listener.incoming() {
+        match s {
+            Ok(stream) => {
+                let n = app.conns.fetch_add(1, Ordering::SeqCst);
+                if n >= app.max_conn {
+                    app.conns.fetch_sub(1, Ordering::SeqCst);
+                    let mut reject = stream;
+                    let _ = respond(&mut reject, 503, &json!({"error": "too many connections"}));
+                    continue;
+                }
+                let a = app.clone();
+                thread::spawn(move || {
+                    let _ = handle(a.clone(), stream);
+                    a.conns.fetch_sub(1, Ordering::SeqCst);
+                });
+            }
+            Err(e) => {
+                eprintln!("accept error: {}", e);
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    }
+}
+
 struct Req {
     method: String,
     path: String,
@@ -82,6 +133,30 @@ enum ReadOutcome {
     BodyTooLarge,
 }
 
+trait Conn: Read + Write {
+    fn set_read_timeout_opt(&self, d: Option<Duration>) -> std::io::Result<()>;
+    fn set_write_timeout_opt(&self, d: Option<Duration>) -> std::io::Result<()>;
+}
+
+impl Conn for TcpStream {
+    fn set_read_timeout_opt(&self, d: Option<Duration>) -> std::io::Result<()> {
+        self.set_read_timeout(d)
+    }
+    fn set_write_timeout_opt(&self, d: Option<Duration>) -> std::io::Result<()> {
+        self.set_write_timeout(d)
+    }
+}
+
+#[cfg(unix)]
+impl Conn for std::os::unix::net::UnixStream {
+    fn set_read_timeout_opt(&self, d: Option<Duration>) -> std::io::Result<()> {
+        self.set_read_timeout(d)
+    }
+    fn set_write_timeout_opt(&self, d: Option<Duration>) -> std::io::Result<()> {
+        self.set_write_timeout(d)
+    }
+}
+
 fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || hay.len() < needle.len() {
         return None;
@@ -89,7 +164,7 @@ fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-fn read_req(s: &mut TcpStream) -> std::io::Result<ReadOutcome> {
+fn read_req<C: Conn>(s: &mut C) -> std::io::Result<ReadOutcome> {
     const MAX_HEADER: usize = 64 * 1024;
     const MAX_BODY: usize = 1024 * 1024;
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -101,7 +176,7 @@ fn read_req(s: &mut TcpStream) -> std::io::Result<ReadOutcome> {
         if remaining.is_zero() {
             return Ok(ReadOutcome::HeaderTimeout);
         }
-        s.set_read_timeout(Some(remaining))?;
+        s.set_read_timeout_opt(Some(remaining))?;
         let n = match s.read(&mut tmp) {
             Ok(n) => n,
             Err(e) if e.kind() == std::io::ErrorKind::TimedOut
@@ -150,7 +225,7 @@ fn read_req(s: &mut TcpStream) -> std::io::Result<ReadOutcome> {
     if len > MAX_BODY {
         return Ok(ReadOutcome::BodyTooLarge);
     }
-    s.set_read_timeout(Some(Duration::from_secs(30)))?;
+    s.set_read_timeout_opt(Some(Duration::from_secs(30)))?;
     let want = len;
     let mut body = buf[head_end + 4..].to_vec();
     while body.len() < want {
@@ -209,9 +284,9 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-fn handle(app: Arc<App>, mut s: TcpStream) -> std::io::Result<()> {
-    let _ = s.set_read_timeout(Some(Duration::from_secs(30)));
-    let _ = s.set_write_timeout(Some(Duration::from_secs(30)));
+fn handle<C: Conn>(app: Arc<App>, mut s: C) -> std::io::Result<()> {
+    let _ = s.set_read_timeout_opt(Some(Duration::from_secs(30)));
+    let _ = s.set_write_timeout_opt(Some(Duration::from_secs(30)));
     let req = match read_req(&mut s)? {
         ReadOutcome::Req(r) => r,
         ReadOutcome::Eof => return Ok(()),
@@ -223,42 +298,149 @@ fn handle(app: Arc<App>, mut s: TcpStream) -> std::io::Result<()> {
         }
     };
 
+    let host = req.headers.get("host").map(|v| v.as_str());
+    if !auth::host_allowed(&app.allow_hosts, &app.bind_host, host) {
+        return respond_full(&mut s, 421, &json!({"error": "misdirected request"}), &[]);
+    }
+
+    let origin = req.headers.get("origin").map(|v| v.as_str());
+    let cors_extra: Vec<(&str, String)> = match auth::origin_allowed(&app.allow_origins, origin) {
+        Some(allowed) => vec![
+            ("Access-Control-Allow-Origin", allowed),
+            ("Vary", "Origin".to_string()),
+        ],
+        None => vec![],
+    };
+    if req.method == "OPTIONS" {
+        let mut extras = cors_extra;
+        if !extras.is_empty() {
+            extras.push(("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS".to_string()));
+            extras.push(("Access-Control-Allow-Headers", "content-type, x-roamway-token, x-approval".to_string()));
+            extras.push(("Access-Control-Max-Age", "86400".to_string()));
+        }
+        return respond_preflight(&mut s, &extras);
+    }
+
+    let segs: Vec<&str> = req
+        .path
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+
     // SSE attach: only the events endpoint accepts a query token; everything
     // else must carry the token in the x-roamway-token header.
     let events_id = events_agent_id(&req);
     if events_id.is_some() && req.method == "GET" {
-        if let Some(tok) = app.token.clone() {
-            let got = req
-                .query
-                .get("token")
-                .cloned()
-                .or_else(|| req.headers.get("x-roamway-token").cloned())
-                .unwrap_or_default();
-            if !ct_eq(&got, &tok) {
-                return respond(&mut s, 401, &json!({"error": "unauthorized"}));
+        let got = req
+            .query
+            .get("token")
+            .cloned()
+            .or_else(|| req.headers.get("x-roamway-token").cloned())
+            .unwrap_or_default();
+        match authenticate(&app, Some(&got)) {
+            AuthOutcome::Reject => {
+                return respond_full(&mut s, 401, &json!({"error": "unauthorized"}), &[]);
             }
+            AuthOutcome::Open | AuthOutcome::Identity { .. } => {}
         }
-        let _ = s.set_write_timeout(None);
-        let _ = s.set_read_timeout(None);
+        let _ = s.set_write_timeout_opt(None);
+        let _ = s.set_read_timeout_opt(None);
         stream_agent_events(&app, &mut s, events_id.as_deref().unwrap());
         return Ok(());
     }
 
-    if needs_auth(&req.path) {
-        if let Some(tok) = app.token.clone() {
-            let got = req
-                .headers
-                .get("x-roamway-token")
-                .cloned()
-                .unwrap_or_default();
-            if !ct_eq(&got, &tok) {
-                return respond(&mut s, 401, &json!({"error": "unauthorized"}));
+    let public = !needs_auth(&req.path);
+    if !public {
+        let presented = req.headers.get("x-roamway-token").map(|v| v.as_str());
+        match authenticate(&app, presented) {
+            AuthOutcome::Reject => {
+                return respond_full(&mut s, 401, &json!({"error": "unauthorized"}), &cors_extra);
+            }
+            AuthOutcome::Open => {}
+            AuthOutcome::Identity { token_id, scopes } => {
+                let need = auth::required_scope(req.method.as_str(), &segs);
+                if !auth::has_scope(&scopes, need) {
+                    return respond_full(
+                        &mut s,
+                        403,
+                        &json!({"error": "insufficient scope", "required": need}),
+                        &cors_extra,
+                    );
+                }
+                let is_approval_meta = segs.first() == Some(&"v1") && segs.get(1) == Some(&"approvals");
+                let requires_approval = auth::is_write_method(req.method.as_str())
+                    && !is_approval_meta
+                    && app.require_approval.iter().any(|s| s == need);
+                if requires_approval {
+                    let replay = req.headers.get("x-approval").map(|v| v.as_str());
+                    match replay {
+                        Some(aprid) => {
+                            let check = {
+                                let st = app.approvals.lock().unwrap_or_else(|e| e.into_inner());
+                                st.verify_replay(aprid, req.method.as_str(), req.path.as_str(), &req.body)
+                            };
+                            if let Err(e) = check {
+                                return respond_full(
+                                    &mut s,
+                                    409,
+                                    &json!({"error": e}),
+                                    &cors_extra,
+                                );
+                            }
+                        }
+                        None => {
+                            let rec = {
+                                let mut st = app.approvals.lock().unwrap_or_else(|e| e.into_inner());
+                                st.create(req.method.as_str(), req.path.as_str(), &req.body, &token_id)
+                            };
+                            return respond_full(
+                                &mut s,
+                                202,
+                                &json!({"approval_id": rec.id, "status": "pending"}),
+                                &cors_extra,
+                            );
+                        }
+                    }
+                }
             }
         }
     }
 
     let (code, body) = route(&app, &req);
-    respond(&mut s, code, &body)
+    respond_full(&mut s, code, &body, &cors_extra)
+}
+
+enum AuthOutcome {
+    Open,
+    Reject,
+    Identity { token_id: String, scopes: Vec<String> },
+}
+
+fn authenticate(app: &Arc<App>, presented: Option<&str>) -> AuthOutcome {
+    let has_tokens = {
+        let st = app.tokens.lock().unwrap_or_else(|e| e.into_inner());
+        !st.tokens.is_empty()
+    };
+    if app.token.as_deref().map(|t| t.is_empty()).unwrap_or(true) && !has_tokens {
+        return AuthOutcome::Open;
+    }
+    let got = presented.unwrap_or_default();
+    if let Some(legacy) = app.token.as_deref().filter(|t| !t.is_empty()) {
+        if auth::ct_eq_str(legacy, got) {
+            return AuthOutcome::Identity {
+                token_id: "legacy".to_string(),
+                scopes: auth::ALL_SCOPES.iter().map(|s| s.to_string()).collect(),
+            };
+        }
+    }
+    if !got.is_empty() {
+        let mut st = app.tokens.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(rec) = st.resolve(got) {
+            return AuthOutcome::Identity { token_id: rec.id, scopes: rec.scopes };
+        }
+    }
+    AuthOutcome::Reject
 }
 
 /// Returns the agent id when the request targets /v1/agents/{id}/events.
@@ -286,13 +468,13 @@ fn agent_state(app: &Arc<App>, id: &str) -> String {
         .unwrap_or_else(|| "archived".into())
 }
 
-fn emit_sse(s: &mut TcpStream, payload: &str) -> bool {
+fn emit_sse<C: Conn>(s: &mut C, payload: &str) -> bool {
     let data = format!("data: {}\n\n", payload);
     s.write_all(data.as_bytes()).and_then(|_| s.flush()).is_ok()
 }
 
-fn stream_agent_events(app: &Arc<App>, s: &mut TcpStream, id: &str) {
-    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+fn stream_agent_events<C: Conn>(app: &Arc<App>, s: &mut C, id: &str) {
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n";
     if s.write_all(head.as_bytes()).and_then(|_| s.flush()).is_err() {
         return;
     }
@@ -363,10 +545,11 @@ fn stream_agent_events(app: &Arc<App>, s: &mut TcpStream, id: &str) {
     }
 }
 fn needs_auth(path: &str) -> bool {
-    path != "/health"
+    !matches!(path, "/health" | "/v1/auth/login" | "/v1/auth/pair")
 }
 
 /// 常量时间比较，避免按字节提前返回泄露 token 前缀
+#[cfg(test)]
 fn ct_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     if a.len() != b.len() {
@@ -379,16 +562,35 @@ fn ct_eq(a: &str, b: &str) -> bool {
     diff == 0
 }
 
-fn respond(s: &mut TcpStream, code: u16, v: &Value) -> std::io::Result<()> {
+fn respond<C: Conn>(s: &mut C, code: u16, v: &Value) -> std::io::Result<()> {
+    respond_full(s, code, v, &[])
+}
+
+fn respond_full<C: Conn>(s: &mut C, code: u16, v: &Value, extra: &[(&str, String)]) -> std::io::Result<()> {
     let body = serde_json::to_vec_pretty(v).unwrap_or_else(|_| b"{}".to_vec());
-    let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n",
         code,
         reason(code),
         body.len()
     );
+    for (k, v) in extra {
+        head.push_str(&format!("{}: {}\r\n", k, v));
+    }
+    head.push_str("\r\n");
     s.write_all(head.as_bytes())?;
     s.write_all(&body)?;
+    s.flush()
+}
+
+fn respond_preflight<C: Conn>(s: &mut C, extra: &[(&str, String)]) -> std::io::Result<()> {
+    let mut head = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n"
+        .to_string();
+    for (k, v) in extra {
+        head.push_str(&format!("{}: {}\r\n", k, v));
+    }
+    head.push_str("\r\n");
+    s.write_all(head.as_bytes())?;
     s.flush()
 }
 
@@ -396,12 +598,17 @@ fn reason(code: u16) -> &'static str {
     match code {
         200 => "OK",
         201 => "Created",
+        202 => "Accepted",
+        204 => "No Content",
         400 => "Bad Request",
         401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
+        405 => "Method Not Allowed",
         408 => "Request Timeout",
         409 => "Conflict",
         413 => "Payload Too Large",
+        421 => "Misdirected Request",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "OK",
@@ -565,6 +772,87 @@ struct ContinueAgent {
     #[serde(default)]
     timeout_s: Option<u64>,
 }
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginBody {
+    password: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PairBody {
+    code: String,
+}
+
+fn login_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
+    let body: LoginBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(_) => return (400, json!({"error": "password required"})),
+    };
+    let ok = {
+        let st = app.passwords.lock().unwrap_or_else(|e| e.into_inner());
+        st.verify(&body.password)
+    };
+    if !ok {
+        return (401, json!({"error": "invalid password"}));
+    }
+    let mut st = app.tokens.lock().unwrap_or_else(|e| e.into_inner());
+    let (id, plain) = st.create(
+        Some("login".into()),
+        auth::ALL_SCOPES.iter().map(|s| s.to_string()).collect(),
+        Some(auth::LOGIN_TTL_SECS),
+    );
+    (200, json!({
+        "token": plain,
+        "token_id": id,
+        "expires_at": crate::types::iso(crate::types::now() + auth::LOGIN_TTL_SECS),
+    }))
+}
+
+fn pair_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
+    let body: PairBody = match serde_json::from_slice(&req.body) {
+        Ok(b) => b,
+        Err(_) => return (400, json!({"error": "code required"})),
+    };
+    let consumed = {
+        let mut st = app.pairings.lock().unwrap_or_else(|e| e.into_inner());
+        st.consume(&body.code)
+    };
+    if let Err(e) = consumed {
+        return (401, json!({"error": e}));
+    }
+    let mut st = app.tokens.lock().unwrap_or_else(|e| e.into_inner());
+    let (id, plain) = st.create(
+        Some("pair".into()),
+        auth::ALL_SCOPES.iter().map(|s| s.to_string()).collect(),
+        None,
+    );
+    (200, json!({"token": plain, "token_id": id}))
+}
+
+fn approvals_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
+    let all = query_true(req, "all");
+    let st = app.approvals.lock().unwrap_or_else(|e| e.into_inner());
+    (200, json!({"approvals": st.list(all)}))
+}
+
+fn approval_decide_route(app: &Arc<App>, req: &Req, id: &str, status: &str) -> (u16, Value) {
+    let decided_by = req
+        .headers
+        .get("x-roamway-token")
+        .map(|t| auth::sha256_hex(t.as_bytes()))
+        .unwrap_or_else(|| "cli".to_string());
+    let ok = {
+        let mut st = app.approvals.lock().unwrap_or_else(|e| e.into_inner());
+        st.decide(id, status, &decided_by)
+    };
+    if ok {
+        (200, json!({"ok": true, "id": id, "status": status}))
+    } else {
+        (404, json!({"error": "no such pending approval"}))
+    }
+}
+
 fn route(app: &Arc<App>, req: &Req) -> (u16, Value) {
     let segs: Vec<&str> = req
         .path
@@ -576,6 +864,11 @@ fn route(app: &Arc<App>, req: &Req) -> (u16, Value) {
     match (m, segs.as_slice()) {
         ("GET", ["health"]) => (200, health(app)),
         ("GET", ["v1", "health"]) => (200, v1_health(app)),
+        ("POST", ["v1", "auth", "login"]) => login_route(app, req),
+        ("POST", ["v1", "auth", "pair"]) => pair_route(app, req),
+        ("GET", ["v1", "approvals"]) => approvals_route(app, req),
+        ("POST", ["v1", "approvals", id, "approve"]) => approval_decide_route(app, req, id, "approved"),
+        ("POST", ["v1", "approvals", id, "deny"]) => approval_decide_route(app, req, id, "denied"),
         ("GET", ["v1", "hosts"]) => list_hosts(app),
         ("GET", ["v1", "workspaces"]) => list_workspaces_route(app),
         ("POST", ["v1", "workspaces", "clone"]) => clone_workspace_route(app, req),
@@ -1915,6 +2208,17 @@ mod tests {
             max_concurrent: 4,
             max_conn: 64,
             conns: std::sync::atomic::AtomicUsize::new(0),
+            tokens: std::sync::Mutex::new(auth::TokenStore::load(&dir)),
+            approvals: std::sync::Mutex::new(auth::ApprovalStore::load(&dir)),
+            passwords: std::sync::Mutex::new(auth::PasswordStore::load(&dir)),
+            pairings: std::sync::Mutex::new(auth::PairingStore::load(&dir)),
+            allow_hosts: vec![],
+            allow_origins: vec![],
+            require_approval: vec![],
+            bind_host: "127.0.0.1".to_string(),
+            unix_socket: None,
+            tls_cert: None,
+            tls_key: None,
         });
         let req = Req {
             method: "GET".into(),
@@ -1971,6 +2275,17 @@ mod tests {
             max_concurrent: 4,
             max_conn: 64,
             conns: std::sync::atomic::AtomicUsize::new(0),
+            tokens: std::sync::Mutex::new(auth::TokenStore::load(dir)),
+            approvals: std::sync::Mutex::new(auth::ApprovalStore::load(dir)),
+            passwords: std::sync::Mutex::new(auth::PasswordStore::load(dir)),
+            pairings: std::sync::Mutex::new(auth::PairingStore::load(dir)),
+            allow_hosts: vec![],
+            allow_origins: vec![],
+            require_approval: vec![],
+            bind_host: "127.0.0.1".to_string(),
+            unix_socket: None,
+            tls_cert: None,
+            tls_key: None,
         })
     }
 
@@ -2061,5 +2376,19 @@ mod tests {
         let outcome = read_req(&mut s).unwrap();
         assert!(matches!(outcome, ReadOutcome::HeaderTimeout));
         sender.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unix_socket_path_permissions_are_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("roamway-unix-sock-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("roamway.sock");
+        let listener = bind_unix_listener(&path).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

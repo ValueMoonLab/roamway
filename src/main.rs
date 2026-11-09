@@ -1,4 +1,5 @@
 mod agents;
+mod auth;
 mod cron;
 mod hosts;
 mod jobs;
@@ -21,7 +22,7 @@ use std::thread;
 use std::time::Duration;
 use types::*;
 
-const BOOLS: &[&str] = &["no-wait", "quiet", "json", "allow-overlap", "disabled", "help", "force", "probe", "all", "worktree", "keep-worktree", "run-now", "overlap", "enabled", "enter", "no-enter"];
+const BOOLS: &[&str] = &["no-wait", "quiet", "json", "allow-overlap", "disabled", "help", "force", "probe", "all", "worktree", "keep-worktree", "run-now", "overlap", "enabled", "enter", "no-enter", "stdin"];
 
 fn usage() {
     println!(
@@ -48,7 +49,11 @@ fn usage() {
   roamway host add <name> --endpoint <ep> [--token T] [--force]
   roamway host ls [--probe] [--json]
   roamway host rm <name> | host enable|disable <name> | host probe <name>
-  roamway daemon status|config|start|stop|restart|reload|pair
+  roamway daemon status|config|start|stop|restart|reload|pair|set-password
+  roamway pair [--json] [--host H]
+  roamway token add|create --name N [--scope read|run|admin] [--ttl 24h]
+  roamway token ls|list | token revoke <id>
+  roamway approve <id> | deny <id> | approvals [--all]
   roamway onboard [--bind 0.0.0.0:8796]
   roamway restart | reload
 
@@ -81,13 +86,13 @@ fn parse_flags(args: &[String]) -> (HashMap<String, String>, Vec<String>) {
         }
         if let Some(k) = a.strip_prefix("--") {
             if BOOLS.contains(&k) {
-                flags.insert(k.to_string(), "true".into());
+                push_flag(&mut flags, k, "true".into());
                 i += 1;
             } else if i + 1 < args.len() && !args[i + 1].starts_with("--") {
-                flags.insert(k.to_string(), args[i + 1].clone());
+                push_flag(&mut flags, k, args[i + 1].clone());
                 i += 2;
             } else {
-                flags.insert(k.to_string(), "true".into());
+                push_flag(&mut flags, k, "true".into());
                 i += 1;
             }
         } else {
@@ -96,6 +101,25 @@ fn parse_flags(args: &[String]) -> (HashMap<String, String>, Vec<String>) {
         }
     }
     (flags, pos)
+}
+
+fn push_flag(flags: &mut HashMap<String, String>, key: &str, value: String) {
+    match flags.get_mut(key) {
+        Some(existing) => {
+            existing.push('\u{1f}');
+            existing.push_str(&value);
+        }
+        None => {
+            flags.insert(key.to_string(), value);
+        }
+    }
+}
+
+fn flag_many(flags: &HashMap<String, String>, key: &str) -> Vec<String> {
+    flags
+        .get(key)
+        .map(|v| v.split('\u{1f}').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
+        .unwrap_or_default()
 }
 
 struct Client {
@@ -375,6 +399,11 @@ fn main() {
         "jobs-rm" => cmd_jobs_rm(&flags, &pos),
         "health" => cmd_health(&flags),
         "host" => cmd_host(&flags, &pos),
+        "token" => cmd_token(&flags, &pos),
+        "pair" => cmd_pair(&flags),
+        "approve" => cmd_approve(&flags, &pos),
+        "deny" => cmd_deny(&flags, &pos),
+        "approvals" => cmd_approvals(&flags),
         "daemon" => cmd_daemon(&flags, &pos),
         "onboard" => cmd_onboard(&flags),
         "restart" => cmd_restart(&flags),
@@ -444,9 +473,18 @@ fn cmd_serve(flags: &HashMap<String, String>) {
         .and_then(|v| v.parse().ok())
         .filter(|v| *v > 0)
         .unwrap_or(64);
+    let allow_hosts = flag_many(flags, "allow-host");
+    let allow_origins = flag_many(flags, "allow-origin");
+    let require_approval = flag_many(flags, "require-approval");
+    let unix_socket = flags.get("unix-socket").map(PathBuf::from);
+    let tls_cert = flags.get("tls-cert").map(PathBuf::from);
+    let tls_key = flags.get("tls-key").map(PathBuf::from);
+    let bind_host = bind_parts(&bind).map(|(h, _)| h).unwrap_or_else(|| bind.clone());
 
     // 无 token 且绑定非 loopback 时拒绝启动，避免把任意命令执行暴露给整个网络
-    if token.is_none() && !is_loopback_bind(&bind) {
+    let token_store = auth::TokenStore::load(&data);
+    let has_saved_tokens = !token_store.tokens.is_empty();
+    if token.is_none() && !has_saved_tokens && !is_loopback_bind(&bind) {
         eprintln!(
             "roamway: refusing to serve without --token on non-loopback bind {}; use 127.0.0.1/::1 or set ROAMWAY_TOKEN",
             bind
@@ -459,6 +497,9 @@ fn cmd_serve(flags: &HashMap<String, String>) {
     let schedule_store = schedules::ScheduleStore::load(&data);
     // 受管终端：元数据落 data/terminals.json，运行态只在内存，重启后标 exited 不复活
     let terminal_store = terminals::TerminalStore::load(&data);
+    let approval_store = auth::ApprovalStore::load(&data);
+    let password_store = auth::PasswordStore::load(&data);
+    let pairing_store = auth::PairingStore::load(&data);
     let app = Arc::new(App {
         store: Mutex::new(store),
         schedules: Mutex::new(schedule_store),
@@ -471,6 +512,17 @@ fn cmd_serve(flags: &HashMap<String, String>) {
         max_concurrent,
         max_conn,
         conns: AtomicUsize::new(0),
+        tokens: Mutex::new(token_store),
+        approvals: Mutex::new(approval_store),
+        passwords: Mutex::new(password_store),
+        pairings: Mutex::new(pairing_store),
+        allow_hosts,
+        allow_origins,
+        require_approval,
+        bind_host,
+        unix_socket,
+        tls_cert,
+        tls_key,
     });
     if loaded_ok {
         app.save();
@@ -494,7 +546,7 @@ fn cmd_serve(flags: &HashMap<String, String>) {
         "roamway {} | data={} | auth={} | tz=+{} | max-concurrent={} | max-conn={}",
         env!("CARGO_PKG_VERSION"),
         data.display(),
-        if token.is_some() { "token" } else { "off" },
+        if token.is_some() { "token" } else if has_saved_tokens { "tokens" } else { "off" },
         tz,
         max_concurrent,
         max_conn
@@ -2152,7 +2204,8 @@ fn cmd_daemon(flags: &HashMap<String, String>, pos: &[String]) {
         "restart" => cmd_daemon_restart(flags),
         "reload" => cmd_daemon_reload(flags),
         "pair" => cmd_daemon_pair(flags),
-        _ => eprintln!("usage: roamway daemon status|config|start|stop|restart|reload|pair"),
+        "set-password" => cmd_daemon_set_password(flags),
+        _ => eprintln!("usage: roamway daemon status|config|start|stop|restart|reload|pair|set-password"),
     }
 }
 
@@ -2377,6 +2430,217 @@ fn cmd_daemon_pair(flags: &HashMap<String, String>) {
     println!("http://{}:{}?token={}", pair_ip(&bind), port, token);
 }
 
+fn cmd_daemon_set_password(flags: &HashMap<String, String>) {
+    let data = data_dir_for(flags);
+    let _ = std::fs::create_dir_all(&data);
+    let password = if flags.contains_key("stdin") {
+        let mut line = String::new();
+        if let Err(e) = std::io::stdin().read_line(&mut line) {
+            eprintln!("read password failed: {}", e);
+            return;
+        }
+        line.trim_end_matches(['\r', '\n']).to_string()
+    } else {
+        print!("new password: ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if let Err(e) = std::io::stdin().read_line(&mut line) {
+            eprintln!("read password failed: {}", e);
+            return;
+        }
+        line.trim_end_matches(['\r', '\n']).to_string()
+    };
+    let mut store = auth::PasswordStore::load(&data);
+    match store.set_password(&password) {
+        Ok(()) => println!("password set for {} (pbkdf2-sha256)", data.display()),
+        Err(e) => eprintln!("set-password failed: {}", e),
+    }
+}
+
+fn cmd_token(flags: &HashMap<String, String>, pos: &[String]) {
+    let sub = pos.first().map(String::as_str).unwrap_or("help");
+    let data = data_dir_for(flags);
+    let _ = std::fs::create_dir_all(&data);
+    match sub {
+        "add" | "create" => cmd_token_create(flags, &data),
+        "ls" | "list" => cmd_token_ls(flags, &data),
+        "revoke" => {
+            let id = pos.get(1).cloned().unwrap_or_default();
+            if id.is_empty() {
+                eprintln!("usage: roamway token revoke <id>");
+                return;
+            }
+            let mut store = auth::TokenStore::load(&data);
+            if store.revoke(&id) {
+                println!("revoked {}", id);
+            } else {
+                eprintln!("no such token: {}", id);
+            }
+        }
+        _ => eprintln!("usage: roamway token add|create --name N [--scope read|run|admin] [--ttl 24h] | ls|list | revoke <id>"),
+    }
+}
+
+fn cmd_token_create(flags: &HashMap<String, String>, data: &std::path::Path) {
+    let name_opt = flags.get("name").cloned().filter(|s| !s.is_empty());
+    let mut scopes = flag_many(flags, "scope");
+    if scopes.is_empty() {
+        scopes = vec!["read".to_string(), "run".to_string()];
+    }
+    for s in &scopes {
+        if !auth::ALL_SCOPES.contains(&s.as_str()) {
+            eprintln!("invalid --scope '{}' (read|run|admin)", s);
+            return;
+        }
+    }
+    let ttl = flags.get("ttl").and_then(|v| auth::parse_ttl(v));
+    let mut store = auth::TokenStore::load(data);
+    let (id, plain) = store.create(name_opt.clone(), scopes.clone(), ttl);
+    let name = name_opt.unwrap_or_else(|| format!("token-{}", &id));
+    if flags.contains_key("json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "id": id,
+                "name": name,
+                "scopes": scopes,
+                "token": plain,
+                "expires_at": ttl.map(|s| iso(now() + s)),
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        println!("id:      {}", id);
+        println!("name:    {}", name);
+        println!("scopes:  {}", scopes.join(","));
+        match ttl {
+            Some(s) => println!("expires: {} ({}s)", iso(now() + s), s),
+            None => println!("expires: never"),
+        }
+        println!("token:   {}   # shown once, store it safely", plain);
+    }
+}
+
+fn cmd_token_ls(flags: &HashMap<String, String>, data: &std::path::Path) {
+    let store = auth::TokenStore::load(data);
+    if flags.contains_key("json") {
+        println!("{}", serde_json::to_string_pretty(&store.tokens).unwrap_or_default());
+        return;
+    }
+    if store.tokens.is_empty() {
+        println!("no tokens");
+        return;
+    }
+    println!("{:<34} {:<20} {:<18} {:<21} sha256", "id", "name", "scopes", "expires");
+    for t in &store.tokens {
+        let name: String = t.name.chars().take(20).collect();
+        let exp = match t.expires_at {
+            Some(e) => iso(e),
+            None => "never".to_string(),
+        };
+        println!(
+            "{:<34} {:<20} {:<18} {:<21} {}",
+            t.id,
+            name,
+            t.scopes.join(","),
+            exp,
+            mask_sha256(&t.sha256),
+        );
+    }
+}
+
+fn mask_sha256(sha: &str) -> String {
+    if sha.len() <= 12 {
+        return "*masked*".to_string();
+    }
+    format!("{}...{}", &sha[..8], &sha[sha.len() - 4..])
+}
+
+fn cmd_pair(flags: &HashMap<String, String>) {
+    let data = data_dir_for(flags);
+    let _ = std::fs::create_dir_all(&data);
+    let mut store = auth::PairingStore::load(&data);
+    let code = store.generate(auth::PAIR_TTL_SECS);
+    let host = flags
+        .get("host")
+        .cloned()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:8796".to_string());
+    let endpoint = format!("{}/v1/auth/pair", host.trim_end_matches('/'));
+    let exchange = format!(
+        "curl -X POST {} -H 'content-type: application/json' -d '{{\"code\":\"{}\"}}'",
+        endpoint,
+        code
+    );
+    if flags.contains_key("json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "code": code,
+                "ttl_secs": auth::PAIR_TTL_SECS,
+                "exchange": exchange,
+            }))
+            .unwrap_or_default()
+        );
+    } else {
+        println!("pair code: {}  (valid {}s)", code, auth::PAIR_TTL_SECS);
+        println!("exchange : {}", exchange);
+    }
+}
+
+fn cmd_approve(flags: &HashMap<String, String>, pos: &[String]) {
+    let id = pos.first().map(String::as_str).unwrap_or("");
+    if id.is_empty() {
+        eprintln!("usage: roamway approve <id>");
+        return;
+    }
+    match request(flags, "POST", &format!("/v1/approvals/{}/approve", id), None) {
+        Ok(v) if flags.contains_key("json") => println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default()),
+        Ok(v) => println!("{} {}", id, v["status"].as_str().unwrap_or("approved")),
+        Err(e) => eprintln!("approve failed: {}", e),
+    }
+}
+
+fn cmd_deny(flags: &HashMap<String, String>, pos: &[String]) {
+    let id = pos.first().map(String::as_str).unwrap_or("");
+    if id.is_empty() {
+        eprintln!("usage: roamway deny <id>");
+        return;
+    }
+    match request(flags, "POST", &format!("/v1/approvals/{}/deny", id), None) {
+        Ok(v) if flags.contains_key("json") => println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default()),
+        Ok(v) => println!("{} {}", id, v["status"].as_str().unwrap_or("denied")),
+        Err(e) => eprintln!("deny failed: {}", e),
+    }
+}
+
+fn cmd_approvals(flags: &HashMap<String, String>) {
+    let path = if flags.contains_key("all") { "/v1/approvals?all=1" } else { "/v1/approvals" };
+    match request(flags, "GET", path, None) {
+        Ok(v) => {
+            if flags.contains_key("json") {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                return;
+            }
+            let arr = v.get("approvals").and_then(|a| a.as_array()).cloned().unwrap_or_default();
+            if arr.is_empty() {
+                println!("no approvals");
+                return;
+            }
+            for a in &arr {
+                println!(
+                    "{:<34} {:<8} {:<6} {} {}",
+                    a["id"].as_str().unwrap_or("-"),
+                    a["status"].as_str().unwrap_or("-"),
+                    a["method"].as_str().unwrap_or("-"),
+                    a["path"].as_str().unwrap_or("-"),
+                    a["ts"].as_i64().map(iso).unwrap_or_else(|| "-".into()),
+                );
+            }
+        }
+        Err(e) => eprintln!("approvals failed: {}", e),
+    }
+}
 fn cmd_onboard(flags: &HashMap<String, String>) {
     let data = data_dir_for(flags);
     let _ = std::fs::create_dir_all(&data);
@@ -2446,6 +2710,17 @@ pub mod test_support {
             max_concurrent: 4,
             max_conn: 64,
             conns: AtomicUsize::new(0),
+            tokens: Mutex::new(auth::TokenStore::load(dir)),
+            approvals: Mutex::new(auth::ApprovalStore::load(dir)),
+            passwords: Mutex::new(auth::PasswordStore::load(dir)),
+            pairings: Mutex::new(auth::PairingStore::load(dir)),
+            allow_hosts: vec![],
+            allow_origins: vec![],
+            require_approval: vec![],
+            bind_host: "127.0.0.1".to_string(),
+            unix_socket: None,
+            tls_cert: None,
+            tls_key: None,
         })
     }
 }
@@ -2466,6 +2741,23 @@ mod tests {
         assert_eq!(flags.get("bind").map(String::as_str), Some("127.0.0.1:1"));
         assert_eq!(flags.get("no-wait").map(String::as_str), Some("true"));
         assert_eq!(pos, vec!["run".to_string()]);
+    }
+
+    #[test]
+    fn repeated_flags_are_collected() {
+        let args = [
+            "--scope".to_string(),
+            "read".to_string(),
+            "--scope".to_string(),
+            "run".to_string(),
+            "--allow-host".to_string(),
+            "a.example".to_string(),
+            "--allow-host".to_string(),
+            "b.example".to_string(),
+        ];
+        let (flags, _) = parse_flags(&args);
+        assert_eq!(flag_many(&flags, "scope"), vec!["read", "run"]);
+        assert_eq!(flag_many(&flags, "allow-host"), vec!["a.example", "b.example"]);
     }
 
     #[test]

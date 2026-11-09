@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use crate::auth;
 use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
@@ -331,6 +332,17 @@ pub struct App {
     pub max_concurrent: usize,
     pub max_conn: usize,
     pub conns: AtomicUsize,
+    pub tokens: Mutex<auth::TokenStore>,
+    pub approvals: Mutex<auth::ApprovalStore>,
+    pub passwords: Mutex<auth::PasswordStore>,
+    pub pairings: Mutex<auth::PairingStore>,
+    pub allow_hosts: Vec<String>,
+    pub allow_origins: Vec<String>,
+    pub require_approval: Vec<String>,
+    pub bind_host: String,
+    pub unix_socket: Option<PathBuf>,
+    pub tls_cert: Option<PathBuf>,
+    pub tls_key: Option<PathBuf>,
 }
 
 impl App {
