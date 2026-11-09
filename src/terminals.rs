@@ -85,9 +85,17 @@ impl TerminalStore {
             read_json(&dir.join("terminals.json")).unwrap_or_default();
         let mut scripts: Vec<Script> = read_json(&dir.join("scripts.json")).unwrap_or_default();
         // 重启后不复活子进程：内存里的管道已经没了，标 exited/stopped 才是事实。
+        // 但子进程本身还活着（daemon 被 kill / 部署重启时它已自成进程组），
+        // 不收掉就是永久孤儿进程，且用户再也管不到它 —— 这里按记录的 pid 整组收掉。
+        // pid_is_our_run 用 /proc 启动时间兜底，PID 复用不会误杀别人的进程。
         let mut dirty = false;
         for t in terminals.iter_mut() {
             if t.state == "running" {
+                if let Some(pid) = t.pid {
+                    if crate::runner::pid_is_our_run(pid, Some(t.created_at)) {
+                        crate::runner::kill_process_group(pid);
+                    }
+                }
                 t.state = "exited".into();
                 t.pid = None;
                 t.exit_code = None;
@@ -96,6 +104,11 @@ impl TerminalStore {
         }
         for s in scripts.iter_mut() {
             if s.state == "running" {
+                if let Some(pid) = s.pid {
+                    if crate::runner::pid_is_our_run(pid, Some(s.started_at)) {
+                        crate::runner::kill_process_group(pid);
+                    }
+                }
                 s.state = "stopped".into();
                 s.pid = None;
                 dirty = true;
@@ -477,9 +490,14 @@ pub fn send_keys(app: &Arc<App>, id: &str, keys: &str, enter: bool) -> Result<()
 
 pub fn kill(app: &Arc<App>, id: &str) -> Result<Terminal, String> {
     let term = get(app, id)?;
+    let mut seen: Option<u64> = None;
     {
         let rts = app.term_rt.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(rt) = rts.get(&format!("term:{}", term.id)) {
+            if let Ok(r) = rt.ring.lock() {
+                // 落盘前把实际字节数带回元数据，否则重启后 ls 会显示 0
+                seen = Some(r.total());
+            }
             if rt.alive() {
                 let pid = rt.child.lock().map(|c| c.id()).unwrap_or(0);
                 if pid > 1 {
@@ -497,6 +515,9 @@ pub fn kill(app: &Arc<App>, id: &str) -> Result<Terminal, String> {
         Some(t) => {
             t.state = "exited".into();
             t.pid = None;
+            if let Some(n) = seen {
+                t.bytes_out = n;
+            }
             t.clone()
         }
         None => return Err(format!("no such terminal: {}", id)),
@@ -782,6 +803,35 @@ mod tests {
         assert_eq!(st.terminals[0].state, "exited");
         assert_eq!(st.terminals[0].pid, None);
         assert_eq!(st.scripts[0].state, "stopped");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restart_reaps_orphan_children() {
+        let dir = std::env::temp_dir().join(format!("rw-orphan-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut cmd = Command::new(default_shell());
+        cmd.arg("-c").arg("sleep 60");
+        child_command(&mut cmd);
+        let mut child = cmd.spawn().unwrap();
+        let pid = child.id();
+        let terms = vec![Terminal {
+            id: "term_0000beef".into(),
+            name: "orphan".into(),
+            state: "running".into(),
+            pid: Some(pid),
+            created_at: now(),
+            ..Default::default()
+        }];
+        write_json(&dir.join("terminals.json"), &terms).unwrap();
+        let st = TerminalStore::load(&dir);
+        assert_eq!(st.terminals[0].state, "exited");
+        assert_eq!(st.terminals[0].pid, None);
+        // 进程组必须被收掉：wait 能返回且不是正常退出（被信号杀掉）
+        let status = child.wait().unwrap();
+        assert!(!status.success(), "orphan child survived restart: {:?}", status);
         let _ = fs::remove_dir_all(&dir);
     }
 
