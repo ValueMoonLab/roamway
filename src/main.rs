@@ -1,3 +1,4 @@
+mod agents;
 mod hosts;
 mod jobs;
 mod runner;
@@ -6,6 +7,7 @@ mod types;
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Command, Stdio};
@@ -15,7 +17,7 @@ use std::thread;
 use std::time::Duration;
 use types::*;
 
-const BOOLS: &[&str] = &["no-wait", "quiet", "json", "allow-overlap", "disabled", "help", "force", "probe"];
+const BOOLS: &[&str] = &["no-wait", "quiet", "json", "allow-overlap", "disabled", "help", "force", "probe", "all"];
 
 fn usage() {
     println!(
@@ -23,6 +25,9 @@ fn usage() {
 
   roamway serve  [--bind 127.0.0.1:8796] [--data DIR] [--token T] [--tz 8] [--max-concurrent 4] [--max-conn 64]
   roamway run    --agent codex [--model M] [--workspace DIR] [--title T] [--timeout 1800] [--no-wait] [--host H] "prompt"
+  roamway agent run <prompt> [--title --workspace --model --kind --no-wait]
+  roamway agent ls|inspect|logs|wait|attach|archive|reload|update|open|detach|import
+  roamway attach|inspect|wait|archive|import <id>   # 顶层别名
   roamway ls     [--limit 20] [--host H|all]
   roamway status ID [--host H]
   roamway logs   ID [--tail 80] [--host H]
@@ -100,6 +105,7 @@ impl Client {
             "GET" => ureq::get(&url),
             "POST" => ureq::post(&url),
             "DELETE" => ureq::delete(&url),
+            "PATCH" => ureq::patch(&url),
             _ => ureq::get(&url),
         }
         .timeout(Duration::from_secs(60));
@@ -324,7 +330,13 @@ fn main() {
         "serve" => cmd_serve(&flags),
         "run" => cmd_run(&flags, &pos),
         "ls" | "list" => cmd_ls(&flags),
-        "status" | "inspect" => cmd_status(&flags, &pos),
+        "status" => cmd_status(&flags, &pos),
+        "agent" => cmd_agent(&flags, &pos),
+        "attach" => cmd_agent_attach(&flags, &pos),
+        "inspect" => cmd_agent_inspect(&flags, &pos),
+        "wait" => cmd_agent_wait(&flags, &pos),
+        "archive" => cmd_agent_archive(&flags, &pos),
+        "import" => cmd_agent_import(&flags, &pos),
         "logs" => cmd_logs(&flags, &pos),
         "stop" => cmd_stop(&flags, &pos),
         "rm" => cmd_rm(&flags, &pos),
@@ -1104,6 +1116,405 @@ fn cmd_host_probe(flags: &HashMap<String, String>, pos: &[String]) {
     }
     let _ = reg.save();
     println!("{}", serde_json::to_string_pretty(&host_json(&reg.hosts[idx])).unwrap_or_default());
+}
+
+fn cmd_agent(flags: &HashMap<String, String>, pos: &[String]) {
+    match pos.first().map(String::as_str).unwrap_or("help") {
+        "run" => cmd_agent_run(flags, &pos[1..]),
+        "ls" | "list" => cmd_agent_ls(flags),
+        "inspect" => cmd_agent_inspect(flags, &pos[1..]),
+        "logs" => cmd_agent_logs(flags, &pos[1..]),
+        "wait" => cmd_agent_wait(flags, &pos[1..]),
+        "attach" => cmd_agent_attach(flags, &pos[1..]),
+        "archive" => cmd_agent_archive(flags, &pos[1..]),
+        "reload" => cmd_agent_reload(flags, &pos[1..]),
+        "update" => cmd_agent_update(flags, &pos[1..]),
+        "open" => cmd_agent_open(flags, &pos[1..]),
+        "detach" => cmd_agent_detach(flags, &pos[1..]),
+        "import" => cmd_agent_import(flags, &pos[1..]),
+        _ => eprintln!(
+            "usage: roamway agent run|ls|inspect|logs|wait|attach|archive|reload|update|open|detach|import ..."
+        ),
+    }
+}
+
+fn cmd_agent_run(flags: &HashMap<String, String>, pos: &[String]) {
+    let mut prompt = pos.join(" ");
+    if prompt.trim().is_empty() {
+        prompt = flags.get("prompt").cloned().unwrap_or_default();
+    }
+    if prompt.trim().is_empty() {
+        eprintln!("prompt required");
+        return;
+    }
+    let body = json!({
+        "kind": flags.get("kind").cloned().unwrap_or_else(|| "shell".into()),
+        "model": flags.get("model"),
+        "workspace": flags.get("workspace"),
+        "title": flags.get("title"),
+        "prompt": prompt,
+    });
+    let v = match request(flags, "POST", "/v1/agents", Some(body)) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("agent run failed: {}", e);
+            return;
+        }
+    };
+    if flags.contains_key("json") {
+        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+        return;
+    }
+    let agent_id = v["agent"]["id"].as_str().unwrap_or("").to_string();
+    let run_id = v["run"]["id"].as_str().unwrap_or("").to_string();
+    if flags.contains_key("no-wait") {
+        println!("agent: {}\nrun:   {}", agent_id, run_id);
+        return;
+    }
+    let started = std::time::Instant::now();
+    loop {
+        thread::sleep(Duration::from_secs(2));
+        match request(flags, "GET", &format!("/v1/agents/{}", agent_id), None) {
+            Ok(v) => {
+                let st = v["agent"]["state"].as_str().unwrap_or("?");
+                if st != "running" {
+                    println!(
+                        "agent: {}\nrun:   {}\nstate: {}\n{}s",
+                        agent_id,
+                        run_id,
+                        st,
+                        started.elapsed().as_secs()
+                    );
+                    return;
+                }
+                if flags.contains_key("quiet") {
+                    continue;
+                }
+                eprintln!("[{}] {} {}s", agent_id, st, started.elapsed().as_secs());
+            }
+            Err(e) => {
+                eprintln!("poll failed: {}", e);
+                return;
+            }
+        }
+    }
+}
+
+fn cmd_agent_ls(flags: &HashMap<String, String>) {
+    let path = if flags.contains_key("all") {
+        "/v1/agents?all=1"
+    } else {
+        "/v1/agents"
+    };
+    match request(flags, "GET", path, None) {
+        Ok(v) => {
+            if flags.contains_key("json") {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                return;
+            }
+            let empty = vec![];
+            let agents = v["agents"].as_array().unwrap_or(&empty);
+            println!(
+                "{:<12} {:<10} {:<14} {:<16} {:<22} {}",
+                "ID", "STATE", "KIND", "MODEL", "TITLE", "UPDATED"
+            );
+            for a in agents {
+                println!(
+                    "{:<12} {:<10} {:<14} {:<16} {:<22} {}",
+                    a["id"].as_str().unwrap_or(""),
+                    a["state"].as_str().unwrap_or(""),
+                    a["kind"].as_str().unwrap_or(""),
+                    trunc(a["model"].as_str().unwrap_or("-"), 16),
+                    trunc(a["title"].as_str().unwrap_or(""), 22),
+                    a["updated_at"]
+                        .as_i64()
+                        .map(iso)
+                        .unwrap_or_else(|| "-".into())
+                );
+            }
+        }
+        Err(e) => eprintln!("agent ls failed: {}", e),
+    }
+}
+
+fn cmd_agent_inspect(flags: &HashMap<String, String>, pos: &[String]) {
+    let id = match pos.first() {
+        Some(i) => i,
+        None => return eprintln!("usage: roamway inspect <id>"),
+    };
+    match request(flags, "GET", &format!("/v1/agents/{}", id), None) {
+        Ok(v) => {
+            if flags.contains_key("json") {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                return;
+            }
+            let a = &v["agent"];
+            println!("id:         {}", a["id"].as_str().unwrap_or(""));
+            println!("title:      {}", a["title"].as_str().unwrap_or(""));
+            println!("kind:       {}", a["kind"].as_str().unwrap_or(""));
+            println!("model:      {}", a["model"].as_str().unwrap_or("-"));
+            println!("workspace:  {}", a["workspace"].as_str().unwrap_or(""));
+            println!("session_id: {}", a["session_id"].as_str().unwrap_or(""));
+            println!("state:      {}", a["state"].as_str().unwrap_or(""));
+            println!("parent:     {}", a["parent"].as_str().unwrap_or(""));
+            println!("history:    {} msgs", a["history"].as_array().map(|h| h.len()).unwrap_or(0));
+            println!("created_at: {}", a["created_at"].as_i64().map(iso).unwrap_or_else(|| "-".into()));
+            println!("updated_at: {}", a["updated_at"].as_i64().map(iso).unwrap_or_else(|| "-".into()));
+            println!("last_run:   {}", a["last_run_id"].as_str().unwrap_or(""));
+            println!("last_error: {}", a["last_error"].as_str().unwrap_or(""));
+            let empty = vec![];
+            let runs = v["runs"].as_array().unwrap_or(&empty);
+            println!("runs (recent 5):");
+            for r in runs.iter().take(5) {
+                println!(
+                    "  {:<12} {:<12} {} -> {}",
+                    r["id"].as_str().unwrap_or(""),
+                    r["status"].as_str().unwrap_or(""),
+                    r["created_at"].as_i64().map(iso).unwrap_or_else(|| "-".into()),
+                    r["ended_at"].as_i64().map(iso).unwrap_or_else(|| "-".into())
+                );
+            }
+        }
+        Err(e) => eprintln!("agent inspect failed: {}", e),
+    }
+}
+
+fn cmd_agent_logs(flags: &HashMap<String, String>, pos: &[String]) {
+    let id = match pos.first() {
+        Some(i) => i,
+        None => return eprintln!("usage: roamway agent logs <id> [--tail 80]"),
+    };
+    let tail = flags.get("tail").cloned().unwrap_or_else(|| "80".into());
+    let detail = match request(flags, "GET", &format!("/v1/agents/{}", id), None) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("agent logs failed: {}", e);
+            return;
+        }
+    };
+    let empty = vec![];
+    let runs = detail["runs"].as_array().unwrap_or(&empty);
+    for r in runs {
+        let rid = r["id"].as_str().unwrap_or("");
+        let status = r["status"].as_str().unwrap_or("");
+        println!("--- {} {}", rid, status);
+        match request(flags, "GET", &format!("/v1/runs/{}/log?tail={}", rid, tail), None) {
+            Ok(l) => println!("{}", l["log"].as_str().unwrap_or("")),
+            Err(e) => eprintln!("  log fetch failed: {}", e),
+        }
+    }
+}
+
+fn cmd_agent_wait(flags: &HashMap<String, String>, pos: &[String]) {
+    let id = match pos.first() {
+        Some(i) => i,
+        None => return eprintln!("usage: roamway wait <id> [--timeout 60]"),
+    };
+    let timeout = flags.get("timeout").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let started = std::time::Instant::now();
+    loop {
+        if timeout > 0 && started.elapsed().as_secs() > timeout {
+            eprintln!("wait timed out after {}s", timeout);
+            std::process::exit(1);
+        }
+        thread::sleep(Duration::from_secs(2));
+        match request(flags, "GET", &format!("/v1/agents/{}", id), None) {
+            Ok(v) => {
+                let st = v["agent"]["state"].as_str().unwrap_or("?");
+                if st != "running" {
+                    println!("state={}", st);
+                    return;
+                }
+            }
+            Err(e) => {
+                eprintln!("wait failed: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
+}
+
+fn cmd_agent_archive(flags: &HashMap<String, String>, pos: &[String]) {
+    let id = match pos.first() {
+        Some(i) => i,
+        None => return eprintln!("usage: roamway archive <id>"),
+    };
+    match request(flags, "DELETE", &format!("/v1/agents/{}", id), None) {
+        Ok(v) => {
+            if flags.contains_key("json") {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+            } else {
+                println!("archived {}", id);
+            }
+        }
+        Err(e) => eprintln!("agent archive failed: {}", e),
+    }
+}
+
+fn cmd_agent_reload(flags: &HashMap<String, String>, pos: &[String]) {
+    let id = match pos.first() {
+        Some(i) => i,
+        None => return eprintln!("usage: roamway agent reload <id>"),
+    };
+    match request(flags, "POST", &format!("/v1/agents/{}/reload", id), Some(json!({}))) {
+        Ok(v) => {
+            if flags.contains_key("json") {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+            } else {
+                println!("run: {}", v["run"]["id"].as_str().unwrap_or(""));
+            }
+        }
+        Err(e) => eprintln!("agent reload failed: {}", e),
+    }
+}
+
+fn cmd_agent_update(flags: &HashMap<String, String>, pos: &[String]) {
+    let id = match pos.first() {
+        Some(i) => i,
+        None => return eprintln!("usage: roamway agent update <id> [--title --model --workspace]"),
+    };
+    let body = json!({
+        "title": flags.get("title"),
+        "model": flags.get("model"),
+        "workspace": flags.get("workspace"),
+    });
+    match request(flags, "PATCH", &format!("/v1/agents/{}", id), Some(body)) {
+        Ok(v) => {
+            if flags.contains_key("json") {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+            } else {
+                println!("updated {}", id);
+            }
+        }
+        Err(e) => eprintln!("agent update failed: {}", e),
+    }
+}
+
+fn cmd_agent_open(flags: &HashMap<String, String>, pos: &[String]) {
+    let id = match pos.first() {
+        Some(i) => i,
+        None => return eprintln!("usage: roamway agent open <id>"),
+    };
+    let base = if let Some(h) = resolve_host(flags) {
+        h.endpoint.clone()
+    } else {
+        local_base(flags)
+    };
+    println!("{}/agents/{}", base.trim_end_matches('/'), id);
+}
+
+fn cmd_agent_detach(flags: &HashMap<String, String>, pos: &[String]) {
+    let id = match pos.first() {
+        Some(i) => i,
+        None => return eprintln!("usage: roamway agent detach <id>"),
+    };
+    match request(flags, "POST", &format!("/v1/agents/{}/detach", id), Some(json!({}))) {
+        Ok(v) => {
+            if v["detached"].as_bool() == Some(false) {
+                println!("already independent");
+            } else if flags.contains_key("json") {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+            } else {
+                println!("detached {}", id);
+            }
+        }
+        Err(e) => eprintln!("agent detach failed: {}", e),
+    }
+}
+
+fn cmd_agent_import(flags: &HashMap<String, String>, pos: &[String]) {
+    let mut session = flags.get("session").cloned().unwrap_or_default();
+    if session.trim().is_empty() {
+        session = pos.first().cloned().unwrap_or_default();
+    }
+    if session.trim().is_empty() {
+        eprintln!("--session is required");
+        return;
+    }
+    let body = json!({
+        "kind": flags.get("kind").cloned().unwrap_or_else(|| "codex".into()),
+        "session": session,
+        "title": flags.get("title"),
+        "model": flags.get("model"),
+        "workspace": flags.get("workspace"),
+    });
+    match request(flags, "POST", "/v1/agents/import", Some(body)) {
+        Ok(v) => {
+            if flags.contains_key("json") {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+            } else {
+                println!("imported {}", v["agent"]["id"].as_str().unwrap_or(""));
+            }
+        }
+        Err(e) => eprintln!("import failed: {}", e),
+    }
+}
+
+fn cmd_agent_attach(flags: &HashMap<String, String>, pos: &[String]) {
+    let id = match pos.first() {
+        Some(i) => i,
+        None => return eprintln!("usage: roamway attach <id>"),
+    };
+    let (base, token) = if let Some(h) = resolve_host(flags) {
+        (
+            h.endpoint.clone(),
+            if h.token.is_empty() {
+                None
+            } else {
+                Some(h.token.clone())
+            },
+        )
+    } else {
+        let c = local_client(flags);
+        (c.base.clone(), c.token.clone())
+    };
+    let mut url = format!("{}/v1/agents/{}/events", base.trim_end_matches('/'), id);
+    if let Some(t) = &token {
+        url.push_str("?token=");
+        url.push_str(t);
+    }
+    let req = ureq::get(&url).timeout(Duration::from_secs(3600));
+    match req.call() {
+        Ok(resp) => {
+            let reader = resp.into_reader();
+            let mut r = std::io::BufReader::new(reader);
+            let mut line = Vec::new();
+            let mut last_state = String::new();
+            loop {
+                line.clear();
+                let n = match r.read_until(b'\n', &mut line) {
+                    Ok(n) => n,
+                    Err(_) => break,
+                };
+                if n == 0 {
+                    break;
+                }
+                let text = String::from_utf8_lossy(&line)
+                    .trim_end_matches(['\r', '\n'])
+                    .to_string();
+                if let Some(payload) = text.strip_prefix("data:") {
+                    if let Ok(v) = serde_json::from_str::<Value>(payload.trim()) {
+                        match v["type"].as_str() {
+                            Some("log") => {
+                                print!("{}", v["chunk"].as_str().unwrap_or(""));
+                                let _ = std::io::stdout().flush();
+                            }
+                            Some("state") => {
+                                last_state = v["state"].as_str().unwrap_or("").to_string();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            println!("state={}", last_state);
+        }
+        Err(ureq::Error::Status(code, resp)) => {
+            let t = resp.into_string().unwrap_or_default();
+            eprintln!("attach failed: HTTP {}: {}", code, t);
+        }
+        Err(e) => eprintln!("attach failed: {}", e),
+    }
 }
 
 fn cmd_daemon(flags: &HashMap<String, String>, pos: &[String]) {

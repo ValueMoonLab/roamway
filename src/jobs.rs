@@ -113,6 +113,7 @@ pub fn spawn_from_job(app: Arc<App>, job_id: &str) {
             job_id: Some(j.id.clone()),
             pid: None,
             attempts: 0,
+            agent_id: None,
         });
         if let Some(jj) = st.state.jobs.iter_mut().find(|x| x.id == job_id) {
             jj.last_run = Some(iso(t));
@@ -256,6 +257,7 @@ mod tests {
             job_id: None,
             pid: None,
             attempts: 0,
+            agent_id: None,
         };
         let state = State {
             runs: vec![
@@ -266,6 +268,7 @@ mod tests {
                 mk("e", RunStatus::Queued),
             ],
             jobs: vec![],
+            agents: vec![],
             seq: 0,
         };
         let picked = queued_to_start(&state, 2);
@@ -293,6 +296,7 @@ mod tests {
             job_id: None,
             pid: None,
             attempts: 0,
+            agent_id: None,
         };
         let dir = std::env::temp_dir().join(format!("roamway-prune-{}", now()));
         let _ = std::fs::create_dir_all(&dir);
@@ -301,6 +305,7 @@ mod tests {
             state: State {
                 runs: (0..805).map(mk).collect(),
                 jobs: vec![],
+                agents: vec![],
                 seq: 0,
             },
             loaded_ok: true,

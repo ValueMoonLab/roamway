@@ -7,6 +7,8 @@ use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::agents::Agent;
+
 pub fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -117,6 +119,8 @@ pub struct Run {
     pub pid: Option<u32>,
     #[serde(default)]
     pub attempts: u32,
+    #[serde(default)]
+    pub agent_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -164,6 +168,8 @@ pub struct State {
     #[serde(default)]
     pub jobs: Vec<Job>,
     #[serde(default)]
+    pub agents: Vec<Agent>,
+    #[serde(default)]
     pub seq: u64,
 }
 
@@ -194,6 +200,23 @@ impl Store {
                 r.ended_at = Some(now());
                 r.error = Some("daemon restarted while running".into());
                 dirty = true;
+            }
+        }
+        // 重启后，若 agent 仍标 running/queued 但对应 run 已不在活动态，修正为 error
+        for a in state.agents.iter_mut() {
+            if a.state == "running" || a.state == "queued" {
+                let active = state
+                    .runs
+                    .iter()
+                    .any(|r| r.id == a.last_run_id && !r.status.terminal());
+                if !active {
+                    a.state = "error".into();
+                    if a.last_error.is_empty() {
+                        a.last_error = "daemon restarted while running".into();
+                    }
+                    a.updated_at = now();
+                    dirty = true;
+                }
             }
         }
         let store = Store {
@@ -441,10 +464,12 @@ mod tests {
             job_id: None,
             pid: None,
             attempts: 0,
+            agent_id: None,
         };
         let state = State {
             runs: vec![run],
             jobs: vec![],
+            agents: vec![],
             seq: 1,
         };
         fs::write(dir.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();

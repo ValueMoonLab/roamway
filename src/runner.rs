@@ -1,7 +1,8 @@
+use crate::agents;
 use crate::types::*;
 use serde_json::json;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,13 +32,12 @@ fn execute(app: Arc<App>, id: String) {
             .or_insert_with(|| Arc::new(AtomicBool::new(false)))
             .clone()
     };
-    let (run, log_path) = {
+    let (run, log_path, agent_ctx) = {
         let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
         let idx = match st.state.runs.iter().position(|r| r.id == id) {
             Some(i) => i,
             None => return,
         };
-        // 被 stop 抢先改掉的任务绝不复活：状态必须是 Queued 且无取消标记
         if !run_is_startable(st.state.runs[idx].status, &cancel) {
             drop(st);
             remove_cancel(&app, &id);
@@ -46,12 +46,21 @@ fn execute(app: Arc<App>, id: String) {
         st.state.runs[idx].status = RunStatus::Running;
         st.state.runs[idx].started_at = Some(now());
         let r = st.state.runs[idx].clone();
+        let ctx = match r.agent_id.as_deref() {
+            Some(aid) => st
+                .state
+                .agents
+                .iter()
+                .find(|a| a.id == aid)
+                .map(|a| (a.kind.clone(), a.session_id.clone(), a.history.clone()))
+                .unwrap_or_else(|| (r.agent.clone(), String::new(), Vec::new())),
+            None => (r.agent.clone(), String::new(), Vec::new()),
+        };
         let lp = st.log_path(&id);
         st.save();
-        (r, lp)
+        (r, lp, ctx)
     };
 
-    // spawn 前再查一次取消标志
     if cancel.load(Ordering::Relaxed) {
         finalize(&app, &id, RunStatus::Killed, None, None);
         return;
@@ -77,25 +86,180 @@ fn execute(app: Arc<App>, id: String) {
         let _ = f.flush();
     }
 
-    let (status, code, err) = if run.agent.starts_with("api:") {
-        run_api(&run, &log_path, &cancel)
+    let (agent_kind, mut session, history) = agent_ctx;
+    let mut resume_note: Option<String> = None;
+    let mut claude_flag: Option<&'static str> = None;
+    if run.agent_id.is_some() && agent_kind == "claude" {
+        match probe_claude_flags() {
+            Some(flags) => {
+                if session.is_empty() {
+                    if let Some(sf) = flags.session_flag {
+                        session = agents::gen_session_id();
+                        record_agent_session(&app, &run.agent_id, &session);
+                        claude_flag = Some(sf);
+                    } else {
+                        resume_note = Some("resume unsupported".into());
+                    }
+                } else {
+                    claude_flag = flags.resume_flag.or(flags.session_flag);
+                }
+            }
+            None => resume_note = Some("resume unsupported".into()),
+        }
+    }
+
+    let outcome = if run.agent.starts_with("api:") {
+        let (status, code, err, text) = run_api(&run, &log_path, &cancel, &history);
+        (status, code, err, text)
     } else {
-        run_cli(&app, &run, &log_path, &cancel)
+        let session_for_run = if matches!(agent_kind.as_str(), "codex" | "claude") {
+            if session.is_empty() {
+                None
+            } else {
+                Some(session.as_str())
+            }
+        } else {
+            None
+        };
+        let (status, code, err) = run_cli(&app, &run, &log_path, &cancel, session_for_run, claude_flag);
+        (status, code, err, String::new())
     };
+    let (status, code, err, assistant) = outcome;
 
     if let Ok(mut f) = OpenOptions::new().append(true).open(&log_path) {
         let _ = writeln!(f, "\n# end {} status={:?} exit={:?}", iso(now()), status, code);
     }
+
+    if status == RunStatus::Done && agent_kind == "codex" {
+        if session.is_empty() {
+            match extract_codex_session(&log_path) {
+                Some(sid) => {
+                    record_agent_session(&app, &run.agent_id, &sid);
+                }
+                None => {
+                    resume_note = Some("resume unsupported".into());
+                }
+            }
+        } else if let Some(sid) = extract_codex_session(&log_path) {
+            record_agent_session(&app, &run.agent_id, &sid);
+        }
+    }
+    if !assistant.is_empty() {
+        push_assistant(&app, &run.agent_id, &assistant);
+    }
+    update_agent_run_status(&app, &run.agent_id, &id, &status, err.as_deref());
+    if status == RunStatus::Done {
+        if let Some(note) = resume_note.take() {
+            mark_agent_error(&app, &run.agent_id, &note);
+        }
+    }
+
     finalize(&app, &id, status, code, err);
 }
 
+fn update_agent_run_status(app: &Arc<App>, agent_id: &Option<String>, run_id: &str, status: &RunStatus, err: Option<&str>) {
+    let aid = match agent_id.as_deref() {
+        Some(a) => a,
+        None => return,
+    };
+    let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(a) = st.state.agents.iter_mut().find(|a| a.id == aid) {
+        let ok = *status == RunStatus::Done;
+        agents::apply_run_status_to_agent(a, run_id, ok, err);
+    }
+    st.save();
+}
+
+fn record_agent_session(app: &Arc<App>, agent_id: &Option<String>, sid: &str) {
+    let aid = match agent_id.as_deref() {
+        Some(a) => a,
+        None => return,
+    };
+    let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(a) = st.state.agents.iter_mut().find(|a| a.id == aid) {
+        agents::record_session_id(a, sid);
+    }
+    st.save();
+}
+
+fn mark_agent_error(app: &Arc<App>, agent_id: &Option<String>, err: &str) {
+    let aid = match agent_id.as_deref() {
+        Some(a) => a,
+        None => return,
+    };
+    let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(a) = st.state.agents.iter_mut().find(|a| a.id == aid) {
+        a.last_error = err.to_string();
+        a.updated_at = now();
+    }
+    st.save();
+}
+
+fn push_assistant(app: &Arc<App>, agent_id: &Option<String>, text: &str) {
+    let aid = match agent_id.as_deref() {
+        Some(a) => a,
+        None => return,
+    };
+    let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(a) = st.state.agents.iter_mut().find(|a| a.id == aid) {
+        agents::push_msg(a, "assistant", text);
+    }
+    st.save();
+}
+
+struct ClaudeFlags {
+    session_flag: Option<&'static str>,
+    resume_flag: Option<&'static str>,
+}
+
+fn probe_claude_flags() -> Option<ClaudeFlags> {
+    let out = Command::new("claude").args(["--help"]).output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).to_lowercase();
+    if !text.contains("--session-id") && !text.contains("--resume") {
+        return None;
+    }
+    Some(ClaudeFlags {
+        session_flag: if text.contains("--session-id") {
+            Some("--session-id")
+        } else {
+            None
+        },
+        resume_flag: if text.contains("--resume") {
+            Some("--resume")
+        } else {
+            None
+        },
+    })
+}
+
+fn extract_codex_session(log_path: &Path) -> Option<String> {
+    let mut s = String::new();
+    File::open(log_path).ok()?.read_to_string(&mut s).ok()?;
+    for line in s.lines() {
+        let l = line.trim();
+        let lower = l.to_lowercase();
+        for key in ["session id:", "session:"] {
+            if lower.starts_with(key) {
+                let sid = l[key.len()..].trim();
+                if !sid.is_empty() {
+                    return Some(sid.to_string());
+                }
+            }
+        }
+    }
+    None
+}
 fn env_list(key: &str) -> Vec<String> {
     std::env::var(key)
         .map(|v| v.split_whitespace().map(|s| s.to_string()).collect())
         .unwrap_or_default()
 }
 
-fn build_command(run: &Run) -> Result<Command, String> {
+fn build_command_with_session(
+    run: &Run,
+    session_id: Option<&str>,
+    claude_resume_flag: Option<&str>,
+) -> Result<Command, String> {
     let (prog, args): (String, Vec<String>) = match run.agent.as_str() {
         "shell" => {
             if cfg!(windows) {
@@ -111,6 +275,10 @@ fn build_command(run: &Run) -> Result<Command, String> {
                 "-s".into(),
                 "workspace-write".into(),
             ];
+            if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
+                a.push("resume".into());
+                a.push(sid.to_string());
+            }
             if !run.workspace.is_empty() {
                 a.push("-C".into());
                 a.push(run.workspace.clone());
@@ -132,7 +300,15 @@ fn build_command(run: &Run) -> Result<Command, String> {
             a.extend(env_list("ROAMWAY_HERMES_ARGS"));
             ("hermes".into(), a)
         }
-        "claude" => ("claude".into(), vec!["-p".into(), run.prompt.clone()]),
+        "claude" => {
+            let mut a: Vec<String> = vec!["-p".into()];
+            if let (Some(flag), Some(sid)) = (claude_resume_flag, session_id.filter(|s| !s.is_empty())) {
+                a.push(flag.to_string());
+                a.push(sid.to_string());
+            }
+            a.push(run.prompt.clone());
+            ("claude".into(), a)
+        }
         other => return Err(format!("unknown agent: {}", other)),
     };
 
@@ -144,7 +320,6 @@ fn build_command(run: &Run) -> Result<Command, String> {
     configure_process(&mut c);
     Ok(c)
 }
-
 #[cfg(unix)]
 fn configure_process(c: &mut Command) {
     use std::os::unix::process::CommandExt;
@@ -252,8 +427,10 @@ fn run_cli(
     run: &Run,
     log_path: &Path,
     cancel: &Arc<AtomicBool>,
+    session_id: Option<&str>,
+    claude_resume_flag: Option<&str>,
 ) -> (RunStatus, Option<i32>, Option<String>) {
-    let mut cmd = match build_command(run) {
+    let mut cmd = match build_command_with_session(run, session_id, claude_resume_flag) {
         Ok(c) => c,
         Err(e) => return (RunStatus::Failed, None, Some(e)),
     };
@@ -323,7 +500,8 @@ fn run_api(
     run: &Run,
     log_path: &Path,
     _cancel: &Arc<AtomicBool>,
-) -> (RunStatus, Option<i32>, Option<String>) {
+    history: &[agents::Msg],
+) -> (RunStatus, Option<i32>, Option<String>, String) {
     let (default_url, key_env, url_env, default_model) = match run.agent.as_str() {
         "api:deepseek" => (
             "https://api.deepseek.com/chat/completions",
@@ -342,6 +520,7 @@ fn run_api(
                 RunStatus::Failed,
                 None,
                 Some(format!("unknown api agent {}", other)),
+                String::new(),
             )
         }
     };
@@ -356,6 +535,7 @@ fn run_api(
                 RunStatus::Failed,
                 None,
                 Some(format!("missing env {}", key_env)),
+                String::new(),
             )
         }
     };
@@ -364,9 +544,16 @@ fn run_api(
         .clone()
         .filter(|m| !m.is_empty())
         .unwrap_or_else(|| default_model.to_string());
+    let mut messages: Vec<serde_json::Value> = history
+        .iter()
+        .map(|m| json!({ "role": m.role, "content": m.content }))
+        .collect();
+    if !history.iter().any(|m| m.role == "user" && m.content == run.prompt) {
+        messages.push(json!({ "role": "user", "content": run.prompt }));
+    }
     let body = json!({
         "model": model,
-        "messages": [{"role": "user", "content": run.prompt}],
+        "messages": messages,
         "stream": false
     });
     let resp = ureq::post(&url)
@@ -377,7 +564,7 @@ fn run_api(
 
     let mut f = match OpenOptions::new().append(true).create(true).open(log_path) {
         Ok(f) => f,
-        Err(e) => return (RunStatus::Failed, None, Some(e.to_string())),
+        Err(e) => return (RunStatus::Failed, None, Some(e.to_string()), String::new()),
     };
     match resp {
         Ok(r) => match r.into_json::<serde_json::Value>() {
@@ -389,11 +576,16 @@ fn run_api(
                 let _ = writeln!(f, "{}", text);
                 let _ = f.flush();
                 if text.is_empty() {
-                    return (RunStatus::Failed, Some(0), Some("empty completion".into()));
+                    return (
+                        RunStatus::Failed,
+                        Some(0),
+                        Some("empty completion".into()),
+                        String::new(),
+                    );
                 }
-                (RunStatus::Done, Some(0), None)
+                (RunStatus::Done, Some(0), None, text)
             }
-            Err(e) => (RunStatus::Failed, None, Some(e.to_string())),
+            Err(e) => (RunStatus::Failed, None, Some(e.to_string()), String::new()),
         },
         Err(ureq::Error::Status(code, r)) => {
             let body = r.into_string().unwrap_or_default();
@@ -402,15 +594,15 @@ fn run_api(
                 RunStatus::Failed,
                 Some(code as i32),
                 Some(format!("http {}", code)),
+                String::new(),
             )
         }
         Err(e) => {
             let _ = writeln!(f, "request error: {}", e);
-            (RunStatus::Failed, None, Some(e.to_string()))
+            (RunStatus::Failed, None, Some(e.to_string()), String::new())
         }
     }
 }
-
 fn finalize(app: &Arc<App>, id: &str, status: RunStatus, code: Option<i32>, err: Option<String>) {
     let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
     let idx = match st.state.runs.iter().position(|r| r.id == id) {
@@ -480,14 +672,15 @@ mod tests {
             job_id: None,
             pid: None,
             attempts: 0,
+            agent_id: None,
         }
     }
 
     #[test]
     fn unknown_agent_rejected_by_builder() {
-        assert!(build_command(&sample_run("rm -rf /")).is_err());
-        assert!(build_command(&sample_run("shell")).is_ok());
-        assert!(build_command(&sample_run("codex")).is_ok());
+        assert!(build_command_with_session(&sample_run("rm -rf /"), None, None).is_err());
+        assert!(build_command_with_session(&sample_run("shell"), None, None).is_ok());
+        assert!(build_command_with_session(&sample_run("codex"), None, None).is_ok());
     }
 
     #[cfg(target_os = "linux")]

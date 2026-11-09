@@ -1,3 +1,4 @@
+use crate::agents;
 use crate::hosts;
 use crate::jobs;
 use crate::types::*;
@@ -219,7 +220,27 @@ fn handle(app: Arc<App>, mut s: TcpStream) -> std::io::Result<()> {
         }
     };
 
-    // /health 免鉴权；其余路由若配置了 token 则只接受 header
+    // SSE attach: only the events endpoint accepts a query token; everything
+    // else must carry the token in the x-roamway-token header.
+    let events_id = events_agent_id(&req);
+    if events_id.is_some() && req.method == "GET" {
+        if let Some(tok) = app.token.clone() {
+            let got = req
+                .query
+                .get("token")
+                .cloned()
+                .or_else(|| req.headers.get("x-roamway-token").cloned())
+                .unwrap_or_default();
+            if !ct_eq(&got, &tok) {
+                return respond(&mut s, 401, &json!({"error": "unauthorized"}));
+            }
+        }
+        let _ = s.set_write_timeout(None);
+        let _ = s.set_read_timeout(None);
+        stream_agent_events(&app, &mut s, events_id.as_deref().unwrap());
+        return Ok(());
+    }
+
     if needs_auth(&req.path) {
         if let Some(tok) = app.token.clone() {
             let got = req
@@ -237,7 +258,107 @@ fn handle(app: Arc<App>, mut s: TcpStream) -> std::io::Result<()> {
     respond(&mut s, code, &body)
 }
 
-/// 只有 /health 免鉴权；/v1/health 仍需鉴权
+/// Returns the agent id when the request targets /v1/agents/{id}/events.
+fn events_agent_id(req: &Req) -> Option<String> {
+    let segs: Vec<&str> = req
+        .path
+        .trim_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
+    if segs.len() == 4 && segs[0] == "v1" && segs[1] == "agents" && segs[3] == "events" {
+        Some(segs[2].to_string())
+    } else {
+        None
+    }
+}
+
+fn agent_state(app: &Arc<App>, id: &str) -> String {
+    let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+    st.state
+        .agents
+        .iter()
+        .find(|a| a.id == id)
+        .map(|a| a.state.clone())
+        .unwrap_or_else(|| "archived".into())
+}
+
+fn emit_sse(s: &mut TcpStream, payload: &str) -> bool {
+    let data = format!("data: {}\n\n", payload);
+    s.write_all(data.as_bytes()).and_then(|_| s.flush()).is_ok()
+}
+
+fn stream_agent_events(app: &Arc<App>, s: &mut TcpStream, id: &str) {
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n";
+    if s.write_all(head.as_bytes()).and_then(|_| s.flush()).is_err() {
+        return;
+    }
+    let log_path = {
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        let latest = st
+            .state
+            .runs
+            .iter()
+            .filter(|r| r.agent_id.as_deref() == Some(id))
+            .max_by_key(|r| r.created_at)
+            .map(|r| r.id.clone())
+            .unwrap_or_else(|| id.to_string());
+        st.log_path(&latest)
+    };
+    let mut offset: u64 = 0;
+    let mut last_state = String::new();
+    let started = Instant::now();
+    let mut last_ping = 0u64;
+    let mut last_len: u64 = 0;
+    loop {
+        let state = agent_state(app, id);
+        if state != last_state {
+            if emit_sse(s, &serde_json::to_string(&json!({"type":"state","state": state})).unwrap_or_default()) {
+                last_state = state.clone();
+            }
+        }
+        if let Ok(meta) = std::fs::metadata(&log_path) {
+            let len = meta.len();
+            if len < last_len || offset > len {
+                offset = 0;
+            }
+            last_len = len;
+        }
+        let mut buf = [0u8; 4096];
+        if let Ok(mut f) = std::fs::File::open(&log_path) {
+            use std::io::{Read, Seek, SeekFrom};
+            if f.seek(SeekFrom::Start(offset)).is_ok() {
+                loop {
+                    match f.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            offset += n as u64;
+                            let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+                            let ev = serde_json::to_string(&json!({"type":"log","chunk": chunk}))
+                                .unwrap_or_default();
+                            if !emit_sse(s, &ev) {
+                                return;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+        if state != "running" && state != "queued" {
+            let _ = emit_sse(s, &serde_json::to_string(&json!({"type":"state","state": state})).unwrap_or_default());
+            return;
+        }
+        let elapsed = started.elapsed().as_secs();
+        if elapsed / 15 > last_ping {
+            last_ping = elapsed / 15;
+            if s.write_all(b": ping\n\n").and_then(|_| s.flush()).is_err() {
+                return;
+            }
+        }
+        thread::sleep(Duration::from_millis(300));
+    }
+}
 fn needs_auth(path: &str) -> bool {
     path != "/health"
 }
@@ -326,6 +447,53 @@ struct NewJob {
     enabled: Option<bool>,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewAgent {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    workspace: Option<String>,
+    prompt: String,
+    #[serde(default)]
+    timeout_s: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewImport {
+    kind: String,
+    session: String,
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PatchAgent {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    workspace: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ContinueAgent {
+    prompt: String,
+    #[serde(default)]
+    timeout_s: Option<u64>,
+}
 fn route(app: &Arc<App>, req: &Req) -> (u16, Value) {
     let segs: Vec<&str> = req
         .path
@@ -374,10 +542,188 @@ fn route(app: &Arc<App>, req: &Req) -> (u16, Value) {
                 (404, json!({"error": "no such job"}))
             }
         }
+        ("GET", ["v1", "agents"]) => list_agents_route(app, req),
+        ("POST", ["v1", "agents"]) => create_agent_route(app, req),
+        ("POST", ["v1", "agents", "import"]) => import_agent_route(app, req),
+        ("GET", ["v1", "agents", id]) => get_agent_route(app, id),
+        ("PATCH", ["v1", "agents", id]) => patch_agent_route(app, id, req),
+        ("DELETE", ["v1", "agents", id]) => archive_agent_route(app, id),
+        ("POST", ["v1", "agents", id, "reload"]) => reload_agent_route(app, id),
+        ("POST", ["v1", "agents", id, "run"]) => continue_agent_route(app, id, req),
+        ("POST", ["v1", "agents", id, "detach"]) => detach_agent_route(app, id),
+        ("GET", ["v1", "agents", _id, "events"]) => (405, json!({"error": "events must be streamed"})),
         _ => (404, json!({"error": "not found", "path": req.path})),
     }
 }
 
+fn query_true(req: &Req, key: &str) -> bool {
+    req.query
+        .get(key)
+        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
+fn agent_run_summary(r: &Run) -> Value {
+    json!({
+        "id": r.id,
+        "title": r.title,
+        "agent": r.agent,
+        "status": r.status,
+        "created_at": r.created_at,
+        "started_at": r.started_at,
+        "ended_at": r.ended_at,
+        "exit_code": r.exit_code,
+        "error": r.error,
+    })
+}
+
+fn list_agents_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
+    let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+    let all = query_true(req, "all");
+    let agents: Vec<&agents::Agent> = agents::filter_visible(&st.state.agents, all);
+    (200, json!({ "agents": agents }))
+}
+
+fn get_agent_route(app: &Arc<App>, id: &str) -> (u16, Value) {
+    let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+    match st.state.agents.iter().find(|a| a.id == id) {
+        Some(a) => {
+            let mut runs: Vec<&Run> = st
+                .state
+                .runs
+                .iter()
+                .filter(|r| r.agent_id.as_deref() == Some(a.id.as_str()))
+                .collect();
+            runs.sort_by(|x, y| y.created_at.cmp(&x.created_at));
+            let runs: Vec<Value> = runs.into_iter().map(agent_run_summary).collect();
+            (200, json!({ "agent": a, "runs": runs }))
+        }
+        None => (404, json!({ "error": "no such agent" })),
+    }
+}
+
+fn create_agent_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
+    let spec: NewAgent = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
+        Err(e) => return (400, json!({ "error": format!("bad json: {}", e) })),
+    };
+    let kind = spec.kind.unwrap_or_else(|| "shell".into());
+    if !is_known_agent(&kind) {
+        return (400, json!({ "error": "unknown agent" }));
+    }
+    if spec.prompt.trim().is_empty() {
+        return (400, json!({ "error": "prompt is required" }));
+    }
+    let timeout_s = spec.timeout_s.unwrap_or(1800);
+    if !valid_timeout_s(timeout_s) {
+        return (400, json!({ "error": "timeout_s must be in 1..=21600" }));
+    }
+    match agents::create_agent_and_run(
+        app,
+        &kind,
+        spec.model,
+        spec.workspace,
+        spec.title,
+        &spec.prompt,
+        timeout_s,
+    ) {
+        Ok((agent, run)) => (200, json!({ "agent": agent, "run": run })),
+        Err(e) => (400, json!({ "error": e })),
+    }
+}
+
+fn import_agent_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
+    let spec: NewImport = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
+        Err(e) => return (400, json!({ "error": format!("bad json: {}", e) })),
+    };
+    match agents::import_agent(
+        app,
+        &spec.kind,
+        &spec.session,
+        spec.title,
+        spec.model,
+        spec.workspace,
+    ) {
+        Ok(agent) => (200, json!({ "agent": agent })),
+        Err(e) => (400, json!({ "error": e })),
+    }
+}
+
+fn patch_agent_route(app: &Arc<App>, id: &str, req: &Req) -> (u16, Value) {
+    let spec: PatchAgent = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
+        Err(e) => return (400, json!({ "error": format!("bad json: {}", e) })),
+    };
+    if spec.title.is_none() && spec.model.is_none() && spec.workspace.is_none() {
+        return (400, json!({ "error": "nothing to update" }));
+    }
+    match agents::update_agent_meta(app, id, spec.title, spec.model, spec.workspace) {
+        Ok(agent) => (200, json!({ "agent": agent })),
+        Err(e) => (404, json!({ "error": e })),
+    }
+}
+
+fn archive_agent_route(app: &Arc<App>, id: &str) -> (u16, Value) {
+    match agents::archive_agent(app, id) {
+        Ok(()) => (200, json!({ "ok": true, "archived": id })),
+        Err(e) => (404, json!({ "error": e })),
+    }
+}
+
+fn reload_agent_route(app: &Arc<App>, id: &str) -> (u16, Value) {
+    let exists = {
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        st.state.agents.iter().any(|a| a.id == id)
+    };
+    if !exists {
+        return (404, json!({ "error": "no such agent" }));
+    }
+    match agents::reload_agent(app, id, 1800) {
+        Ok(run) => {
+            let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+            let agent = st.state.agents.iter().find(|a| a.id == id).cloned();
+            (200, json!({ "agent": agent, "run": run }))
+        }
+        Err(e) => (400, json!({ "error": e })),
+    }
+}
+
+fn detach_agent_route(app: &Arc<App>, id: &str) -> (u16, Value) {
+    match agents::detach_agent(app, id) {
+        Ok(detached) => (200, json!({ "ok": true, "id": id, "detached": detached })),
+        Err(e) => (404, json!({ "error": e })),
+    }
+}
+
+fn continue_agent_route(app: &Arc<App>, id: &str, req: &Req) -> (u16, Value) {
+    let spec: ContinueAgent = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
+        Err(e) => return (400, json!({ "error": format!("bad json: {}", e) })),
+    };
+    if spec.prompt.trim().is_empty() {
+        return (400, json!({ "error": "prompt is required" }));
+    }
+    let timeout_s = spec.timeout_s.unwrap_or(1800);
+    if !valid_timeout_s(timeout_s) {
+        return (400, json!({ "error": "timeout_s must be in 1..=21600" }));
+    }
+    let exists = {
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        st.state.agents.iter().any(|a| a.id == id)
+    };
+    if !exists {
+        return (404, json!({ "error": "no such agent" }));
+    }
+    match agents::queue_agent_run(app, id, &spec.prompt, timeout_s) {
+        Ok(run) => {
+            let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+            let agent = st.state.agents.iter().find(|a| a.id == id).cloned();
+            (200, json!({ "agent": agent, "run": run }))
+        }
+        Err(e) => (400, json!({ "error": e })),
+    }
+}
 fn list_hosts(app: &Arc<App>) -> (u16, Value) {
     let dir = {
         let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
@@ -565,6 +911,7 @@ fn create_run(app: &Arc<App>, req: &Req) -> (u16, Value) {
             job_id: None,
             pid: None,
             attempts: 0,
+            agent_id: None,
         };
         st.state.runs.push(r.clone());
         jobs::prune(&mut st);
@@ -868,12 +1215,14 @@ mod tests {
             job_id: None,
             pid: None,
             attempts: 0,
+            agent_id: None,
         };
         let store = Store {
             dir: dir.clone(),
             state: State {
                 runs: vec![mk("a"), mk("b"), mk("c")],
                 jobs: vec![],
+                agents: vec![],
                 seq: 3,
             },
             loaded_ok: true,
@@ -924,10 +1273,11 @@ mod tests {
             job_id: None,
             pid: None,
             attempts: 0,
+            agent_id: None,
         };
         let store = Store {
             dir: dir.to_path_buf(),
-            state: State { runs: vec![run], jobs: vec![], seq: 1 },
+            state: State { runs: vec![run], jobs: vec![], agents: vec![], seq: 1 },
             loaded_ok: true,
         };
         Arc::new(App {

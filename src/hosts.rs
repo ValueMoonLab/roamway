@@ -1,9 +1,10 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Host {
@@ -85,10 +86,17 @@ pub fn valid_name(name: &str) -> bool {
 static HOST_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub fn gen_host_id() -> String {
-    let t = crate::types::now() as u64;
     let n = HOST_SEQ.fetch_add(1, Ordering::SeqCst);
-    let v = (t.rotate_left(13) ^ n.wrapping_mul(0x9e37_79b9)) & 0xffff_ffff;
-    format!("host_{:08x}", v)
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    n.hash(&mut hasher);
+    t.hash(&mut hasher);
+    let h = hasher.finish();
+    let seed = (n.wrapping_add(t).wrapping_add(h)) as u32;
+    format!("host_{:08x}", seed)
 }
 
 impl Registry {
@@ -260,6 +268,7 @@ pub fn dispatch(
         "GET" => ureq::get(&url),
         "POST" => ureq::post(&url),
         "DELETE" => ureq::delete(&url),
+        "PATCH" => ureq::patch(&url),
         _ => return Err(format!("unsupported method: {}", method)),
     };
     let req = req.timeout(Duration::from_secs(60)).set("x-roamway-token", &h.token);
