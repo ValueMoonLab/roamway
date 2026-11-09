@@ -123,32 +123,17 @@ queued ──▶ running ──▶ done
 
 ## CLI
 
-```
-roamway serve    [--bind 127.0.0.1:8796] [--data DIR] [--token T] [--tz 8] [--max-concurrent 4] [--max-conn 64]
-                 [--tls-cert PEM --tls-key PEM] [--allow-host H] [--allow-origin O]
-                 [--unix-socket PATH] [--require-approval run|admin]
-roamway run      --agent AGENT [--model M] [--workspace DIR] [--title T]
-                 [--timeout 1800] [--no-wait] "prompt"
-roamway ls       [--limit 20]
-roamway status   RUN_ID
-roamway logs     RUN_ID [--tail 80]
-roamway stop     RUN_ID
-roamway rm       RUN_ID
-roamway jobs
-roamway jobs-add --agent AGENT (--every 3600 | --daily 08:30)
-                 [--model M] [--workspace DIR] [--max-retries 2]
-                 [--allow-overlap] [--disabled] "prompt"
-roamway jobs-run JOB_ID
-roamway jobs-rm  JOB_ID
-roamway health
-roamway token create --name N [--scope read|run|admin] [--ttl 24h]
-roamway token ls | roamway token revoke ID
-roamway pair  [--json] [--host H]
-roamway daemon set-password [--stdin]
-roamway approve ID | roamway deny ID | roamway approvals [--all]
+命令面已与 Paseo 对齐（31 个顶层命令 / 96 条），不再手工维护命令清单，权威文本随时由命令自身输出：
+
+```bash
+roamway help              # 总帮助
+roamway help <cmd>        # 任意命令帮助（与 roamway <cmd> --help 完全一致）
+roamway <cmd> --help      # 同上
 ```
 
-通用参数：`--host http://127.0.0.1:8796`、`--token T`（也可用 `ROAMWAY_HOST` / `ROAMWAY_TOKEN`）。
+核心命令速览（完整清单以 `roamway help` 为准）：`serve`、`start`、`run`、`send`、`delete`、`ls`、`status`、`logs`、`stop`、`rm`、`schedule`、`heartbeat`、`permit`、`workspace`、`agent`、`daemon`、`host`、`hub`、`terminal`、`script`、`provider`、`usage`、`plugin`、`speech`。
+
+全局参数：`--host http://127.0.0.1:8796`、`--token T`、`-o/--format table|json|yaml`、`--json`、`-q/--quiet`、`--no-headers`、`--no-color`、`--home DIR`（等价 `--data DIR`）；环境变量 `ROAMWAY_HOST` / `ROAMWAY_TOKEN` 仍可用。
 
 ## agent 类型
 
@@ -326,7 +311,8 @@ roamway run --host http://192.168.1.50:8796 --token T \
 - 登录：页面输入 daemon token 后存入 `localStorage`，所有 API 请求带 `Authorization: Bearer`，401 自动回到登录页。
 - 页面：Agents 列表/详情与实时输出（SSE）、worktree diff、Hosts 管理与 probe、Schedules、Terminals、Usage、Settings（token / provider / 主题）。
 - 移动端：支持深色模式与 720px 断点，关键操作 44px 最小点击区。
-- 静态资源随二进制嵌入（`include_str!`），无需 Node 构建链；`GET /` 302 到 `/ui/`。
+- 静态资源随二进制嵌入（`include_str!`）：`/ui/` 返回 `index.html`，`/ui/app.js` 与 `/ui/style.css` 同源内嵌，无需 Node 构建链；`GET /` 302 到 `/ui/`。
+- 截图：暂不随仓库提交二进制截图；界面以源码为准（`src/web/index.html`、`src/web/app.js`）。
 
 ```bash
 roamway serve --bind 127.0.0.1:8796 --token mysecret   # 启动后打开 http://127.0.0.1:8796/ui/

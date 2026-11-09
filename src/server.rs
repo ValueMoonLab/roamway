@@ -793,6 +793,15 @@ struct NewClone {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct NewWorkspace {
+    name: String,
+    path: String,
+    #[serde(default)]
+    remote: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NewAgent {
     #[serde(default)]
     title: Option<String>,
@@ -998,6 +1007,7 @@ fn route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         ("DELETE", ["v1", "hosts", name]) => delete_host_route(app, name),
         ("POST", ["v1", "hosts", name, "probe"]) => probe_host_route(app, name),
         ("GET", ["v1", "workspaces"]) => list_workspaces_route(app),
+        ("POST", ["v1", "workspaces"]) => create_workspace_route(app, req),
         ("POST", ["v1", "workspaces", "clone"]) => clone_workspace_route(app, req),
         ("DELETE", ["v1", "workspaces", name]) => remove_workspace_route(app, name),
         ("GET", ["v1", "terminals"]) => (200, json!({ "terminals": terminals::list(app) })),
@@ -2114,6 +2124,32 @@ fn list_workspaces_route(app: &Arc<App>) -> (u16, Value) {
     };
     let reg = workspaces::Registry::load(&data_dir);
     (200, json!({ "workspaces": reg.workspaces }))
+}
+
+fn create_workspace_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
+    let spec: NewWorkspace = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
+        Err(e) => return (400, json!({ "error": format!("bad json: {}", e) })),
+    };
+    if spec.name.trim().is_empty() {
+        return (400, json!({ "error": "name is required" }));
+    }
+    if spec.path.trim().is_empty() {
+        return (400, json!({ "error": "path is required" }));
+    }
+    let data_dir = {
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        st.dir.clone()
+    };
+    let remote = spec.remote.unwrap_or_default();
+    let mut reg = workspaces::Registry::load(&data_dir);
+    match reg.add_named(&spec.name, Path::new(&spec.path), &remote) {
+        Ok(ws) => match reg.save() {
+            Ok(()) => (200, json!({ "workspace": ws })),
+            Err(e) => (500, json!({ "error": format!("save workspaces.json failed: {}", e) })),
+        },
+        Err(e) => (400, json!({ "error": e })),
+    }
 }
 
 fn clone_workspace_route(app: &Arc<App>, req: &Req) -> (u16, Value) {

@@ -90,12 +90,20 @@ impl Registry {
 
     pub fn add(&mut self, path: &Path, remote: &str) -> Result<Workspace, String> {
         let abs = fs::canonicalize(path).map_err(|e| format!("workspace not found: {}", e))?;
-        let abs_path = abs.to_string_lossy().to_string();
         let name = abs
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("workspace")
             .to_string();
+        self.add_named(&name, path, remote)
+    }
+
+    pub fn add_named(&mut self, name: &str, path: &Path, remote: &str) -> Result<Workspace, String> {
+        let abs = fs::canonicalize(path).map_err(|e| format!("workspace not found: {}", e))?;
+        let abs_path = abs.to_string_lossy().to_string();
+        if name.trim().is_empty() {
+            return Err("name is required".to_string());
+        }
         if self.workspaces.iter().any(|w| w.name == name) {
             return Err(format!("workspace '{}' already registered", name));
         }
@@ -104,7 +112,7 @@ impl Registry {
         }
         let ws = Workspace {
             id: gen_workspace_id(),
-            name,
+            name: name.to_string(),
             path: abs_path,
             remote: remote.to_string(),
             host: "local".to_string(),

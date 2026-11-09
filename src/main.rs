@@ -22,72 +22,78 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Command, Stdio};
-use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicUsize, AtomicI32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use types::*;
 
-const BOOLS: &[&str] = &["no-wait", "quiet", "json", "allow-overlap", "disabled", "help", "force", "probe", "all", "worktree", "keep-worktree", "run-now", "overlap", "enabled", "enter", "no-enter", "stdin", "no-browser"];
+const BOOLS: &[&str] = &["no-wait", "quiet", "json", "allow-overlap", "disabled", "help", "force", "probe", "all", "worktree", "keep-worktree", "run-now", "overlap", "enabled", "enter", "no-enter", "stdin", "no-browser", "no-headers", "no-color", "version"];
+
+static FAIL_CODE: AtomicI32 = AtomicI32::new(0);
+
+fn fail(code: i32) {
+    FAIL_CODE.fetch_max(code, Ordering::SeqCst);
+}
+
+fn usage_error(msg: &str) {
+    eprintln!("{}", msg);
+    fail(2);
+}
 
 fn usage() {
     println!(
         r#"roamway {} — 迷你多智能体编排器（国内模型 / 长跑友好）
 
+核心：
   roamway serve  [--bind 127.0.0.1:8796] [--data DIR] [--token T] [--tz 8] [--max-concurrent 4] [--max-conn 64]
-  roamway ui [--print]
+  roamway start                                  # = daemon start
   roamway run    --agent codex [--model M] [--workspace DIR] [--title T] [--timeout 1800] [--no-wait] [--host H] "prompt"
-  roamway clone  <owner/repo | git url> [--dir DIR] [--protocol https|ssh] [--json] [--host H]
-  roamway agent run <prompt> [--title --workspace --model --kind --worktree --no-wait]
-  roamway agent ls|inspect|logs|wait|attach|archive [--keep-worktree]|reload|update|open [--no-browser]|detach|import
-  roamway attach|inspect|wait|archive|import <id>   # 顶层别名
+  roamway send   <agent-id> <prompt...>          # 续跑 agent
+  roamway delete <id> [--yes]                    # 运行中先 stop 再硬删
   roamway ls     [--limit 20] [--host H|all] [--trigger ID]
-  roamway status [ID] [--json] [--host H]
-  roamway logs   ID [--tail 80] [--host H]
-  roamway stop   ID [--host H]
+  roamway status [ID]
+  roamway logs   ID [--tail 80]
+  roamway stop   ID
   roamway rm     ID
-  roamway jobs
-  roamway schedule create|ls|inspect|logs|pause|resume|delete|run-once|update [--host H]
-  roamway hooks [--json] [--host H]
-  roamway hub [init [--name N] [--force] | permissions | projects | deploy | logout | status | token rotate]
-  roamway jobs-add --agent shell --every 3600 | --daily 08:30 [--model M] [--workspace DIR] [--max-retries 2] "prompt"
-  roamway jobs-run ID
-  roamway jobs-rm  ID
+  roamway jobs | jobs-add | jobs-run | jobs-rm
+  roamway schedule create|ls|inspect|logs|pause|resume|delete|run-once|update
+  roamway hooks
+  roamway agent run|ls|inspect|logs|wait|attach|archive|reload|update|open|detach|import
+  roamway attach|inspect|wait|archive|import <id>
+  roamway hub [init|permissions|projects|deploy|logout|status|token rotate]
   roamway health
-  roamway host add <name> --endpoint <ep> [--token T] [--force]
-  roamway host ls [--probe] [--json]
-  roamway host rm <name> | host enable|disable <name> | host probe <name>
+  roamway host add|ls|rm|enable|disable|probe
   roamway daemon status|config|start|stop|restart|reload|pair|set-password
-  roamway pair [--json] [--host H]
-  roamway token add|create --name N [--scope read|run|admin] [--ttl 24h]
-  roamway token ls|list | token revoke <id>
+  roamway token add|create --name N [--scope read|run|admin] [--ttl 24h] | ls|list | revoke <id>
   roamway approve <id> | deny <id> | approvals [--all]
   roamway onboard [--bind 0.0.0.0:8796]
   roamway restart | reload
 
 运维扩展：
-  roamway workspace ls [--json]
-  roamway workspace rm <name>
-  roamway terminal create [--name N] [--workspace DIR] [--shell bash] [--buffer-kb 256]
-  roamway terminal ls [--json] | capture <id> [--since N] [--tail N] | kill <id>
-  roamway terminal send-keys <id> <keys...> [--enter|--no-enter]
-  roamway script ls [--json] | add --name N --cmd C [--workspace P] | rm <name>
-  roamway script start <name> | stop <name>
+  roamway permit ls | approve <id> | deny <id>
+  roamway heartbeat ls|create|update|delete           # 落在 schedule 存储
+  roamway workspace ls | create <name> --path DIR | archive <name> | setup <name> | rm <name>
+  roamway terminal create|ls|capture|send-keys|kill
+  roamway script ls|add|rm|start|stop
   注：受管终端无 TTY，TUI 程序（vim/top 交互界面）不支持
 
 生态扩展：
   roamway provider [ls|models [<id>] [--refresh]|diagnostic <id>]
-  roamway usage [ls [--since 7d|24h|ISO] [--provider id]|inspect <run_id>] [--json]
-  roamway plugin [ls|init <name>|logs <name>|reload <name>|enable|disable <name> [--trust]|remove <name> [--keep-files]]
+  roamway usage [ls [--since 7d|24h|ISO] [--provider id]|inspect <run_id>]
+  roamway plugin [ls|init|logs|reload|enable|disable|remove]
   roamway speech [transcribe <file>|say <text> [--out file]]
 
-通用参数：--host http://127.0.0.1:8796  --token T
+不支持：
+  roamway project ls|delete   # 无 project 模型，请用 workspace ls（exit 2）
+
+通用参数：--host http://127.0.0.1:8796  --token T  --format table|json|yaml  --json  -q/--quiet
+          --no-headers  --no-color  --home DIR（等价 --data DIR）
 环境变量：ROAMWAY_HOST / ROAMWAY_TOKEN / ROAMWAY_DEEPSEEK_KEY / ROAMWAY_QWEN_KEY
 agent 可选：codex | hermes | claude | shell | api:deepseek | api:qwen"#,
         env!("CARGO_PKG_VERSION")
     );
 }
-
 fn parse_flags(args: &[String]) -> (HashMap<String, String>, Vec<String>) {
     let mut flags = HashMap::new();
     let mut pos = Vec::new();
@@ -97,6 +103,36 @@ fn parse_flags(args: &[String]) -> (HashMap<String, String>, Vec<String>) {
         if a == "--" {
             pos.extend(args[i + 1..].iter().cloned());
             break;
+        }
+        if a.starts_with('-') && !a.starts_with("--") && a.len() >= 2 {
+            match a[1..].as_ref() {
+                "o" => {
+                    if i + 1 < args.len() {
+                        push_flag(&mut flags, "format", args[i + 1].clone());
+                        i += 2;
+                    } else {
+                        push_flag(&mut flags, "format", "true".into());
+                        i += 1;
+                    }
+                    continue;
+                }
+                "q" => {
+                    push_flag(&mut flags, "quiet", "true".into());
+                    i += 1;
+                    continue;
+                }
+                "h" => {
+                    push_flag(&mut flags, "help", "true".into());
+                    i += 1;
+                    continue;
+                }
+                "V" => {
+                    push_flag(&mut flags, "version", "true".into());
+                    i += 1;
+                    continue;
+                }
+                _ => {}
+            }
         }
         if let Some(k) = a.strip_prefix("--") {
             if BOOLS.contains(&k) {
@@ -116,7 +152,6 @@ fn parse_flags(args: &[String]) -> (HashMap<String, String>, Vec<String>) {
     }
     (flags, pos)
 }
-
 fn push_flag(flags: &mut HashMap<String, String>, key: &str, value: String) {
     match flags.get_mut(key) {
         Some(existing) => {
@@ -136,6 +171,165 @@ fn flag_many(flags: &HashMap<String, String>, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn format_is_json(flags: &HashMap<String, String>) -> bool {
+    flags.contains_key("json") || flags.get("format").map(|f| f == "json").unwrap_or(false)
+}
+
+fn format_is_yaml(flags: &HashMap<String, String>) -> bool {
+    flags.get("format").map(|f| f == "yaml").unwrap_or(false)
+}
+
+fn format_value(flags: &HashMap<String, String>, v: &Value) -> String {
+    if format_is_yaml(flags) {
+        to_yaml(v)
+    } else {
+        format!("{}\n", serde_json::to_string_pretty(v).unwrap_or_default())
+    }
+}
+
+fn print_formatted(flags: &HashMap<String, String>, v: &Value) {
+    print!("{}", format_value(flags, v));
+}
+
+fn yaml_plain(s: &str) -> bool {
+    !s.is_empty()
+        && !matches!(
+            s,
+            "null" | "Null" | "NULL" | "true" | "True" | "TRUE" | "false" | "False" | "FALSE" | "~" | "yes" | "no" | "on" | "off"
+        )
+        && !s.trim().is_empty()
+        && s == s.trim()
+        && !s.contains(|ch: char| {
+            matches!(
+                ch,
+                ':' | '#' | '{' | '}' | '[' | ']' | ',' | '&' | '*' | '!' | '|' | '>' | '\'' | '"' | '%' | '@' | '`' | '\n' | '\r'
+            ) || ch.is_ascii_control()
+        })
+        && s.parse::<f64>().is_err()
+        && !s.starts_with('-')
+        && !s.starts_with('?')
+        && !s.starts_with(':')
+}
+
+fn yaml_scalar(v: &Value) -> String {
+    match v {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => yaml_string(s),
+        Value::Array(a) if a.is_empty() => "[]".to_string(),
+        Value::Object(m) if m.is_empty() => "{}".to_string(),
+        _ => serde_json::to_string(v).unwrap_or_default(),
+    }
+}
+
+fn yaml_string(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    if yaml_plain(s) {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "''"))
+    }
+}
+
+fn yaml_inlineable(v: &Value) -> bool {
+    match v {
+        Value::String(s) => !s.contains('\n') && !s.contains('\r'),
+        Value::Array(a) => a.is_empty(),
+        Value::Object(m) => m.is_empty(),
+        _ => true,
+    }
+}
+
+fn emit_yaml(v: &Value, indent: usize, out: &mut String) {
+    let pad = "  ".repeat(indent);
+    match v {
+        Value::Object(map) => {
+            for (k, child) in map {
+                out.push_str(&format!("{}{}:", pad, yaml_string(k)));
+                if yaml_inlineable(child) {
+                    out.push(' ');
+                    out.push_str(&yaml_scalar(child));
+                    out.push('\n');
+                } else {
+                    out.push('\n');
+                    emit_yaml(child, indent + 1, out);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            if arr.is_empty() {
+                out.push_str(&format!("{}[]\n", pad));
+                return;
+            }
+            for item in arr {
+                match item {
+                    Value::Object(map) => {
+                        let mut iter = map.iter();
+                        if let Some((k, child)) = iter.next() {
+                            out.push_str(&format!("{}- {}:", pad, yaml_string(k)));
+                            if yaml_inlineable(child) {
+                                out.push(' ');
+                                out.push_str(&yaml_scalar(child));
+                                out.push('\n');
+                            } else {
+                                out.push('\n');
+                                emit_yaml(child, indent + 2, out);
+                            }
+                        }
+                        for (k, child) in iter {
+                            out.push_str(&format!("{}  {}:", pad, yaml_string(k)));
+                            if yaml_inlineable(child) {
+                                out.push(' ');
+                                out.push_str(&yaml_scalar(child));
+                                out.push('\n');
+                            } else {
+                                out.push('\n');
+                                emit_yaml(child, indent + 2, out);
+                            }
+                        }
+                    }
+                    Value::String(s) if s.contains('\n') || s.contains('\r') => {
+                        out.push_str(&format!("{}-\n", pad));
+                        out.push_str(&format!("{}  |-\n", pad));
+                        for line in s.lines() {
+                            out.push_str(&format!("{}    {}\n", pad, line));
+                        }
+                    }
+                    other => {
+                        out.push_str(&format!("{}- {}\n", pad, yaml_scalar(other)));
+                    }
+                }
+            }
+        }
+        Value::String(s) if s.contains('\n') || s.contains('\r') => {
+            out.push_str(&format!("{}|-\n", pad));
+            for line in s.lines() {
+                out.push_str(&format!("{}  {}\n", pad, line));
+            }
+        }
+        other => {
+            out.push_str(&format!("{}{}\n", pad, yaml_scalar(other)));
+        }
+    }
+}
+
+fn to_yaml(v: &Value) -> String {
+    let mut out = String::new();
+    emit_yaml(v, 0, &mut out);
+    out
+}
+
+fn delete_plan(id: &str, running: bool) -> Vec<(String, String)> {
+    let mut plan = Vec::new();
+    if running {
+        plan.push(("POST".to_string(), format!("/v1/runs/{}/stop", id)));
+    }
+    plan.push(("DELETE".to_string(), format!("/v1/runs/{}", id)));
+    plan
+}
 struct Client {
     base: String,
     token: Option<String>,
@@ -172,14 +366,19 @@ impl Client {
             None => r.call(),
         };
         match res {
-            Ok(resp) => resp
-                .into_json::<Value>()
-                .map_err(|e| format!("bad response: {}", e)),
+            Ok(resp) => resp.into_json::<Value>().map_err(|e| {
+                fail(1);
+                format!("bad response: {}", e)
+            }),
             Err(ureq::Error::Status(code, resp)) => {
                 let t = resp.into_string().unwrap_or_default();
+                fail(1);
                 Err(format!("HTTP {}: {}", code, t))
             }
-            Err(e) => Err(e.to_string()),
+            Err(e) => {
+                fail(1);
+                Err(e.to_string())
+            }
         }
     }
 }
@@ -247,11 +446,21 @@ fn resolve_host(flags: &HashMap<String, String>) -> Option<hosts::Host> {
 }
 
 fn dispatch_json(host: &hosts::Host, method: &str, path: &str) -> Result<Value, String> {
-    let (code, text) = hosts::dispatch(host, method, path, None)?;
+    let (code, text) = match hosts::dispatch(host, method, path, None) {
+        Ok(v) => v,
+        Err(e) => {
+            fail(1);
+            return Err(e);
+        }
+    };
     if !(200..300).contains(&code) {
+        fail(1);
         return Err(format!("HTTP {}: {}", code, text));
     }
-    serde_json::from_str::<Value>(&text).map_err(|e| format!("bad response: {}", e))
+    serde_json::from_str::<Value>(&text).map_err(|e| {
+        fail(1);
+        format!("bad response: {}", e)
+    })
 }
 
 fn request(flags: &HashMap<String, String>, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
@@ -260,11 +469,21 @@ fn request(flags: &HashMap<String, String>, method: &str, path: &str, body: Opti
             Some(v) => Some(serde_json::to_string(&v).map_err(|e| e.to_string())?),
             None => None,
         };
-        let (code, text) = hosts::dispatch(&h, method, path, body_str.as_deref())?;
+        let (code, text) = match hosts::dispatch(&h, method, path, body_str.as_deref()) {
+            Ok(v) => v,
+            Err(e) => {
+                fail(1);
+                return Err(e);
+            }
+        };
         if !(200..300).contains(&code) {
+            fail(1);
             return Err(format!("HTTP {}: {}", code, text));
         }
-        return serde_json::from_str::<Value>(&text).map_err(|e| format!("bad response: {}", e));
+        return serde_json::from_str::<Value>(&text).map_err(|e| {
+            fail(1);
+            format!("bad response: {}", e)
+        });
     }
     local_client(flags).req(method, path, body)
 }
@@ -375,68 +594,177 @@ fn port_open(bind: &str) -> bool {
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
-    if argv.is_empty() {
+    std::process::exit(dispatch(&argv));
+}
+
+fn print_command_help(cmd: &str) -> bool {
+    let text = match cmd {
+        "serve" => "roamway serve [--bind 127.0.0.1:8796] [--data DIR] [--token T] [--tz 8] [--max-concurrent 4] [--max-conn 64]",
+        "start" => "roamway start [--bind 127.0.0.1:8796] [--data DIR] [--token T]",
+        "clone" => "roamway clone <owner/repo | git url> [--dir DIR] [--protocol https|ssh] [--json] [--host H]",
+        "workspace" => "roamway workspace ls | create <name> --path DIR | archive <name> | setup <name> | rm <name>",
+        "terminal" | "term" => "roamway terminal create|ls|capture|send-keys|kill  (受管终端无 TTY，TUI 程序不支持)",
+        "script" | "scripts" => "roamway script ls|add --name N --cmd C|rm <name>|start <name>|stop <name>",
+        "provider" => "roamway provider [ls|models [<id>] [--refresh]|diagnostic <id>]",
+        "usage" => "roamway usage [ls [--since 7d|24h|ISO] [--provider id]|inspect <run_id>] [--json]",
+        "plugin" => "roamway plugin ls|init <name>|logs <name>|reload <name>|enable|disable <name> [--trust]|remove <name> [--keep-files]",
+        "speech" => "roamway speech [transcribe <file>|say <text> [--out file]]",
+        "run" => "roamway run --agent codex [--model M] [--workspace DIR] [--title T] [--timeout 1800] [--no-wait] [--host H] \"prompt\"",
+        "send" => "roamway send <agent-id> <prompt...>",
+        "delete" => "roamway delete <id> [--yes]",
+        "ls" | "list" => "roamway ls [--limit 20] [--host H|all] [--trigger ID] [--json|--format table|json|yaml]",
+        "status" => "roamway status [ID] [--json] [--host H]",
+        "schedule" => "roamway schedule create|ls|inspect|logs|pause|resume|delete|run-once|update [--host H]",
+        "hooks" => "roamway hooks [--json] [--host H]",
+        "hub" => "roamway hub [init [--name N] [--force] | permissions | projects | deploy | logout | status | token rotate]",
+        "agent" => "roamway agent run|ls|inspect|logs|wait|attach|archive|reload|update|open|detach|import ...",
+        "ui" => "roamway ui [--print]",
+        "attach" => "roamway attach <id>",
+        "inspect" => "roamway inspect <id>",
+        "wait" => "roamway wait <id> [--timeout 60]",
+        "archive" => "roamway archive <id> [--keep-worktree]",
+        "import" => "roamway import <id> [--session S] [--kind K]",
+        "logs" => "roamway logs ID [--tail 80] [--host H]",
+        "stop" => "roamway stop ID [--host H]",
+        "rm" => "roamway rm ID",
+        "jobs" => "roamway jobs",
+        "jobs-add" => "roamway jobs-add --agent shell --every 3600 | --daily 08:30 [--model M] [--workspace DIR] [--max-retries 2] \"prompt\"",
+        "jobs-run" => "roamway jobs-run ID",
+        "jobs-rm" => "roamway jobs-rm ID",
+        "health" => "roamway health",
+        "host" => "roamway host add <name> --endpoint <ep> [--token T] [--force] | ls [--probe] [--json] | rm <name> | enable|disable <name> | probe <name>",
+        "token" => "roamway token add|create --name N [--scope read|run|admin] [--ttl 24h] | ls|list | revoke <id>",
+        "pair" => "roamway pair [--json] [--host H]",
+        "approve" => "roamway approve <id>",
+        "deny" => "roamway deny <id>",
+        "approvals" => "roamway approvals [--all]",
+        "daemon" => "roamway daemon status|config|start|stop|restart|reload|pair|set-password",
+        "onboard" => "roamway onboard [--bind 0.0.0.0:8796]",
+        "restart" => "roamway restart",
+        "reload" => "roamway reload",
+        "permit" => "roamway permit ls | approve <id> | deny <id>",
+        "heartbeat" => "roamway heartbeat ls [--agent id] | create --name N --agent id --cron C|--every E \"prompt\" | update <id> | delete <id>",
+        "project" => "roamway project ls|delete",
+        "version" => "roamway version",
+        _ => return false,
+    };
+    println!("{}", text);
+    true
+}
+
+fn dispatch(argv: &[String]) -> i32 {
+    let (flags, pos) = parse_flags(argv);
+    if pos.is_empty() {
+        if flags.contains_key("version") {
+            println!("roamway {}", env!("CARGO_PKG_VERSION"));
+            return 0;
+        }
+        if flags.contains_key("help") {
+            usage();
+            return 0;
+        }
         usage();
-        return;
+        return 0;
     }
-    let cmd = argv[0].clone();
-    let (flags, pos) = parse_flags(&argv[1..]);
+
+    let mut flags = flags;
+    if flags.get("home").is_some() && flags.get("data").is_none() {
+        let home = flags.get("home").cloned().unwrap();
+        flags.insert("data".to_string(), home);
+    }
+
+    let cmd = pos[0].clone();
+    let cmd_pos: Vec<String> = pos[1..].to_vec();
+
+    if flags.contains_key("help") {
+        if !print_command_help(&cmd) {
+            eprintln!("unknown command: {}", cmd);
+            eprintln!("run 'roamway help'");
+            return 2;
+        }
+        return 0;
+    }
+    if flags.contains_key("version") {
+        println!("roamway {}", env!("CARGO_PKG_VERSION"));
+        return 0;
+    }
+    if cmd == "help" {
+        let target = cmd_pos.first().map(String::as_str).unwrap_or("");
+        if target.is_empty() {
+            usage();
+            return 0;
+        }
+        if !print_command_help(target) {
+            eprintln!("unknown command: {}", target);
+            eprintln!("run 'roamway help'");
+            return 2;
+        }
+        return 0;
+    }
+
+    FAIL_CODE.store(0, Ordering::SeqCst);
     match cmd.as_str() {
         "serve" => cmd_serve(&flags),
-        "clone" => cmd_clone(&flags, &pos),
-        "workspace" => cmd_workspace(&flags, &pos),
-        "terminal" | "term" => cmd_terminal(&flags, &pos),
-        "script" | "scripts" => cmd_script(&flags, &pos),
-        "provider" => cmd_provider(&flags, &pos),
-        "usage" => cmd_usage(&flags, &pos),
-        "plugin" => cmd_plugin(&flags, &pos),
-        "speech" => cmd_speech(&flags, &pos),
-        "run" => cmd_run(&flags, &pos),
+        "start" => cmd_daemon_start(&flags),
+        "clone" => cmd_clone(&flags, &cmd_pos),
+        "workspace" => cmd_workspace(&flags, &cmd_pos),
+        "terminal" | "term" => cmd_terminal(&flags, &cmd_pos),
+        "script" | "scripts" => cmd_script(&flags, &cmd_pos),
+        "provider" => cmd_provider(&flags, &cmd_pos),
+        "usage" => cmd_usage(&flags, &cmd_pos),
+        "plugin" => cmd_plugin(&flags, &cmd_pos),
+        "speech" => cmd_speech(&flags, &cmd_pos),
+        "run" => cmd_run(&flags, &cmd_pos),
+        "send" => cmd_send(&flags, &cmd_pos),
+        "delete" => cmd_delete(&flags, &cmd_pos),
+        "permit" => cmd_permit(&flags, &cmd_pos),
+        "heartbeat" => cmd_heartbeat(&flags, &cmd_pos),
+        "project" => cmd_project(&flags, &cmd_pos),
         "ls" | "list" => cmd_ls(&flags),
         "status" => {
-            if pos.is_empty() {
+            if cmd_pos.is_empty() {
                 cmd_status_summary(&flags);
             } else {
-                cmd_status(&flags, &pos);
+                cmd_status(&flags, &cmd_pos);
             }
         }
-        "schedule" => cmd_schedule(&flags, &pos),
+        "schedule" => cmd_schedule(&flags, &cmd_pos),
         "hooks" => cmd_hooks(&flags),
-        "hub" => cmd_hub(&flags, &pos),
-        "agent" => cmd_agent(&flags, &pos),
-        "ui" => cmd_ui(&flags, &pos),
-        "attach" => cmd_agent_attach(&flags, &pos),
-        "inspect" => cmd_agent_inspect(&flags, &pos),
-        "wait" => cmd_agent_wait(&flags, &pos),
-        "archive" => cmd_agent_archive(&flags, &pos),
-        "import" => cmd_agent_import(&flags, &pos),
-        "logs" => cmd_logs(&flags, &pos),
-        "stop" => cmd_stop(&flags, &pos),
-        "rm" => cmd_rm(&flags, &pos),
+        "hub" => cmd_hub(&flags, &cmd_pos),
+        "agent" => cmd_agent(&flags, &cmd_pos),
+        "ui" => cmd_ui(&flags, &cmd_pos),
+        "attach" => cmd_agent_attach(&flags, &cmd_pos),
+        "inspect" => cmd_agent_inspect(&flags, &cmd_pos),
+        "wait" => cmd_agent_wait(&flags, &cmd_pos),
+        "archive" => cmd_agent_archive(&flags, &cmd_pos),
+        "import" => cmd_agent_import(&flags, &cmd_pos),
+        "logs" => cmd_logs(&flags, &cmd_pos),
+        "stop" => cmd_stop(&flags, &cmd_pos),
+        "rm" => cmd_rm(&flags, &cmd_pos),
         "jobs" => cmd_jobs(&flags),
-        "jobs-add" => cmd_jobs_add(&flags, &pos),
-        "jobs-run" => cmd_jobs_run(&flags, &pos),
-        "jobs-rm" => cmd_jobs_rm(&flags, &pos),
+        "jobs-add" => cmd_jobs_add(&flags, &cmd_pos),
+        "jobs-run" => cmd_jobs_run(&flags, &cmd_pos),
+        "jobs-rm" => cmd_jobs_rm(&flags, &cmd_pos),
         "health" => cmd_health(&flags),
-        "host" => cmd_host(&flags, &pos),
-        "token" => cmd_token(&flags, &pos),
+        "host" => cmd_host(&flags, &cmd_pos),
+        "token" => cmd_token(&flags, &cmd_pos),
         "pair" => cmd_pair(&flags),
-        "approve" => cmd_approve(&flags, &pos),
-        "deny" => cmd_deny(&flags, &pos),
+        "approve" => cmd_approve(&flags, &cmd_pos),
+        "deny" => cmd_deny(&flags, &cmd_pos),
         "approvals" => cmd_approvals(&flags),
-        "daemon" => cmd_daemon(&flags, &pos),
+        "daemon" => cmd_daemon(&flags, &cmd_pos),
         "onboard" => cmd_onboard(&flags),
         "restart" => cmd_restart(&flags),
         "reload" => cmd_reload(&flags),
-        "version" | "-V" | "--version" => println!("roamway {}", env!("CARGO_PKG_VERSION")),
-        "-h" | "--help" | "help" => usage(),
+        "version" => println!("roamway {}", env!("CARGO_PKG_VERSION")),
         _ => {
             eprintln!("unknown command: {}", cmd);
-            usage();
+            eprintln!("run 'roamway help'");
+            fail(2);
         }
     }
+    FAIL_CODE.load(Ordering::SeqCst)
 }
-
 fn default_data_dir() -> PathBuf {
     let home = std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
@@ -584,7 +912,7 @@ fn cmd_run(flags: &HashMap<String, String>, pos: &[String]) {
         prompt = flags.get("prompt").cloned().unwrap_or_default();
     }
     if prompt.trim().is_empty() {
-        eprintln!("prompt required");
+        usage_error("prompt required");
         return;
     }
     if let Some(h) = resolve_host(flags) {
@@ -682,12 +1010,24 @@ fn cmd_ls(flags: &HashMap<String, String>) {
     }
     match c.req("GET", &url, None) {
         Ok(v) => {
+            if format_is_json(flags) || format_is_yaml(flags) {
+                print_formatted(flags, &v);
+                return;
+            }
             let empty = vec![];
             let runs = v["runs"].as_array().unwrap_or(&empty);
-            println!(
-                "{:<12} {:<12} {:<8} {:<20} {:<26} {}",
-                "ID", "STATUS", "AGENT", "MODEL", "CREATED", "TITLE"
-            );
+            if flags.contains_key("quiet") {
+                for r in runs {
+                    println!("{}", r["id"].as_str().unwrap_or(""));
+                }
+                return;
+            }
+            if !flags.contains_key("no-headers") {
+                println!(
+                    "{:<12} {:<12} {:<8} {:<20} {:<26} {}",
+                    "ID", "STATUS", "AGENT", "MODEL", "CREATED", "TITLE"
+                );
+            }
             for r in runs {
                 println!(
                     "{:<12} {:<12} {:<8} {:<20} {:<26} {}",
@@ -710,7 +1050,7 @@ fn cmd_ls(flags: &HashMap<String, String>) {
 fn cmd_status(flags: &HashMap<String, String>, pos: &[String]) {
     let id = match pos.first() {
         Some(i) => i,
-        None => return eprintln!("usage: roamway status ID"),
+        None => return usage_error("usage: roamway status ID"),
     };
     if let Some(h) = resolve_host(flags) {
         cmd_status_remote(&h, id);
@@ -726,7 +1066,7 @@ fn cmd_status(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_logs(flags: &HashMap<String, String>, pos: &[String]) {
     let id = match pos.first() {
         Some(i) => i,
-        None => return eprintln!("usage: roamway logs ID [--tail 80]"),
+        None => return usage_error("usage: roamway logs ID [--tail 80]"),
     };
     let tail = flags.get("tail").cloned().unwrap_or_else(|| "80".into());
     if let Some(h) = resolve_host(flags) {
@@ -743,7 +1083,7 @@ fn cmd_logs(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_stop(flags: &HashMap<String, String>, pos: &[String]) {
     let id = match pos.first() {
         Some(i) => i,
-        None => return eprintln!("usage: roamway stop ID"),
+        None => return usage_error("usage: roamway stop ID"),
     };
     if let Some(h) = resolve_host(flags) {
         cmd_stop_remote(&h, id);
@@ -759,7 +1099,7 @@ fn cmd_stop(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_rm(flags: &HashMap<String, String>, pos: &[String]) {
     let id = match pos.first() {
         Some(i) => i,
-        None => return eprintln!("usage: roamway rm ID"),
+        None => return usage_error("usage: roamway rm ID"),
     };
     let c = local_client(flags);
     match c.req("DELETE", &format!("/v1/runs/{}", id), None) {
@@ -803,7 +1143,7 @@ fn cmd_jobs(flags: &HashMap<String, String>) {
 fn cmd_jobs_add(flags: &HashMap<String, String>, pos: &[String]) {
     let prompt = pos.join(" ");
     if prompt.trim().is_empty() {
-        eprintln!("prompt required");
+        usage_error("prompt required");
         return;
     }
     let mut body = json!({
@@ -836,7 +1176,7 @@ fn cmd_jobs_add(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_jobs_run(flags: &HashMap<String, String>, pos: &[String]) {
     let id = match pos.first() {
         Some(i) => i,
-        None => return eprintln!("usage: roamway jobs-run ID"),
+        None => return usage_error("usage: roamway jobs-run ID"),
     };
     let c = local_client(flags);
     match c.req("POST", &format!("/v1/jobs/{}/run", id), Some(json!({}))) {
@@ -848,7 +1188,7 @@ fn cmd_jobs_run(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_jobs_rm(flags: &HashMap<String, String>, pos: &[String]) {
     let id = match pos.first() {
         Some(i) => i,
-        None => return eprintln!("usage: roamway jobs-rm ID"),
+        None => return usage_error("usage: roamway jobs-rm ID"),
     };
     let c = local_client(flags);
     match c.req("DELETE", &format!("/v1/jobs/{}", id), None) {
@@ -868,7 +1208,7 @@ fn cmd_schedule(flags: &HashMap<String, String>, pos: &[String]) {
         "delete" | "rm" | "remove" => cmd_schedule_delete(flags, &pos[1..]),
         "run-once" | "run" => cmd_schedule_run_once(flags, &pos[1..]),
         "update" => cmd_schedule_update(flags, &pos[1..]),
-        _ => eprintln!(
+        _ => usage_error(
             "usage: roamway schedule create|ls|inspect|logs|pause|resume|delete|run-once|update ..."
         ),
     }
@@ -878,6 +1218,7 @@ fn cmd_schedule_create(flags: &HashMap<String, String>, pos: &[String]) {
     let name = flags.get("name").cloned().unwrap_or_default();
     if name.trim().is_empty() {
         eprintln!("--name is required");
+        fail(2);
         return;
     }
     let prompt = pos.join(" ");
@@ -888,6 +1229,7 @@ fn cmd_schedule_create(flags: &HashMap<String, String>, pos: &[String]) {
     };
     if prompt.trim().is_empty() {
         eprintln!("prompt is required");
+        fail(2);
         return;
     }
     let body = json!({
@@ -930,16 +1272,24 @@ fn cmd_schedule_ls(flags: &HashMap<String, String>) {
     };
     match request(flags, "GET", path, None) {
         Ok(v) => {
-            if flags.contains_key("json") {
-                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+            if format_is_json(flags) || format_is_yaml(flags) {
+                print_formatted(flags, &v);
                 return;
             }
             let empty = vec![];
             let scheds = v["schedules"].as_array().unwrap_or(&empty);
-            println!(
-                "{:<13} {:<20} {:<26} {:<6} {:<26} {}",
-                "ID", "NAME", "NEXT", "RUNS", "LAST", "CRON"
-            );
+            if flags.contains_key("quiet") {
+                for s in scheds {
+                    println!("{}", s["id"].as_str().unwrap_or(""));
+                }
+                return;
+            }
+            if !flags.contains_key("no-headers") {
+                println!(
+                    "{:<13} {:<20} {:<26} {:<6} {:<26} {}",
+                    "ID", "NAME", "NEXT", "RUNS", "LAST", "CRON"
+                );
+            }
             for s in scheds {
                 println!(
                     "{:<13} {:<20} {:<26} {:<6} {:<26} {}",
@@ -959,7 +1309,7 @@ fn cmd_schedule_ls(flags: &HashMap<String, String>) {
 fn cmd_schedule_inspect(flags: &HashMap<String, String>, pos: &[String]) {
     let key = match pos.first() {
         Some(k) => k,
-        None => return eprintln!("usage: roamway schedule inspect <id|name> [--json]"),
+        None => return usage_error("usage: roamway schedule inspect <id|name> [--json]"),
     };
     match request(flags, "GET", &format!("/v1/schedules/{}", key), None) {
         Ok(v) => {
@@ -988,7 +1338,7 @@ fn cmd_schedule_inspect(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_schedule_logs(flags: &HashMap<String, String>, pos: &[String]) {
     let key = match pos.first() {
         Some(k) => k,
-        None => return eprintln!("usage: roamway schedule logs <id|name> [--tail 20]"),
+        None => return usage_error("usage: roamway schedule logs <id|name> [--tail 20]"),
     };
     let tail = flags.get("tail").cloned().unwrap_or_else(|| "20".into());
     match request(flags, "GET", &format!("/v1/schedules/{}/logs?tail={}", key, tail), None) {
@@ -1006,7 +1356,7 @@ fn cmd_schedule_logs(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_schedule_pause(flags: &HashMap<String, String>, pos: &[String]) {
     let key = match pos.first() {
         Some(k) => k,
-        None => return eprintln!("usage: roamway schedule pause <id|name>"),
+        None => return usage_error("usage: roamway schedule pause <id|name>"),
     };
     match request(flags, "POST", &format!("/v1/schedules/{}/pause", key), Some(json!({}))) {
         Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
@@ -1017,7 +1367,7 @@ fn cmd_schedule_pause(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_schedule_resume(flags: &HashMap<String, String>, pos: &[String]) {
     let key = match pos.first() {
         Some(k) => k,
-        None => return eprintln!("usage: roamway schedule resume <id|name>"),
+        None => return usage_error("usage: roamway schedule resume <id|name>"),
     };
     match request(flags, "POST", &format!("/v1/schedules/{}/resume", key), Some(json!({}))) {
         Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
@@ -1028,7 +1378,7 @@ fn cmd_schedule_resume(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_schedule_delete(flags: &HashMap<String, String>, pos: &[String]) {
     let key = match pos.first() {
         Some(k) => k,
-        None => return eprintln!("usage: roamway schedule delete <id|name>"),
+        None => return usage_error("usage: roamway schedule delete <id|name>"),
     };
     match request(flags, "DELETE", &format!("/v1/schedules/{}", key), None) {
         Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
@@ -1039,7 +1389,7 @@ fn cmd_schedule_delete(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_schedule_run_once(flags: &HashMap<String, String>, pos: &[String]) {
     let key = match pos.first() {
         Some(k) => k,
-        None => return eprintln!("usage: roamway schedule run-once <id|name>"),
+        None => return usage_error("usage: roamway schedule run-once <id|name>"),
     };
     match request(flags, "POST", &format!("/v1/schedules/{}/run", key), Some(json!({}))) {
         Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
@@ -1050,7 +1400,7 @@ fn cmd_schedule_run_once(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_schedule_update(flags: &HashMap<String, String>, pos: &[String]) {
     let key = match pos.first() {
         Some(k) => k,
-        None => return eprintln!("usage: roamway schedule update <id|name> [--cron|--every|--prompt|--max-runs|--tz|--enabled]"),
+        None => return usage_error("usage: roamway schedule update <id|name> [--cron|--every|--prompt|--max-runs|--tz|--enabled]"),
     };
     let mut body = json!({
         "name": flags.get("name"),
@@ -1100,8 +1450,7 @@ fn cmd_hub(flags: &HashMap<String, String>, pos: &[String]) {
         "token" => cmd_hub_token(flags, pos),
         other => {
             eprintln!("unknown hub subcommand: {}", other);
-            eprintln!("usage: roamway hub [init|permissions|projects|deploy|logout|status|token rotate]");
-            std::process::exit(2);
+            usage_error("usage: roamway hub [init|permissions|projects|deploy|logout|status|token rotate]");
         }
     }
 }
@@ -1153,7 +1502,7 @@ fn cmd_hub_permissions(flags: &HashMap<String, String>, pos: &[String]) {
             let subject = pos.get(2).cloned().unwrap_or_default();
             let scope = pos.get(3).cloned().unwrap_or_default();
             if subject.is_empty() || scope.is_empty() {
-                eprintln!("usage: roamway hub permissions grant <subject> <scope>");
+                usage_error("usage: roamway hub permissions grant <subject> <scope>");
                 std::process::exit(2);
             }
             if !hub::valid_scope(&scope) {
@@ -1172,7 +1521,7 @@ fn cmd_hub_permissions(flags: &HashMap<String, String>, pos: &[String]) {
         "revoke" => {
             let subject = pos.get(2).cloned().unwrap_or_default();
             if subject.is_empty() {
-                eprintln!("usage: roamway hub permissions revoke <subject>");
+                usage_error("usage: roamway hub permissions revoke <subject>");
                 std::process::exit(2);
             }
             let dir = data_dir_for(flags);
@@ -1189,7 +1538,7 @@ fn cmd_hub_permissions(flags: &HashMap<String, String>, pos: &[String]) {
             }
         }
         _ => {
-            eprintln!("usage: roamway hub permissions [ls|grant <subject> <scope>|revoke <subject>]");
+            usage_error("usage: roamway hub permissions [ls|grant <subject> <scope>|revoke <subject>]");
             std::process::exit(2);
         }
     }
@@ -1211,7 +1560,7 @@ fn cmd_hub_projects(flags: &HashMap<String, String>, pos: &[String]) {
         "add" => {
             let path = pos.get(2).cloned().unwrap_or_default();
             if path.is_empty() {
-                eprintln!("usage: roamway hub projects add <path>");
+                usage_error("usage: roamway hub projects add <path>");
                 std::process::exit(2);
             }
             if !std::path::Path::new(&path).is_dir() {
@@ -1233,7 +1582,7 @@ fn cmd_hub_projects(flags: &HashMap<String, String>, pos: &[String]) {
         "rm" => {
             let path = pos.get(2).cloned().unwrap_or_default();
             if path.is_empty() {
-                eprintln!("usage: roamway hub projects rm <path>");
+                usage_error("usage: roamway hub projects rm <path>");
                 std::process::exit(2);
             }
             let dir = data_dir_for(flags);
@@ -1250,7 +1599,7 @@ fn cmd_hub_projects(flags: &HashMap<String, String>, pos: &[String]) {
             }
         }
         _ => {
-            eprintln!("usage: roamway hub projects [ls|add <path>|rm <path>]");
+            usage_error("usage: roamway hub projects [ls|add <path>|rm <path>]");
             std::process::exit(2);
         }
     }
@@ -1331,7 +1680,7 @@ fn cmd_hub_status(flags: &HashMap<String, String>) {
 fn cmd_hub_token(flags: &HashMap<String, String>, pos: &[String]) {
     let sub = pos.get(1).map(String::as_str).unwrap_or("");
     if sub != "rotate" {
-        eprintln!("usage: roamway hub token rotate");
+        usage_error("usage: roamway hub token rotate");
         std::process::exit(2);
     }
     let dir = data_dir_for(flags);
@@ -1347,8 +1696,8 @@ fn cmd_hub_token(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_status_summary(flags: &HashMap<String, String>) {
     match request(flags, "GET", "/v1/status", None) {
         Ok(v) => {
-            if flags.contains_key("json") {
-                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+            if format_is_json(flags) || format_is_yaml(flags) {
+                print_formatted(flags, &v);
                 return;
             }
             println!("version   {}", v["version"].as_str().unwrap_or("-"));
@@ -1407,7 +1756,7 @@ fn cmd_clone(flags: &HashMap<String, String>, pos: &[String]) {
     let input = match pos.first() {
         Some(i) if !i.trim().is_empty() => i.clone(),
         _ => {
-            eprintln!("usage: roamway clone <owner/repo | git url> [--dir DIR] [--protocol https|ssh] [--json] [--host H]");
+            usage_error("usage: roamway clone <owner/repo | git url> [--dir DIR] [--protocol https|ssh] [--json] [--host H]");
             return;
         }
     };
@@ -1449,8 +1798,11 @@ fn cmd_clone(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_workspace(flags: &HashMap<String, String>, pos: &[String]) {
     match pos.first().map(String::as_str).unwrap_or("help") {
         "ls" | "list" => cmd_workspace_ls(flags),
+        "create" | "add" => cmd_workspace_create(flags, &pos[1..]),
+        "archive" => cmd_workspace_archive(flags, &pos[1..]),
+        "setup" => cmd_workspace_setup(flags, &pos[1..]),
         "rm" | "remove" => cmd_workspace_rm(flags, &pos[1..]),
-        _ => eprintln!("usage: roamway workspace ls [--json] | workspace rm <name>"),
+        _ => usage_error("usage: roamway workspace ls|create <name> --path DIR|archive <name>|setup <name>|rm <name>"),
     }
 }
 
@@ -1458,29 +1810,44 @@ fn cmd_workspace_ls(flags: &HashMap<String, String>) {
     if let Some(h) = resolve_host(flags) {
         match hosts::dispatch(&h, "GET", "/v1/workspaces", None) {
             Ok((code, text)) if (200..300).contains(&code) => {
-                if flags.contains_key("json") {
+                if format_is_json(flags) {
                     println!("{}", text);
+                } else if format_is_yaml(flags) {
+                    let v: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
+                    print!("{}", to_yaml(&v));
                 } else {
                     print_workspaces_table(&text);
                 }
             }
-            Ok((code, text)) => eprintln!("workspace ls failed: HTTP {}: {}", code, text),
-            Err(e) => eprintln!("workspace ls failed: {}", e),
+            Ok((code, text)) => {
+                eprintln!("workspace ls failed: HTTP {}: {}", code, text);
+                fail(1);
+            }
+            Err(e) => {
+                eprintln!("workspace ls failed: {}", e);
+                fail(1);
+            }
         }
         return;
     }
     let reg = workspaces::Registry::load(&data_dir_for(flags));
-    if flags.contains_key("json") {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({"workspaces": reg.workspaces})).unwrap_or_default()
-        );
+    let v = json!({"workspaces": reg.workspaces});
+    if format_is_json(flags) || format_is_yaml(flags) {
+        print_formatted(flags, &v);
         return;
     }
-    println!(
-        "{:<10} {:<16} {:<26} {:<8} {}",
-        "ID", "NAME", "PATH", "HOST", "CREATED"
-    );
+    if flags.contains_key("quiet") {
+        for w in &reg.workspaces {
+            println!("{}", w.id);
+        }
+        return;
+    }
+    if !flags.contains_key("no-headers") {
+        println!(
+            "{:<10} {:<16} {:<26} {:<8} {}",
+            "ID", "NAME", "PATH", "HOST", "CREATED"
+        );
+    }
     for w in &reg.workspaces {
         println!(
             "{:<10} {:<16} {:<26} {:<8} {}",
@@ -1493,17 +1860,117 @@ fn cmd_workspace_ls(flags: &HashMap<String, String>) {
     }
 }
 
+fn cmd_workspace_create(flags: &HashMap<String, String>, pos: &[String]) {
+    let name = match pos.first() {
+        Some(n) if !n.trim().is_empty() => n.clone(),
+        _ => return usage_error("usage: roamway workspace create <name> --path DIR"),
+    };
+    let path = match flags.get("path").filter(|p| !p.trim().is_empty() && p.as_str() != "true") {
+        Some(p) => p.clone(),
+        None => return usage_error("--path is required"),
+    };
+    let body = json!({
+        "name": name,
+        "path": path,
+        "remote": flags.get("remote"),
+    });
+    match request(flags, "POST", "/v1/workspaces", Some(body)) {
+        Ok(v) => {
+            if format_is_json(flags) || format_is_yaml(flags) {
+                print_formatted(flags, &v);
+            } else {
+                let ws = &v["workspace"];
+                println!(
+                    "created {} at {}",
+                    ws["name"].as_str().unwrap_or(""),
+                    ws["path"].as_str().unwrap_or("")
+                );
+            }
+        }
+        Err(e) => eprintln!("workspace create failed: {}", e),
+    }
+}
+
+fn cmd_workspace_archive(flags: &HashMap<String, String>, pos: &[String]) {
+    let name = match pos.first() {
+        Some(n) if !n.trim().is_empty() => n.clone(),
+        _ => return usage_error("usage: roamway workspace archive <name>"),
+    };
+    match request(flags, "DELETE", &format!("/v1/workspaces/{}", name), None) {
+        Ok(_) => println!("archived {}", name),
+        Err(e) => eprintln!("workspace archive failed: {}", e),
+    }
+}
+
+fn cmd_workspace_setup(flags: &HashMap<String, String>, pos: &[String]) {
+    let name = match pos.first() {
+        Some(n) if !n.trim().is_empty() => n.clone(),
+        _ => return usage_error("usage: roamway workspace setup <name>"),
+    };
+    let dir = data_dir_for(flags);
+    let reg = workspaces::Registry::load(&dir);
+    let ws = match reg.get(&name) {
+        Some(w) => w.clone(),
+        None => {
+            eprintln!("no such workspace: {}", name);
+            fail(2);
+            return;
+        }
+    };
+    let store = terminals::TerminalStore::load(&dir);
+    let script = match store.scripts.iter().find(|s| s.name == name || s.id == name) {
+        Some(s) => s.clone(),
+        None => {
+            eprintln!("no setup script for {}", name);
+            fail(2);
+            return;
+        }
+    };
+    let mut cmd = if cfg!(windows) {
+        let mut c = Command::new("cmd.exe");
+        c.args(["/Q", "/C", &script.cmd]);
+        c
+    } else {
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", &script.cmd]);
+        c
+    };
+    cmd.current_dir(&ws.path);
+    cmd.stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    match cmd.status() {
+        Ok(st) if st.success() => {}
+        Ok(st) => {
+            eprintln!(
+                "setup {} exited {}",
+                name,
+                st.code().map(|c| c.to_string()).unwrap_or_else(|| "-".into())
+            );
+            fail(1);
+        }
+        Err(e) => {
+            eprintln!("setup {} failed: {}", name, e);
+            fail(1);
+        }
+    }
+}
+
 fn cmd_workspace_rm(flags: &HashMap<String, String>, pos: &[String]) {
     let name = match pos.first() {
         Some(n) if !n.trim().is_empty() => n,
-        _ => return eprintln!("usage: roamway workspace rm <name>"),
+        _ => return usage_error("usage: roamway workspace rm <name>"),
     };
     if let Some(h) = resolve_host(flags) {
         let path = format!("/v1/workspaces/{}", name);
         match hosts::dispatch(&h, "DELETE", &path, None) {
             Ok((code, text)) if (200..300).contains(&code) => println!("{}", text),
-            Ok((code, text)) => eprintln!("workspace rm failed: HTTP {}: {}", code, text),
-            Err(e) => eprintln!("workspace rm failed: {}", e),
+            Ok((code, text)) => {
+                eprintln!("workspace rm failed: HTTP {}: {}", code, text);
+                fail(1);
+            }
+            Err(e) => {
+                eprintln!("workspace rm failed: {}", e);
+                fail(1);
+            }
         }
         return;
     }
@@ -1517,6 +1984,269 @@ fn cmd_workspace_rm(flags: &HashMap<String, String>, pos: &[String]) {
         eprintln!("no such workspace: {}", name);
     }
 }
+
+fn probe_run_status(flags: &HashMap<String, String>, id: &str) -> Option<String> {
+    let (base, token) = if let Some(h) = resolve_host(flags) {
+        (
+            hosts::endpoint_normalize(&h.endpoint),
+            if h.token.is_empty() { None } else { Some(h.token.clone()) },
+        )
+    } else {
+        let c = local_client(flags);
+        (c.base.clone(), c.token.clone())
+    };
+    let url = format!("{}{}", base.trim_end_matches('/'), format!("/v1/runs/{}", id));
+    let mut r = ureq::get(&url).timeout(Duration::from_secs(10));
+    if let Some(t) = &token {
+        r = r.set("x-roamway-token", t);
+    }
+    match r.call() {
+        Ok(resp) => {
+            let v: Value = resp.into_json().ok()?;
+            Some(v["run"]["status"].as_str().unwrap_or("").to_string())
+        }
+        Err(ureq::Error::Status(code, _)) if code == 404 => None,
+        Err(_) => None,
+    }
+}
+
+fn cmd_send(flags: &HashMap<String, String>, pos: &[String]) {
+    let id = match pos.first() {
+        Some(i) if !i.trim().is_empty() => i.clone(),
+        _ => return usage_error("usage: roamway send <agent-id> <prompt...>"),
+    };
+    let prompt = pos[1..].join(" ");
+    if prompt.trim().is_empty() {
+        usage_error("prompt is required");
+        return;
+    }
+    let body = json!({
+        "prompt": prompt,
+        "timeout_s": flags.get("timeout").and_then(|v| v.parse::<u64>().ok()),
+    });
+    match request(flags, "POST", &format!("/v1/agents/{}/run", id), Some(body)) {
+        Ok(v) => {
+            if flags.contains_key("quiet") {
+                println!("{}", v["run"]["id"].as_str().unwrap_or(""));
+            } else if format_is_json(flags) || format_is_yaml(flags) {
+                print_formatted(flags, &v);
+            } else {
+                println!("{}", v["run"]["id"].as_str().unwrap_or(""));
+            }
+        }
+        Err(e) => eprintln!("send failed: {}", e),
+    }
+}
+
+fn cmd_delete(flags: &HashMap<String, String>, pos: &[String]) {
+    let id = match pos.first() {
+        Some(i) if !i.trim().is_empty() => i.clone(),
+        _ => return usage_error("usage: roamway delete <id> [--yes]"),
+    };
+    let running = probe_run_status(flags, &id)
+        .map(|s| matches!(s.as_str(), "running" | "queued"))
+        .unwrap_or(false);
+    for (method, path) in delete_plan(&id, running) {
+        if let Err(e) = request(flags, &method, &path, None) {
+            eprintln!("delete failed: {}", e);
+            return;
+        }
+    }
+    if flags.contains_key("quiet") {
+        println!("{}", id);
+    } else {
+        println!("deleted {}", id);
+    }
+}
+
+fn cmd_permit(flags: &HashMap<String, String>, pos: &[String]) {
+    match pos.first().map(String::as_str).unwrap_or("ls") {
+        "ls" | "list" => cmd_approvals(flags),
+        "approve" => {
+            if pos.len() < 2 {
+                usage_error("usage: roamway permit approve <id>");
+            } else {
+                cmd_approve(flags, &pos[1..]);
+            }
+        }
+        "deny" => {
+            if pos.len() < 2 {
+                usage_error("usage: roamway permit deny <id>");
+            } else {
+                cmd_deny(flags, &pos[1..]);
+            }
+        }
+        _ => usage_error("usage: roamway permit ls | approve <id> | deny <id>"),
+    }
+}
+
+fn cmd_heartbeat(flags: &HashMap<String, String>, pos: &[String]) {
+    match pos.first().map(String::as_str).unwrap_or("ls") {
+        "ls" | "list" => cmd_heartbeat_ls(flags),
+        "create" => cmd_heartbeat_create(flags, &pos[1..]),
+        "update" => cmd_heartbeat_update(flags, &pos[1..]),
+        "delete" | "rm" | "remove" => cmd_heartbeat_delete(flags, &pos[1..]),
+        _ => usage_error("usage: roamway heartbeat ls|create|update|delete ..."),
+    }
+}
+
+fn cmd_heartbeat_ls(flags: &HashMap<String, String>) {
+    match request(flags, "GET", "/v1/schedules", None) {
+        Ok(v) => {
+            let agent = flags.get("agent").cloned().filter(|a| !a.is_empty() && a != "true");
+            let mut out = v.clone();
+            if let Some(ag) = &agent {
+                let filtered: Vec<Value> = out
+                    .get("schedules")
+                    .and_then(|s| s.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter(|s| s.get("agent").and_then(|a| a.as_str()) == Some(ag.as_str()))
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                out["schedules"] = json!(filtered);
+            }
+            if format_is_json(flags) || format_is_yaml(flags) {
+                print_formatted(flags, &out);
+                return;
+            }
+            let empty = vec![];
+            let scheds = out["schedules"].as_array().unwrap_or(&empty);
+            if flags.contains_key("quiet") {
+                for s in scheds {
+                    println!("{}", s["id"].as_str().unwrap_or(""));
+                }
+                return;
+            }
+            if !flags.contains_key("no-headers") {
+                println!(
+                    "{:<13} {:<20} {:<26} {:<6} {:<26} {}",
+                    "ID", "NAME", "NEXT", "RUNS", "LAST", "CRON"
+                );
+            }
+            for s in scheds {
+                println!(
+                    "{:<13} {:<20} {:<26} {:<6} {:<26} {}",
+                    s["id"].as_str().unwrap_or(""),
+                    trunc(s["name"].as_str().unwrap_or(""), 20),
+                    s["next_run_at"].as_i64().map(iso).unwrap_or_else(|| "-".into()),
+                    s["runs_count"].as_u64().unwrap_or(0),
+                    s["last_run_at"].as_i64().map(iso).unwrap_or_else(|| "-".into()),
+                    trunc(s["cron"].as_str().unwrap_or("-"), 24)
+                );
+            }
+        }
+        Err(e) => eprintln!("heartbeat ls failed: {}", e),
+    }
+}
+
+fn cmd_heartbeat_create(flags: &HashMap<String, String>, pos: &[String]) {
+    let name = flags.get("name").cloned().unwrap_or_default();
+    if name.trim().is_empty() {
+        usage_error("--name is required");
+        return;
+    }
+    let agent = flags.get("agent").cloned().filter(|a| !a.is_empty() && a != "true").unwrap_or_default();
+    if agent.is_empty() {
+        usage_error("--agent is required");
+        return;
+    }
+    let prompt = pos.join(" ");
+    let prompt = if prompt.trim().is_empty() {
+        flags.get("prompt").cloned().unwrap_or_default()
+    } else {
+        prompt
+    };
+    if prompt.trim().is_empty() {
+        usage_error("prompt is required");
+        return;
+    }
+    let cron = flags.get("cron").cloned().filter(|v| !v.is_empty() && v != "true");
+    let every = flags.get("every").cloned().filter(|v| !v.is_empty() && v != "true");
+    if cron.is_none() && every.is_none() {
+        usage_error("--cron or --every is required");
+        return;
+    }
+    let body = json!({
+        "name": name,
+        "prompt": prompt,
+        "agent": agent,
+        "model": flags.get("model"),
+        "workspace": flags.get("workspace"),
+        "cron": cron,
+        "every": every,
+        "timezone": flags.get("tz"),
+        "max_runs": flags.get("max-runs").and_then(|v| v.parse::<u64>().ok()),
+        "expires_in": flags.get("expires-in").and_then(|v| v.parse::<i64>().ok()),
+        "run_now": flags.contains_key("run-now"),
+        "overlap": flags.contains_key("overlap"),
+    });
+    match request(flags, "POST", "/v1/schedules", Some(body)) {
+        Ok(v) => {
+            if format_is_json(flags) || format_is_yaml(flags) {
+                print_formatted(flags, &v["schedule"]);
+            } else {
+                let s = &v["schedule"];
+                println!(
+                    "created {} {}\tnext={}",
+                    s["id"].as_str().unwrap_or(""),
+                    s["name"].as_str().unwrap_or(""),
+                    s["next_run_at"].as_i64().map(iso).unwrap_or_else(|| "-".into())
+                );
+            }
+        }
+        Err(e) => eprintln!("heartbeat create failed: {}", e),
+    }
+}
+
+fn cmd_heartbeat_update(flags: &HashMap<String, String>, pos: &[String]) {
+    let key = match pos.first() {
+        Some(k) if !k.trim().is_empty() => k.clone(),
+        _ => return usage_error("usage: roamway heartbeat update <id> [--name --agent --cron|--every --prompt]"),
+    };
+    let mut body = json!({
+        "name": flags.get("name"),
+        "agent": flags.get("agent"),
+        "cron": flags.get("cron"),
+        "every": flags.get("every"),
+        "prompt": flags.get("prompt"),
+        "max_runs": flags.get("max-runs").and_then(|v| v.parse::<u64>().ok()),
+        "timezone": flags.get("tz"),
+        "enabled": flags.contains_key("enabled").then(|| true),
+    });
+    if flags.contains_key("disabled") {
+        body["enabled"] = json!(false);
+    }
+    match request(flags, "PATCH", &format!("/v1/schedules/{}", key), Some(body)) {
+        Ok(v) => {
+            if format_is_json(flags) || format_is_yaml(flags) {
+                print_formatted(flags, &v["schedule"]);
+            } else {
+                println!("{}", serde_json::to_string_pretty(&v["schedule"]).unwrap_or_default());
+            }
+        }
+        Err(e) => eprintln!("heartbeat update failed: {}", e),
+    }
+}
+
+fn cmd_heartbeat_delete(flags: &HashMap<String, String>, pos: &[String]) {
+    let key = match pos.first() {
+        Some(k) if !k.trim().is_empty() => k.clone(),
+        _ => return usage_error("usage: roamway heartbeat delete <id|name>"),
+    };
+    match request(flags, "DELETE", &format!("/v1/schedules/{}", key), None) {
+        Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
+        Err(e) => eprintln!("heartbeat delete failed: {}", e),
+    }
+}
+
+fn cmd_project(_flags: &HashMap<String, String>, _pos: &[String]) {
+    eprintln!("project: not supported (no project model; use workspace ls)");
+    fail(2);
+}
+
 fn cmd_terminal(flags: &HashMap<String, String>, pos: &[String]) {
     let c = local_client(flags);
     let json_out = flags.contains_key("json");
@@ -1577,7 +2307,7 @@ fn cmd_terminal(flags: &HashMap<String, String>, pos: &[String]) {
         "capture" | "output" => {
             let id = match pos.get(1).filter(|s| !s.trim().is_empty()) {
                 Some(v) => v,
-                None => return eprintln!("usage: roamway terminal capture <id> [--since N] [--tail N]"),
+                None => return usage_error("usage: roamway terminal capture <id> [--since N] [--tail N]"),
             };
             let mut path = format!("/v1/terminals/{}/output", id);
             let mut qs: Vec<String> = Vec::new();
@@ -1605,7 +2335,7 @@ fn cmd_terminal(flags: &HashMap<String, String>, pos: &[String]) {
         "send-keys" | "send" | "keys" => {
             let id = match pos.get(1).filter(|s| !s.trim().is_empty()) {
                 Some(v) => v,
-                None => return eprintln!("usage: roamway terminal send-keys <id> <keys...> [--enter]"),
+                None => return usage_error("usage: roamway terminal send-keys <id> <keys...> [--enter]"),
             };
             let keys = pos[2..].join(" ");
             let enter = flags.contains_key("enter") && !flags.contains_key("no-enter");
@@ -1618,14 +2348,14 @@ fn cmd_terminal(flags: &HashMap<String, String>, pos: &[String]) {
         "kill" | "rm" | "close" => {
             let id = match pos.get(1).filter(|s| !s.trim().is_empty()) {
                 Some(v) => v,
-                None => return eprintln!("usage: roamway terminal kill <id>"),
+                None => return usage_error("usage: roamway terminal kill <id>"),
             };
             match c.req("DELETE", &format!("/v1/terminals/{}", id), None) {
                 Ok(_) => println!("killed {}", id),
                 Err(e) => eprintln!("terminal kill failed: {}", e),
             }
         }
-        _ => eprintln!(
+        _ => usage_error(
             "usage: roamway terminal create|ls|capture|send-keys|kill  (受管终端无 TTY，TUI 程序不支持)"
         ),
     }
@@ -1661,7 +2391,7 @@ fn cmd_script(flags: &HashMap<String, String>, pos: &[String]) {
             let name = flags.get("name").cloned().unwrap_or_default();
             let cmd = flags.get("cmd").cloned().unwrap_or_default();
             if name.trim().is_empty() || cmd.trim().is_empty() {
-                return eprintln!("usage: roamway script add --name N --cmd \"...\" [--workspace DIR]");
+                return usage_error("usage: roamway script add --name N --cmd \"...\" [--workspace DIR]");
             }
             let body = json!({
                 "name": name,
@@ -1682,7 +2412,7 @@ fn cmd_script(flags: &HashMap<String, String>, pos: &[String]) {
         "rm" | "remove" => {
             let name = match pos.get(1).filter(|s| !s.trim().is_empty()) {
                 Some(v) => v,
-                None => return eprintln!("usage: roamway script rm <name>"),
+                None => return usage_error("usage: roamway script rm <name>"),
             };
             match c.req("DELETE", &format!("/v1/scripts/{}", name), None) {
                 Ok(_) => println!("removed {}", name),
@@ -1692,7 +2422,7 @@ fn cmd_script(flags: &HashMap<String, String>, pos: &[String]) {
         "start" | "stop" => {
             let name = match pos.get(1).filter(|s| !s.trim().is_empty()) {
                 Some(v) => v,
-                None => return eprintln!("usage: roamway script start|stop <name>"),
+                None => return usage_error("usage: roamway script start|stop <name>"),
             };
             let action = if pos[0] == "start" { "start" } else { "stop" };
             match c.req("POST", &format!("/v1/scripts/{}/{}", name, action), None) {
@@ -1712,7 +2442,7 @@ fn cmd_script(flags: &HashMap<String, String>, pos: &[String]) {
                 Err(e) => eprintln!("script {} failed: {}", action, e),
             }
         }
-        _ => eprintln!("usage: roamway script ls|add|rm|start|stop"),
+        _ => usage_error("usage: roamway script ls|add|rm|start|stop"),
     }
 }
 
@@ -1722,7 +2452,7 @@ fn cmd_run_remote(h: &hosts::Host, flags: &HashMap<String, String>, pos: &[Strin
         prompt = flags.get("prompt").cloned().unwrap_or_default();
     }
     if prompt.trim().is_empty() {
-        eprintln!("prompt required");
+        usage_error("prompt required");
         return;
     }
     let body = json!({
@@ -1824,7 +2554,11 @@ fn cmd_ls_remote(h: &hosts::Host, flags: &HashMap<String, String>) {
             for r in &mut runs {
                 r["host"] = json!(h.name);
             }
-            print_runs_table(&runs);
+            if format_is_json(flags) || format_is_yaml(flags) {
+                print_formatted(flags, &json!({"runs": runs}));
+            } else {
+                print_runs_table(&runs);
+            }
         }
         Err(e) => eprintln!("list failed: {}", e),
     }
@@ -1886,7 +2620,11 @@ fn cmd_ls_all(flags: &HashMap<String, String>) {
             .unwrap_or(0)
             .cmp(&a["created_at"].as_i64().unwrap_or(0))
     });
-    print_runs_table(&all);
+    if format_is_json(flags) || format_is_yaml(flags) {
+        print_formatted(flags, &json!({"runs": all}));
+    } else {
+        print_runs_table(&all);
+    }
     if !errors.is_empty() {
         eprintln!("errors:");
         for e in errors {
@@ -1930,18 +2668,18 @@ fn cmd_host(flags: &HashMap<String, String>, pos: &[String]) {
         "enable" => cmd_host_enable(flags, &pos[1..], true),
         "disable" => cmd_host_enable(flags, &pos[1..], false),
         "probe" => cmd_host_probe(flags, &pos[1..]),
-        _ => eprintln!("usage: roamway host add|ls|rm|enable|disable|probe ..."),
+        _ => usage_error("usage: roamway host add|ls|rm|enable|disable|probe ..."),
     }
 }
 
 fn cmd_host_add(flags: &HashMap<String, String>, pos: &[String]) {
     let name = match pos.first() {
         Some(n) => n,
-        None => return eprintln!("usage: roamway host add <name> --endpoint <ep> [--token <t>]"),
+        None => return usage_error("usage: roamway host add <name> --endpoint <ep> [--token <t>]"),
     };
     let endpoint = match flags.get("endpoint") {
         Some(e) => e,
-        None => return eprintln!("--endpoint is required"),
+        None => return usage_error("--endpoint is required"),
     };
     let env_name = format!("ROAMWAY_TOKEN_{}", name.to_uppercase().replace('-', "_"));
     let token = flags
@@ -1951,7 +2689,11 @@ fn cmd_host_add(flags: &HashMap<String, String>, pos: &[String]) {
         .filter(|s| !s.is_empty());
     let token = match token {
         Some(t) => t,
-        None => return eprintln!("token required: --token or environment {}", env_name),
+        None => {
+                eprintln!("token required: --token or environment {}", env_name);
+                fail(2);
+                return;
+            }
     };
     let mut reg = registry_for(flags);
     if reg.get(name).is_some() {
@@ -2031,7 +2773,7 @@ fn cmd_host_ls(flags: &HashMap<String, String>) {
 fn cmd_host_rm(flags: &HashMap<String, String>, pos: &[String]) {
     let name = match pos.first() {
         Some(n) => n,
-        None => return eprintln!("usage: roamway host rm <name>"),
+        None => return usage_error("usage: roamway host rm <name>"),
     };
     let mut reg = registry_for(flags);
     if reg.remove(name) {
@@ -2045,7 +2787,7 @@ fn cmd_host_rm(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_host_enable(flags: &HashMap<String, String>, pos: &[String], enable: bool) {
     let name = match pos.first() {
         Some(n) => n,
-        None => return eprintln!("usage: roamway host enable|disable <name>"),
+        None => return usage_error("usage: roamway host enable|disable <name>"),
     };
     let mut reg = registry_for(flags);
     match reg.hosts.iter_mut().find(|h| h.name == name.as_str()) {
@@ -2061,7 +2803,7 @@ fn cmd_host_enable(flags: &HashMap<String, String>, pos: &[String], enable: bool
 fn cmd_host_probe(flags: &HashMap<String, String>, pos: &[String]) {
     let name = match pos.first() {
         Some(n) => n,
-        None => return eprintln!("usage: roamway host probe <name>"),
+        None => return usage_error("usage: roamway host probe <name>"),
     };
     let mut reg = registry_for(flags);
     let idx = match reg.hosts.iter().position(|h| h.name == name.as_str()) {
@@ -2097,7 +2839,7 @@ fn cmd_agent(flags: &HashMap<String, String>, pos: &[String]) {
         "open" => cmd_agent_open(flags, &pos[1..]),
         "detach" => cmd_agent_detach(flags, &pos[1..]),
         "import" => cmd_agent_import(flags, &pos[1..]),
-        _ => eprintln!(
+        _ => usage_error(
             "usage: roamway agent run|ls|inspect|logs|wait|attach|archive|reload|update|open|detach|import ..."
         ),
     }
@@ -2109,7 +2851,7 @@ fn cmd_agent_run(flags: &HashMap<String, String>, pos: &[String]) {
         prompt = flags.get("prompt").cloned().unwrap_or_default();
     }
     if prompt.trim().is_empty() {
-        eprintln!("prompt required");
+        usage_error("prompt required");
         return;
     }
     let body = json!({
@@ -2206,7 +2948,7 @@ fn cmd_agent_ls(flags: &HashMap<String, String>) {
 fn cmd_agent_inspect(flags: &HashMap<String, String>, pos: &[String]) {
     let id = match pos.first() {
         Some(i) => i,
-        None => return eprintln!("usage: roamway inspect <id>"),
+        None => return usage_error("usage: roamway inspect <id>"),
     };
     match request(flags, "GET", &format!("/v1/agents/{}", id), None) {
         Ok(v) => {
@@ -2248,7 +2990,7 @@ fn cmd_agent_inspect(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_agent_logs(flags: &HashMap<String, String>, pos: &[String]) {
     let id = match pos.first() {
         Some(i) => i,
-        None => return eprintln!("usage: roamway agent logs <id> [--tail 80]"),
+        None => return usage_error("usage: roamway agent logs <id> [--tail 80]"),
     };
     let tail = flags.get("tail").cloned().unwrap_or_else(|| "80".into());
     let detail = match request(flags, "GET", &format!("/v1/agents/{}", id), None) {
@@ -2274,7 +3016,7 @@ fn cmd_agent_logs(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_agent_wait(flags: &HashMap<String, String>, pos: &[String]) {
     let id = match pos.first() {
         Some(i) => i,
-        None => return eprintln!("usage: roamway wait <id> [--timeout 60]"),
+        None => return usage_error("usage: roamway wait <id> [--timeout 60]"),
     };
     let timeout = flags.get("timeout").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
     let started = std::time::Instant::now();
@@ -2303,7 +3045,7 @@ fn cmd_agent_wait(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_agent_archive(flags: &HashMap<String, String>, pos: &[String]) {
     let id = match pos.first() {
         Some(i) => i,
-        None => return eprintln!("usage: roamway archive <id>"),
+        None => return usage_error("usage: roamway archive <id>"),
     };
     let path = if flags.contains_key("keep-worktree") {
         format!("/v1/agents/{}?keep-worktree=1", id)
@@ -2325,7 +3067,7 @@ fn cmd_agent_archive(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_agent_reload(flags: &HashMap<String, String>, pos: &[String]) {
     let id = match pos.first() {
         Some(i) => i,
-        None => return eprintln!("usage: roamway agent reload <id>"),
+        None => return usage_error("usage: roamway agent reload <id>"),
     };
     match request(flags, "POST", &format!("/v1/agents/{}/reload", id), Some(json!({}))) {
         Ok(v) => {
@@ -2342,7 +3084,7 @@ fn cmd_agent_reload(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_agent_update(flags: &HashMap<String, String>, pos: &[String]) {
     let id = match pos.first() {
         Some(i) => i,
-        None => return eprintln!("usage: roamway agent update <id> [--title --model --workspace]"),
+        None => return usage_error("usage: roamway agent update <id> [--title --model --workspace]"),
     };
     let body = json!({
         "title": flags.get("title"),
@@ -2364,7 +3106,7 @@ fn cmd_agent_update(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_agent_open(flags: &HashMap<String, String>, pos: &[String]) {
     let id = match pos.first() {
         Some(i) => i,
-        None => return eprintln!("usage: roamway agent open <id>"),
+        None => return usage_error("usage: roamway agent open <id>"),
     };
     let base = if let Some(h) = resolve_host(flags) {
         h.endpoint.clone()
@@ -2416,7 +3158,7 @@ fn cmd_ui(flags: &HashMap<String, String>, _pos: &[String]) {
 fn cmd_agent_detach(flags: &HashMap<String, String>, pos: &[String]) {
     let id = match pos.first() {
         Some(i) => i,
-        None => return eprintln!("usage: roamway agent detach <id>"),
+        None => return usage_error("usage: roamway agent detach <id>"),
     };
     match request(flags, "POST", &format!("/v1/agents/{}/detach", id), Some(json!({}))) {
         Ok(v) => {
@@ -2439,6 +3181,7 @@ fn cmd_agent_import(flags: &HashMap<String, String>, pos: &[String]) {
     }
     if session.trim().is_empty() {
         eprintln!("--session is required");
+        fail(2);
         return;
     }
     let body = json!({
@@ -2463,7 +3206,7 @@ fn cmd_agent_import(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_agent_attach(flags: &HashMap<String, String>, pos: &[String]) {
     let id = match pos.first() {
         Some(i) => i,
-        None => return eprintln!("usage: roamway attach <id>"),
+        None => return usage_error("usage: roamway attach <id>"),
     };
     let (base, token) = if let Some(h) = resolve_host(flags) {
         (
@@ -2537,7 +3280,7 @@ fn cmd_daemon(flags: &HashMap<String, String>, pos: &[String]) {
         "reload" => cmd_daemon_reload(flags),
         "pair" => cmd_daemon_pair(flags),
         "set-password" => cmd_daemon_set_password(flags),
-        _ => eprintln!("usage: roamway daemon status|config|start|stop|restart|reload|pair|set-password"),
+        _ => usage_error("usage: roamway daemon status|config|start|stop|restart|reload|pair|set-password"),
     }
 }
 
@@ -2752,7 +3495,11 @@ fn cmd_daemon_pair(flags: &HashMap<String, String>) {
         .filter(|s| !s.is_empty());
     let token = match token {
         Some(t) => t,
-        None => return eprintln!("token required: --token, ROAMWAY_TOKEN, or <data>/token"),
+        None => {
+                eprintln!("token required: --token, ROAMWAY_TOKEN, or <data>/token");
+                fail(2);
+                return;
+            }
     };
     let bind = flags
         .get("bind")
@@ -2799,7 +3546,7 @@ fn cmd_token(flags: &HashMap<String, String>, pos: &[String]) {
         "revoke" => {
             let id = pos.get(1).cloned().unwrap_or_default();
             if id.is_empty() {
-                eprintln!("usage: roamway token revoke <id>");
+                usage_error("usage: roamway token revoke <id>");
                 return;
             }
             let mut store = auth::TokenStore::load(&data);
@@ -2809,7 +3556,7 @@ fn cmd_token(flags: &HashMap<String, String>, pos: &[String]) {
                 eprintln!("no such token: {}", id);
             }
         }
-        _ => eprintln!("usage: roamway token add|create --name N [--scope read|run|admin] [--ttl 24h] | ls|list | revoke <id>"),
+        _ => usage_error("usage: roamway token add|create --name N [--scope read|run|admin] [--ttl 24h] | ls|list | revoke <id>"),
     }
 }
 
@@ -2924,7 +3671,7 @@ fn cmd_pair(flags: &HashMap<String, String>) {
 fn cmd_approve(flags: &HashMap<String, String>, pos: &[String]) {
     let id = pos.first().map(String::as_str).unwrap_or("");
     if id.is_empty() {
-        eprintln!("usage: roamway approve <id>");
+        usage_error("usage: roamway approve <id>");
         return;
     }
     match request(flags, "POST", &format!("/v1/approvals/{}/approve", id), None) {
@@ -2937,7 +3684,7 @@ fn cmd_approve(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_deny(flags: &HashMap<String, String>, pos: &[String]) {
     let id = pos.first().map(String::as_str).unwrap_or("");
     if id.is_empty() {
-        eprintln!("usage: roamway deny <id>");
+        usage_error("usage: roamway deny <id>");
         return;
     }
     match request(flags, "POST", &format!("/v1/approvals/{}/deny", id), None) {
@@ -2951,14 +3698,26 @@ fn cmd_approvals(flags: &HashMap<String, String>) {
     let path = if flags.contains_key("all") { "/v1/approvals?all=1" } else { "/v1/approvals" };
     match request(flags, "GET", path, None) {
         Ok(v) => {
-            if flags.contains_key("json") {
-                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+            if format_is_json(flags) || format_is_yaml(flags) {
+                print_formatted(flags, &v);
                 return;
             }
             let arr = v.get("approvals").and_then(|a| a.as_array()).cloned().unwrap_or_default();
+            if flags.contains_key("quiet") {
+                for a in &arr {
+                    println!("{}", a["id"].as_str().unwrap_or("-"));
+                }
+                return;
+            }
             if arr.is_empty() {
                 println!("no approvals");
                 return;
+            }
+            if !flags.contains_key("no-headers") {
+                println!(
+                    "{:<34} {:<8} {:<6} {} {}",
+                    "ID", "STATUS", "METHOD", "PATH", "TS"
+                );
             }
             for a in &arr {
                 println!(
@@ -3061,7 +3820,7 @@ fn cmd_provider(flags: &HashMap<String, String>, pos: &[String]) {
             let id = match pos.get(1) {
                 Some(id) => id,
                 None => {
-                    eprintln!("usage: roamway provider diagnostic <id>");
+                    usage_error("usage: roamway provider diagnostic <id>");
                     return;
                 }
             };
@@ -3074,7 +3833,7 @@ fn cmd_provider(flags: &HashMap<String, String>, pos: &[String]) {
                 None => eprintln!("provider '{}' not found", id),
             }
         }
-        _ => eprintln!("usage: roamway provider [ls|models [<id>] [--refresh]|diagnostic <id>]"),
+        _ => usage_error("usage: roamway provider [ls|models [<id>] [--refresh]|diagnostic <id>]"),
     }
 }
 
@@ -3121,7 +3880,8 @@ fn cmd_usage(flags: &HashMap<String, String>, pos: &[String]) {
             let since = match usage::since_ts(flags.get("since").map(String::as_str)) {
                 Some(s) => s,
                 None => {
-                    eprintln!("usage: invalid --since (expected 7d, 24h or ISO timestamp)");
+                    usage_error("usage: invalid --since (expected 7d, 24h or ISO timestamp)");
+                    fail(2);
                     return;
                 }
             };
@@ -3142,7 +3902,7 @@ fn cmd_usage(flags: &HashMap<String, String>, pos: &[String]) {
             let id = match pos.get(1) {
                 Some(id) => id,
                 None => {
-                    eprintln!("usage: roamway usage inspect <run_id>");
+                    usage_error("usage: roamway usage inspect <run_id>");
                     return;
                 }
             };
@@ -3198,7 +3958,7 @@ fn cmd_usage(flags: &HashMap<String, String>, pos: &[String]) {
                 );
             }
         }
-        _ => eprintln!("usage: roamway usage [ls [--since 7d|24h|ISO] [--provider id]|inspect <run_id>] [--json]"),
+        _ => usage_error("usage: roamway usage [ls [--since 7d|24h|ISO] [--provider id]|inspect <run_id>] [--json]"),
     }
 }
 
@@ -3227,7 +3987,7 @@ fn cmd_plugin(flags: &HashMap<String, String>, pos: &[String]) {
             let name = match pos.get(1) {
                 Some(n) => n,
                 None => {
-                    eprintln!("usage: roamway plugin init <name>");
+                    usage_error("usage: roamway plugin init <name>");
                     return;
                 }
             };
@@ -3240,7 +4000,7 @@ fn cmd_plugin(flags: &HashMap<String, String>, pos: &[String]) {
             let name = match pos.get(1) {
                 Some(n) => n,
                 None => {
-                    eprintln!("usage: roamway plugin logs <name>");
+                    usage_error("usage: roamway plugin logs <name>");
                     return;
                 }
             };
@@ -3254,7 +4014,7 @@ fn cmd_plugin(flags: &HashMap<String, String>, pos: &[String]) {
             let name = match pos.get(1) {
                 Some(n) => n,
                 None => {
-                    eprintln!("usage: roamway plugin reload <name>");
+                    usage_error("usage: roamway plugin reload <name>");
                     return;
                 }
             };
@@ -3267,7 +4027,7 @@ fn cmd_plugin(flags: &HashMap<String, String>, pos: &[String]) {
             let name = match pos.get(1) {
                 Some(n) => n,
                 None => {
-                    eprintln!("usage: roamway plugin enable|disable <name> [--trust]");
+                    usage_error("usage: roamway plugin enable|disable <name> [--trust]");
                     return;
                 }
             };
@@ -3291,7 +4051,7 @@ fn cmd_plugin(flags: &HashMap<String, String>, pos: &[String]) {
             let name = match pos.get(1) {
                 Some(n) => n,
                 None => {
-                    eprintln!("usage: roamway plugin remove <name> [--keep-files]");
+                    usage_error("usage: roamway plugin remove <name> [--keep-files]");
                     return;
                 }
             };
@@ -3300,7 +4060,7 @@ fn cmd_plugin(flags: &HashMap<String, String>, pos: &[String]) {
                 Err(e) => eprintln!("plugin remove failed: {}", e),
             }
         }
-        _ => eprintln!("usage: roamway plugin ls|init|logs|reload|enable|disable|remove ..."),
+        _ => usage_error("usage: roamway plugin ls|init|logs|reload|enable|disable|remove ..."),
     }
 }
 
@@ -3316,7 +4076,7 @@ fn cmd_speech(flags: &HashMap<String, String>, pos: &[String]) {
             let file = match pos.get(1) {
                 Some(f) => f,
                 None => {
-                    eprintln!("usage: roamway speech transcribe <file>");
+                    usage_error("usage: roamway speech transcribe <file>");
                     return;
                 }
             };
@@ -3331,7 +4091,7 @@ fn cmd_speech(flags: &HashMap<String, String>, pos: &[String]) {
         "say" => {
             let text = pos[1..].join(" ");
             if text.trim().is_empty() {
-                eprintln!("usage: roamway speech say <text> [--out file]");
+                usage_error("usage: roamway speech say <text> [--out file]");
                 return;
             }
             match speech::say(&dir, &text, flags.get("out").map(String::as_str)) {
@@ -3342,7 +4102,7 @@ fn cmd_speech(flags: &HashMap<String, String>, pos: &[String]) {
                 }
             }
         }
-        _ => eprintln!("usage: roamway speech [transcribe <file>|say <text> [--out file]]"),
+        _ => usage_error("usage: roamway speech [transcribe <file>|say <text> [--out file]]"),
     }
 }
 
@@ -3490,5 +4250,57 @@ mod tests {
         assert!(!is_loopback_bind("192.168.1.50:8796"));
         assert!(!is_loopback_bind("::"));
         assert!(!is_loopback_bind("[::]:8796"));
+    }
+
+    #[test]
+    fn parse_flags_short_o_and_q() {
+        let (flags, pos) = parse_flags(&["-o".to_string(), "json".to_string(), "ls".to_string()]);
+        assert_eq!(flags.get("format").map(String::as_str), Some("json"));
+        assert_eq!(pos, vec!["ls".to_string()]);
+        let (flags2, pos2) = parse_flags(&["-q".to_string(), "ls".to_string()]);
+        assert_eq!(flags2.get("quiet").map(String::as_str), Some("true"));
+        assert_eq!(pos2, vec!["ls".to_string()]);
+    }
+
+    #[test]
+    fn json_flag_and_format_flag_match() {
+        let mut f1: HashMap<String, String> = HashMap::new();
+        f1.insert("json".to_string(), "true".to_string());
+        let mut f2: HashMap<String, String> = HashMap::new();
+        f2.insert("format".to_string(), "json".to_string());
+        let v = json!({"runs": [{"id": "a", "status": "done"}]});
+        assert!(format_is_json(&f1));
+        assert!(format_is_json(&f2));
+        assert_eq!(format_value(&f1, &v), format_value(&f2, &v));
+    }
+
+    #[test]
+    fn yaml_serializer_emits_nested_maps_and_sequences() {
+        let y = to_yaml(&json!({"a": {"b": [1, "x"]}}));
+        assert!(y.contains("a:"));
+        assert!(y.contains("b:"));
+        assert!(y.contains("- 1"));
+        assert!(y.contains("- x"));
+    }
+
+    #[test]
+    fn dispatch_returns_usage_exit_code() {
+        assert_eq!(dispatch(&["workspace".to_string(), "setup".to_string()]), 2);
+        assert_eq!(dispatch(&["roamway-bogus-command".to_string()]), 2);
+    }
+
+    #[test]
+    fn delete_plan_stops_running_runs_before_delete() {
+        assert_eq!(
+            delete_plan("r1", true),
+            vec![
+                ("POST".to_string(), "/v1/runs/r1/stop".to_string()),
+                ("DELETE".to_string(), "/v1/runs/r1".to_string()),
+            ]
+        );
+        assert_eq!(
+            delete_plan("r1", false),
+            vec![("DELETE".to_string(), "/v1/runs/r1".to_string())]
+        );
     }
 }
