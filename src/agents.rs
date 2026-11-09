@@ -187,6 +187,8 @@ fn push_run_locked(
     labels: BTreeMap<String, String>,
     env: Vec<(String, String)>,
     cwd: Option<String>,
+    options: BTreeMap<String, String>,
+    images: Vec<String>,
 ) -> Result<Run, String> {
     let id = st.next_id("run");
     let run = Run {
@@ -218,6 +220,8 @@ fn push_run_locked(
         labels,
         env,
         cwd,
+        options,
+        images,
     };
     st.state.runs.push(run.clone());
     agent.last_run_id = id;
@@ -242,6 +246,8 @@ pub fn create_agent_and_run(
     labels: BTreeMap<String, String>,
     env: Vec<(String, String)>,
     cwd: Option<String>,
+    options: BTreeMap<String, String>,
+    images: Vec<String>,
 ) -> Result<(Agent, Run), String> {
     if !is_known_agent(kind) {
         return Err("unknown agent".into());
@@ -314,7 +320,19 @@ pub fn create_agent_and_run(
         labels: labels.clone(),
         worktree_mode: worktree_mode.clone(),
     };
-    let run = push_run_locked(&mut st, &mut agent, prompt, timeout_s, false, None, labels, env, cwd)?;
+    let run = push_run_locked(
+        &mut st,
+        &mut agent,
+        prompt,
+        timeout_s,
+        false,
+        None,
+        labels,
+        env,
+        cwd,
+        options,
+        images,
+    )?;
     st.state.agents.push(agent.clone());
     st.save();
     drop(st);
@@ -335,6 +353,8 @@ pub fn queue_agent_run(
     agent_id: &str,
     prompt: &str,
     timeout_s: u64,
+    options: BTreeMap<String, String>,
+    images: Vec<String>,
 ) -> Result<Run, String> {
     if prompt.trim().is_empty() {
         return Err("prompt is required".into());
@@ -356,7 +376,19 @@ pub fn queue_agent_run(
     } else {
         Some("resume unsupported".to_string())
     };
-    let run = push_run_locked(&mut st, &mut agent, prompt, timeout_s, resumed, resume_note, BTreeMap::new(), Vec::new(), None)?;
+    let run = push_run_locked(
+        &mut st,
+        &mut agent,
+        prompt,
+        timeout_s,
+        resumed,
+        resume_note,
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        options,
+        images,
+    )?;
     if let Some(a) = st.state.agents.iter_mut().find(|a| a.id == agent_id) {
         *a = agent.clone();
     }
@@ -387,7 +419,19 @@ pub fn reload_agent(app: &Arc<App>, agent_id: &str, timeout_s: u64) -> Result<Ru
     agent.session_id.clear();
     agent.history.clear();
     agent.last_error.clear();
-    let run = push_run_locked(&mut st, &mut agent, &first_prompt, timeout_s, false, None, BTreeMap::new(), Vec::new(), None)?;
+    let run = push_run_locked(
+        &mut st,
+        &mut agent,
+        &first_prompt,
+        timeout_s,
+        false,
+        None,
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        BTreeMap::new(),
+        Vec::new(),
+    )?;
     if let Some(a) = st.state.agents.iter_mut().find(|a| a.id == agent_id) {
         *a = agent.clone();
     }

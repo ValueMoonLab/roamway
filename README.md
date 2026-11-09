@@ -163,6 +163,35 @@ ROAMWAY_CODEX_ARGS="--dangerously-bypass-approvals-and-sandbox" roamway serve ..
 
 出于安全考虑，`agent` 采用白名单：只接受 `codex`、`hermes`、`claude`、`shell`、`api:deepseek`、`api:qwen`。要接入新 CLI，请在 `src/types.rs` 的 `KNOWN_AGENTS` 与 `src/runner.rs` 的 `build_command` 里各加一条映射后重新编译。
 
+### 每 run 参数透传
+
+`run` 支持把思考档位、沙箱模式、provider、图片、输出 schema 直接交给该 run 的 agent（映射逐 provider 见 `docs/providers.md`）：
+
+| 参数 | 取值 | codex 实际 argv |
+|---|---|---|
+| `--thinking` | `none` `low` `medium` `high` | `-c model_reasoning_effort=<level>` |
+| `--mode` | `read-only` `workspace-write` `danger-full-access` | `-s <mode>`（不给则仍是 `workspace-write`） |
+| `--provider` | `ollama` / `lmstudio` / `oss` / 其它 id | `--oss --local-provider <P>` / `--oss` / `-c model_provider=<P>` |
+| `--image <FILE>` | 可重复，每个都是存在的文件 | 每张一个 `-i <FILE>` |
+| `--output-schema <FILE>` | 存在的 JSON 对象文件（须含 `type`） | `--output-schema <FILE>` |
+
+```bash
+roamway run --agent codex --thinking high --mode read-only \
+  --image shot.png --output-schema schema.json --provider ollama "看一下这张图"
+```
+
+校验在 CLI 与 HTTP 各做一次，文案逐字一致：
+
+- `--thinking` / `--mode` 只接受枚举：`run --thinking must be one of none|low|medium|high`、`run --mode must be one of read-only|workspace-write|danger-full-access`
+- `--image` 必须是存在的文件：`run --image: no such file: <p>`
+- `--output-schema` 必须是存在的文件且内容是带 `type` 的 JSON 对象：`run --output-schema: not a JSON object with type: <p>`
+- `--provider` 限 `[A-Za-z0-9_.-]{1,40}`
+- 未知 key：`unknown run option: <k>`
+
+不支持面：`claude` 没有 provider / image / output-schema 的能力，带上是 `run --provider: not supported for agent claude` 一类错误；它的 `--thinking` 走环境变量 `MAX_THINKING_TOKENS`（low=2048 / medium=8192 / high=24576，`none` 不设），`--mode` 走 `--permission-mode`。`shell`、`hermes`、`api:*` 带任何选项一律 `run --<k>: not supported for agent <kind>`。所有被拒的参数在派发前就判掉，不会出现「跑完了才发现参数没生效」。
+
+HTTP 侧同构：`POST /v1/runs` 与 `POST /v1/agents/{id}/run` 接受 `"options": {"thinking":"high","mode":"read-only","provider":"ollama","output_schema":"/abs/schema.json"}` 与 `"images": ["/abs/a.png"]`，非法时 400 `{"error": "<同上文本>"}`；`GET /v1/runs/{id}` 与 `run --json` 原样回显这两项。daemon 日志每 run 打一行 `[runopts] agent=<kind> keys=<k1,k2> images=<n>`（只打 key，不打值）。
+
 ## 环境变量
 
 | 变量 | 作用 |

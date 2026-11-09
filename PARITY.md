@@ -12,7 +12,7 @@
 |---|---|---|---|---|
 | 1 | `paseo host` | ✅ | `src/main.rs:fn cmd_host` | 主机注册表 add/ls/rm/enable/disable/probe 全量 |
 | 2 | `paseo ls` | ✅ | `src/main.rs:fn cmd_ls` / 测试：`ls_plan_switches_runs_and_global_limit_defaults` | 默认 agent 维度，列 `ID/STATE/KIND/MODEL/TITLE/UPDATED`；`--runs` 看 run 表；`--background` 不做（roamway 无后台列表模型，exit 2） |
-| 3 | `paseo run` | ⚠️ | `src/main.rs:fn run_plan` / 测试：`run_plan_worktree_mode_and_unsupported_validation` | agent-backed，支持 worktree/cwd/env/label；不支持 `--thinking/--mode/--image/--output-schema/--provider`（用 `--agent`）与 `--worktree-slug/--new-branch/--base/--branch`，均 exit 2 |
+| 3 | `paseo run` | ⚠️ | `src/main.rs:fn run_plan` / `src/runner.rs:fn provider_args` / 测试：`provider_args_codex_maps_thinking_mode_provider_image_schema`、`run_plan_no_longer_rejects_provider_flags` | agent-backed，支持 worktree/cwd/env/label 与每 run 的 `--thinking/--mode/--provider/--image/--output-schema`（argv 映射见 `src/runner.rs:fn provider_args`，provider 无能力时显式 exit 2）；仅 `--worktree-slug/--new-branch/--base/--branch` 仍未对齐（P16），exit 2 |
 | 4 | `paseo import` | ✅ | `src/main.rs:fn cmd_agent_import` | 导入已有 provider 会话 |
 | 5 | `paseo clone` | ✅ | `src/main.rs:fn cmd_clone` | 本地 `workspaces::clone_repo` 或远端 `/v1/workspaces/clone` |
 | 6 | `paseo attach` | ✅ | `src/main.rs:fn cmd_agent_attach` | SSE 长连接接输出流 |

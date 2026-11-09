@@ -167,6 +167,10 @@ pub struct Run {
     pub env: Vec<(String, String)>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub options: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -533,6 +537,8 @@ mod tests {
             labels: BTreeMap::new(),
             env: Vec::new(),
             cwd: None,
+            options: BTreeMap::new(),
+            images: Vec::new(),
         };
         let state = State {
             runs: vec![run],

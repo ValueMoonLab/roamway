@@ -1,6 +1,7 @@
 use crate::agents;
 use crate::types::*;
 use serde_json::json;
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::Path;
@@ -90,6 +91,14 @@ fn execute(app: Arc<App>, id: String) {
             run.agent,
             run.model,
             run.workspace
+        );
+        let option_keys = run.options.keys().map(String::as_str).collect::<Vec<_>>().join(",");
+        let _ = writeln!(
+            f,
+            "[runopts] agent={} keys={} images={}",
+            run.agent,
+            option_keys,
+            run.images.len()
         );
         let _ = f.flush();
     }
@@ -300,6 +309,103 @@ fn env_list(key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn first_option_key(opts: &BTreeMap<String, String>) -> Option<&str> {
+    opts.keys().next().map(String::as_str)
+}
+
+fn reject_any_option(kind: &str, opts: &BTreeMap<String, String>, images: &[String]) -> Result<(), String> {
+    if let Some(key) = first_option_key(opts) {
+        return Err(format!("run --{}: not supported for agent {}", key, kind));
+    }
+    if !images.is_empty() {
+        return Err(format!("run --image: not supported for agent {}", kind));
+    }
+    Ok(())
+}
+
+fn claude_thinking_tokens(level: &str) -> Option<&'static str> {
+    match level {
+        "low" => Some("2048"),
+        "medium" => Some("8192"),
+        "high" => Some("24576"),
+        _ => None,
+    }
+}
+
+/// 把 per-run options/images 映射成 argv 片段，顺序固定：
+/// thinking → mode → provider → images → output_schema。
+/// provider 没有对应能力时显式报错，不静默丢弃。
+pub fn provider_args(
+    kind: &str,
+    opts: &BTreeMap<String, String>,
+    images: &[String],
+    mode: Option<&str>,
+) -> Result<Vec<String>, String> {
+    match kind {
+        "codex" => {
+            let mut args: Vec<String> = Vec::new();
+            if let Some(level) = opts.get("thinking") {
+                args.push("-c".into());
+                args.push(format!("model_reasoning_effort={}", level));
+            }
+            if let Some(m) = mode {
+                args.push("-s".into());
+                args.push(m.to_string());
+            }
+            if let Some(provider) = opts.get("provider") {
+                match provider.as_str() {
+                    "ollama" | "lmstudio" => {
+                        args.push("--oss".into());
+                        args.push("--local-provider".into());
+                        args.push(provider.clone());
+                    }
+                    "oss" => args.push("--oss".into()),
+                    other => {
+                        args.push("-c".into());
+                        args.push(format!("model_provider={}", other));
+                    }
+                }
+            }
+            for image in images {
+                args.push("-i".into());
+                args.push(image.clone());
+            }
+            if let Some(schema) = opts.get("output_schema") {
+                args.push("--output-schema".into());
+                args.push(schema.clone());
+            }
+            Ok(args)
+        }
+        "claude" => {
+            if opts.contains_key("provider") {
+                return Err("run --provider: not supported for agent claude".into());
+            }
+            if !images.is_empty() {
+                return Err("run --image: not supported for agent claude".into());
+            }
+            if opts.contains_key("output_schema") {
+                return Err("run --output-schema: not supported for agent claude".into());
+            }
+            let mut args: Vec<String> = Vec::new();
+            let m = mode.or_else(|| opts.get("mode").map(String::as_str));
+            if let Some(m) = m {
+                args.push("--permission-mode".into());
+                args.push(m.to_string());
+            }
+            Ok(args)
+        }
+        "shell" | "hermes" => {
+            reject_any_option(kind, opts, images)?;
+            Ok(Vec::new())
+        }
+        other if other.starts_with("api:") => {
+            reject_any_option(other, opts, images)?;
+            Ok(Vec::new())
+        }
+        other => Err(format!("unknown agent: {}", other)),
+    }
+}
+
 fn build_command_with_session(
     run: &Run,
     session_id: Option<&str>,
@@ -312,6 +418,7 @@ fn build_command_with_session(
         .unwrap_or(&run.workspace);
     let (prog, args): (String, Vec<String>) = match run.agent.as_str() {
         "shell" => {
+            reject_any_option("shell", &run.options, &run.images)?;
             if cfg!(windows) {
                 ("cmd".into(), vec!["/C".into(), run.prompt.clone()])
             } else {
@@ -319,12 +426,16 @@ fn build_command_with_session(
             }
         }
         "codex" => {
-            let mut a: Vec<String> = vec![
-                "exec".into(),
-                "--skip-git-repo-check".into(),
-                "-s".into(),
-                "workspace-write".into(),
-            ];
+            let mode = run.options.get("mode").map(String::as_str);
+            let extra = provider_args("codex", &run.options, &run.images, mode)?;
+            let mut a: Vec<String> = vec!["exec".into(), "--skip-git-repo-check".into()];
+            if run.options.contains_key("mode") {
+                // provider_args 已输出 -s <mode>
+            } else {
+                a.push("-s".into());
+                a.push("workspace-write".into());
+            }
+            a.extend(extra);
             if let Some(sid) = session_id.filter(|s| !s.is_empty()) {
                 a.push("resume".into());
                 a.push(sid.to_string());
@@ -342,6 +453,7 @@ fn build_command_with_session(
             ("codex".into(), a)
         }
         "hermes" => {
+            reject_any_option("hermes", &run.options, &run.images)?;
             let mut a: Vec<String> = vec!["-z".into(), run.prompt.clone()];
             if let Some(m) = run.model.as_ref().filter(|m| !m.is_empty()) {
                 a.push("-m".into());
@@ -351,11 +463,18 @@ fn build_command_with_session(
             ("hermes".into(), a)
         }
         "claude" => {
+            let extra = provider_args(
+                "claude",
+                &run.options,
+                &run.images,
+                run.options.get("mode").map(String::as_str),
+            )?;
             let mut a: Vec<String> = vec!["-p".into()];
             if let (Some(flag), Some(sid)) = (claude_resume_flag, session_id.filter(|s| !s.is_empty())) {
                 a.push(flag.to_string());
                 a.push(sid.to_string());
             }
+            a.extend(extra);
             a.push(run.prompt.clone());
             ("claude".into(), a)
         }
@@ -363,6 +482,13 @@ fn build_command_with_session(
     };
 
     let mut c = Command::new(prog);
+    if run.agent == "claude" {
+        if let Some(level) = run.options.get("thinking") {
+            if let Some(tokens) = claude_thinking_tokens(level) {
+                c.env("MAX_THINKING_TOKENS", tokens);
+            }
+        }
+    }
     c.args(args);
     if !effective.is_empty() && Path::new(effective).is_dir() {
         c.current_dir(effective);
@@ -756,6 +882,8 @@ mod tests {
             labels: std::collections::BTreeMap::new(),
             env: Vec::new(),
             cwd: None,
+            options: std::collections::BTreeMap::new(),
+            images: Vec::new(),
         }
     }
 
@@ -804,5 +932,67 @@ mod tests {
         assert!(!run_is_startable(RunStatus::Running, &cancel));
         cancel.store(true, Ordering::Relaxed);
         assert!(!run_is_startable(RunStatus::Queued, &cancel));
+    }
+
+    #[test]
+    fn provider_args_codex_maps_thinking_mode_provider_image_schema() {
+        let mut opts = BTreeMap::new();
+        opts.insert("thinking".to_string(), "high".to_string());
+        opts.insert("provider".to_string(), "ollama".to_string());
+        opts.insert("output_schema".to_string(), "/tmp/s.json".to_string());
+        let images = vec!["/tmp/a.png".to_string(), "/tmp/b.png".to_string()];
+        let args = provider_args("codex", &opts, &images, Some("read-only")).unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "-c",
+                "model_reasoning_effort=high",
+                "-s",
+                "read-only",
+                "--oss",
+                "--local-provider",
+                "ollama",
+                "-i",
+                "/tmp/a.png",
+                "-i",
+                "/tmp/b.png",
+                "--output-schema",
+                "/tmp/s.json",
+            ]
+        );
+    }
+
+    #[test]
+    fn provider_args_empty_is_identity() {
+        let empty = BTreeMap::new();
+        assert_eq!(provider_args("codex", &empty, &[], None).unwrap(), Vec::<String>::new());
+        assert_eq!(provider_args("claude", &empty, &[], None).unwrap(), Vec::<String>::new());
+        assert_eq!(provider_args("shell", &empty, &[], None).unwrap(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn provider_args_claude_rejects_provider_and_image() {
+        let mut opts = BTreeMap::new();
+        opts.insert("provider".to_string(), "ollama".to_string());
+        assert_eq!(
+            provider_args("claude", &opts, &[], None).unwrap_err(),
+            "run --provider: not supported for agent claude"
+        );
+
+        let empty = BTreeMap::new();
+        assert_eq!(
+            provider_args("claude", &empty, &["/tmp/a.png".to_string()], None).unwrap_err(),
+            "run --image: not supported for agent claude"
+        );
+    }
+
+    #[test]
+    fn provider_args_shell_rejects_any_option() {
+        let mut opts = BTreeMap::new();
+        opts.insert("thinking".to_string(), "high".to_string());
+        assert_eq!(
+            provider_args("shell", &opts, &[], None).unwrap_err(),
+            "run --thinking: not supported for agent shell"
+        );
     }
 }

@@ -289,6 +289,8 @@ mod tests {
             labels: std::collections::BTreeMap::new(),
             env: Vec::new(),
             cwd: None,
+            options: std::collections::BTreeMap::new(),
+            images: Vec::new(),
         }
     }
 

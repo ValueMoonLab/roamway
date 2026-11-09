@@ -47,6 +47,34 @@ curl -s -H "Authorization: Bearer $TOKEN" $BASE/v1/agents/<id>/session
 # {"agent_id":"ag_…","kind":"codex","resumable":true,"has_session":true,"session_id":"…","state":"idle","last_error":"","last_run_id":"run_…"}
 ```
 
+## per-run 参数映射
+
+`run --thinking/--mode/--provider/--image/--output-schema` 与 HTTP 的 `options`/`images` 由 `src/runner.rs:fn provider_args` 统一翻译成 argv，顺序固定 `thinking → mode → provider → images → output_schema`（逐字节固定，便于断言）。
+
+| 选项 | codex | claude |
+|---|---|---|
+| `thinking=low|medium|high|none` | `-c model_reasoning_effort=<L>` | 环境变量 `MAX_THINKING_TOKENS`（low=2048、medium=8192、high=24576；`none` 不设） |
+| `mode=read-only|workspace-write|danger-full-access` | `-s <M>`（无 `mode` 时保持 `-s workspace-write`） | `--permission-mode <M>` |
+| `provider=ollama` / `lmstudio` | `--oss --local-provider <P>` | ❌ `run --provider: not supported for agent claude` |
+| `provider=oss` | `--oss` | ❌ 同上 |
+| `provider=<其它 id>` | `-c model_provider=<P>` | ❌ 同上 |
+| `image=<FILE>`（可重复） | `-i <FILE>`，每个一张 | ❌ `run --image: not supported for agent claude` |
+| `output_schema=<FILE>` | `--output-schema <FILE>` | ❌ `run --output-schema: not supported for agent claude` |
+
+不支持面汇总：
+
+- `shell`、`hermes`、`api:*`：任何非空 `options` 或 `images` 都直接拒，文案 `run --<k>: not supported for agent <kind>`（exit 2 / HTTP 400），不静默丢弃。
+- `claude`：只有 `thinking` 与 `mode` 能透传，其余三项显式拒绝。
+- 无选项时 `provider_args(kind, 空, &[], None)` 返回空 Vec，既有 argv 除 `-s` 取值外逐字节不变。
+
+参数取值在 `src/main.rs:fn validate_run_options` 校验（CLI 与 server 各调一次，文案逐字一致）；被拒的参数在派发前判掉，不会出现「跑完才发现没生效」。HTTP 示例：
+
+```bash
+curl -s -H "Authorization: Bearer ***" -H 'content-type: application/json' \
+  -d '{"prompt":"看一下这张图","agent":"codex","options":{"thinking":"high","mode":"read-only","provider":"ollama"},"images":["/abs/a.png"]}' \
+  $BASE/v1/runs
+```
+
 ## 新增 agent
 
 白名单在 `src/types.rs` 的 `KNOWN_AGENTS`，执行命令映射在 `src/runner.rs` 的 `build_command`；各加一条后重新编译。

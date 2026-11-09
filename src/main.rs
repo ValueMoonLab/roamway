@@ -239,6 +239,61 @@ fn parse_env(vals: &[String]) -> Result<Vec<(String, String)>, String> {
     Ok(out)
 }
 
+/// `--image` 必须是可读的已存在文件路径
+pub fn validate_image_path(p: &str) -> Result<(), String> {
+    if std::path::Path::new(p).is_file() {
+        Ok(())
+    } else {
+        Err(format!("run --image: no such file: {}", p))
+    }
+}
+
+/// `--output-schema` 必须是已存在文件，内容为带 `"type"` 的 JSON 对象
+fn validate_output_schema(path: &str) -> Result<(), String> {
+    let bad = || format!("run --output-schema: not a JSON object with type: {}", path);
+    let text = std::fs::read_to_string(path).map_err(|_| bad())?;
+    let value: Value = serde_json::from_str(&text).map_err(|_| bad())?;
+    if value.get("type").is_some() {
+        Ok(())
+    } else {
+        Err(bad())
+    }
+}
+
+/// run options 的值校验（CLI 与 HTTP 共用），返回规范化后的有序拷贝
+pub fn validate_run_options(raw: &BTreeMap<String, String>) -> Result<BTreeMap<String, String>, String> {
+    let mut out = BTreeMap::new();
+    for (k, v) in raw {
+        match k.as_str() {
+            "thinking" => {
+                if !matches!(v.as_str(), "none" | "low" | "medium" | "high") {
+                    return Err("run --thinking must be one of none|low|medium|high".to_string());
+                }
+            }
+            "mode" => {
+                if !matches!(v.as_str(), "read-only" | "workspace-write" | "danger-full-access") {
+                    return Err(
+                        "run --mode must be one of read-only|workspace-write|danger-full-access".to_string(),
+                    );
+                }
+            }
+            "provider" => {
+                let valid = !v.is_empty()
+                    && v.len() <= 40
+                    && v.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-');
+                if !valid {
+                    return Err(format!("run --provider: invalid value: {}", v));
+                }
+            }
+            "output_schema" => validate_output_schema(v)?,
+            other => return Err(format!("unknown run option: {}", other)),
+        }
+        out.insert(k.clone(), v.clone());
+    }
+    Ok(out)
+}
+
 #[derive(Debug)]
 struct RunPlan {
     kind: String,
@@ -252,15 +307,14 @@ struct RunPlan {
     labels: BTreeMap<String, String>,
     env: Vec<(String, String)>,
     cwd: Option<String>,
+    options: BTreeMap<String, String>,
+    images: Vec<String>,
     wait_timeout: Option<u64>,
 }
 
 /// 把 `run` 的 flags 收敛成 RunPlan；先校验不支持项，避免无效请求打到服务端
 fn run_plan(flags: &HashMap<String, String>) -> Result<RunPlan, String> {
-    for f in [
-        "thinking", "mode", "image", "output-schema", "provider", "worktree-slug", "new-branch",
-        "base", "branch",
-    ] {
+    for f in ["worktree-slug", "new-branch", "base", "branch"] {
         if flags.contains_key(f) {
             return Err(format!("run --{}: not supported by roamway", f));
         }
@@ -289,8 +343,27 @@ fn run_plan(flags: &HashMap<String, String>) -> Result<RunPlan, String> {
             }
         }
     }
+    let images = flag_many(flags, "image");
+    for img in &images {
+        validate_image_path(img)?;
+    }
+    let mut options = BTreeMap::new();
+    for key in ["thinking", "mode", "provider", "output-schema"] {
+        if let Some(v) = flags.get(key) {
+            let k = if key == "output-schema" { "output_schema" } else { key };
+            options.insert(k.to_string(), v.clone());
+        }
+    }
+    let options = validate_run_options(&options)?;
+    let kind = flags.get("agent").cloned().unwrap_or_else(|| "codex".into());
+    crate::runner::provider_args(
+        &kind,
+        &options,
+        &images,
+        options.get("mode").map(String::as_str),
+    )?;
     Ok(RunPlan {
-        kind: flags.get("agent").cloned().unwrap_or_else(|| "codex".into()),
+        kind,
         model: flags.get("model").cloned(),
         workspace: flags.get("workspace").cloned(),
         title: flags.get("title").cloned(),
@@ -301,6 +374,8 @@ fn run_plan(flags: &HashMap<String, String>) -> Result<RunPlan, String> {
         labels: parse_labels(&flag_many(flags, "label"))?,
         env: parse_env(&flag_many(flags, "env"))?,
         cwd: flags.get("cwd").cloned().filter(|c| !c.is_empty()),
+        options,
+        images,
         wait_timeout: flags.get("wait-timeout").and_then(|v| v.parse::<u64>().ok()),
     })
 }
@@ -320,9 +395,12 @@ fn run_body(plan: &RunPlan, prompt: &str) -> Value {
         "cwd": plan.cwd.clone(),
         "worktree_mode": plan.worktree_mode.clone(),
         "pr_number": plan.pr_number.clone(),
+        "options": plan.options.clone(),
+        "images": plan.images.clone(),
     })
 }
 
+#[derive(Debug)]
 struct LsPlan {
     runs: bool,
     global: bool,
@@ -992,12 +1070,32 @@ fn resolved_config(flags: &HashMap<String, String>) -> Result<config::EffectiveC
     config::resolve_config(flags, &env_map(), &file)
 }
 
+/// 守护进程常见坑：非登录 shell 的 PATH 找不到 ~/.npm-global/bin 里的 codex。
+/// 只能追加、不能前置：调用方显式设置 PATH 时（自定义安装路径、验收用替身）最前面的
+/// 目录必须继续优先，前置会把这些目录顶掉，导致实际跑起来的不是预期那个二进制。
+fn path_with_fallbacks(cur: &str, home: &str) -> String {
+    let extras = [
+        format!("{}/.npm-global/bin", home),
+        format!("{}/.local/bin", home),
+        "/usr/local/bin".to_string(),
+    ];
+    let mut parts: Vec<String> = cur
+        .split(':')
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    for e in extras {
+        if !parts.iter().any(|p| p == &e) {
+            parts.push(e);
+        }
+    }
+    parts.join(":")
+}
+
 fn cmd_serve(flags: &HashMap<String, String>) {
-    // 守护进程常见坑：非登录 shell 的 PATH 找不到 ~/.npm-global/bin 里的 codex
     if let Ok(home) = std::env::var("HOME") {
-        let extra = format!("{}/.npm-global/bin:{}/.local/bin:/usr/local/bin", home, home);
         let cur = std::env::var("PATH").unwrap_or_default();
-        std::env::set_var("PATH", format!("{}:{}", extra, cur));
+        std::env::set_var("PATH", path_with_fallbacks(&cur, &home));
     }
     let cfg = match resolved_config(flags) {
         Ok(c) => c,
@@ -1128,6 +1226,10 @@ fn wait_run(
                 let st = v["run"]["status"].as_str().unwrap_or("?").to_string();
                 last_status = st.clone();
                 if matches!(st.as_str(), "done" | "failed" | "timeout" | "killed" | "interrupted") {
+                    if format_is_json(flags) {
+                        print_formatted(flags, &v["run"]);
+                        return;
+                    }
                     let err = v["run"]["error"].as_str().unwrap_or("");
                     println!(
                         "{}\t{}\t{}s{}",
@@ -4698,6 +4800,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn serve_path_fallbacks_append_without_displacing_caller_entries() {
+        // 调用方显式设置的目录必须保持优先，fallback 只追加在末尾且不重复。
+        let got = path_with_fallbacks("/tmp/shim:/usr/bin", "/home/u");
+        assert_eq!(
+            got,
+            "/tmp/shim:/usr/bin:/home/u/.npm-global/bin:/home/u/.local/bin:/usr/local/bin"
+        );
+        // 已在 PATH 里的 fallback 不重复添加；空段被丢掉。
+        let again = path_with_fallbacks("/usr/local/bin::/opt/x", "/home/u");
+        assert_eq!(
+            again,
+            "/usr/local/bin:/opt/x:/home/u/.npm-global/bin:/home/u/.local/bin"
+        );
+        // 空 PATH 也能得到完整 fallback。
+        assert_eq!(
+            path_with_fallbacks("", "/home/u"),
+            "/home/u/.npm-global/bin:/home/u/.local/bin:/usr/local/bin"
+        );
+    }
+
+    #[test]
     fn flags_parse_pairs_and_bools() {
         let args = [
             "--bind".to_string(),
@@ -4893,7 +5016,7 @@ mod tests {
         assert!(run_plan(&f2).unwrap_err().contains("checkout-pr requires --pr-number"));
 
         let mut f3: HashMap<String, String> = HashMap::new();
-        f3.insert("thinking".to_string(), "high".to_string());
+        f3.insert("worktree-slug".to_string(), "slug".to_string());
         assert!(run_plan(&f3).unwrap_err().contains("not supported"));
 
         let mut f4: HashMap<String, String> = HashMap::new();
@@ -4964,5 +5087,46 @@ mod tests {
         let (flags, _) = parse_flags(&["-a".to_string(), "-g".to_string(), "ls".to_string()]);
         assert_eq!(flags.get("all").map(String::as_str), Some("true"));
         assert_eq!(flags.get("global").map(String::as_str), Some("true"));
+    }
+
+    #[test]
+    fn validate_run_options_rejects_unknown_key_and_bad_values() {
+        let ok: BTreeMap<String, String> = BTreeMap::new();
+        assert_eq!(validate_run_options(&ok).unwrap(), ok);
+
+        let mut unknown: BTreeMap<String, String> = BTreeMap::new();
+        unknown.insert("bogus".to_string(), "1".to_string());
+        assert_eq!(
+            validate_run_options(&unknown).unwrap_err(),
+            "unknown run option: bogus"
+        );
+
+        let mut thinking: BTreeMap<String, String> = BTreeMap::new();
+        thinking.insert("thinking".to_string(), "bogus".to_string());
+        assert!(validate_run_options(&thinking).unwrap_err().contains("none|low|medium|high"));
+
+        let mut mode: BTreeMap<String, String> = BTreeMap::new();
+        mode.insert("mode".to_string(), "x".to_string());
+        assert!(validate_run_options(&mode).unwrap_err().contains("read-only|workspace-write|danger-full-access"));
+
+        let mut schema: BTreeMap<String, String> = BTreeMap::new();
+        schema.insert("output_schema".to_string(), "/nope".to_string());
+        assert!(validate_run_options(&schema).unwrap_err().contains("not a JSON object with type"));
+    }
+
+    #[test]
+    fn run_plan_no_longer_rejects_provider_flags() {
+        let mut f: HashMap<String, String> = HashMap::new();
+        f.insert("thinking".to_string(), "high".to_string());
+        f.insert("mode".to_string(), "read-only".to_string());
+        f.insert("provider".to_string(), "ollama".to_string());
+        let plan = run_plan(&f).unwrap();
+        assert_eq!(plan.options.get("thinking").map(String::as_str), Some("high"));
+        assert_eq!(plan.options.get("mode").map(String::as_str), Some("read-only"));
+        assert_eq!(plan.options.get("provider").map(String::as_str), Some("ollama"));
+
+        let mut w: HashMap<String, String> = HashMap::new();
+        w.insert("worktree-slug".to_string(), "slug".to_string());
+        assert!(run_plan(&w).unwrap_err().contains("not supported"));
     }
 }

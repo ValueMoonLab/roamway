@@ -764,6 +764,10 @@ struct NewRun {
     prompt: String,
     #[serde(default, alias = "timeout_secs")]
     timeout_s: Option<u64>,
+    #[serde(default)]
+    options: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    images: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -838,6 +842,10 @@ struct NewAgent {
     worktree_mode: Option<String>,
     #[serde(default)]
     pr_number: Option<String>,
+    #[serde(default)]
+    options: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    images: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -926,6 +934,10 @@ struct ContinueAgent {
     prompt: String,
     #[serde(default)]
     timeout_s: Option<u64>,
+    #[serde(default)]
+    options: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    images: Option<Vec<String>>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1593,7 +1605,7 @@ fn hub_hook_route(app: &Arc<App>, req: &Req, trigger_id: &str) -> (u16, Value) {
     }
 
     let spec = trigger.agent_spec.clone();
-    match agents::create_agent_and_run(app, &spec.provider, None, Some(spec.cwd.clone()), None, &spec.prompt, 1800, false, None, None, BTreeMap::new(), Vec::new(), None) {
+    match agents::create_agent_and_run(app, &spec.provider, None, Some(spec.cwd.clone()), None, &spec.prompt, 1800, false, None, None, BTreeMap::new(), Vec::new(), None, BTreeMap::new(), Vec::new()) {
         Ok((_agent, run)) => {
             agents::tag_run_trigger(app, &run.id, trigger_id);
             let mut rt = app.hub_rt.lock().unwrap_or_else(|e| e.into_inner());
@@ -1686,6 +1698,16 @@ fn agent_session_route(app: &Arc<App>, id: &str) -> (u16, Value) {
 }
 
 fn create_agent_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
+    let raw: Value = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
+        Err(e) => return (400, json!({ "error": format!("bad json: {}", e) })),
+    };
+    if raw.get("images").map(|v| !v.is_array()).unwrap_or(false) {
+        return (400, json!({ "error": "images must be an array of paths" }));
+    }
+    if raw.get("options").map(|v| !v.is_object()).unwrap_or(false) {
+        return (400, json!({ "error": "options must be an object" }));
+    }
     let spec: NewAgent = match serde_json::from_slice(&req.body) {
         Ok(v) => v,
         Err(e) => return (400, json!({ "error": format!("bad json: {}", e) })),
@@ -1718,6 +1740,24 @@ fn create_agent_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         },
         None => None,
     };
+    let options = match crate::validate_run_options(&spec.options.unwrap_or_default()) {
+        Ok(o) => o,
+        Err(e) => return (400, json!({ "error": e })),
+    };
+    let images = spec.images.unwrap_or_default();
+    for img in &images {
+        if let Err(e) = crate::validate_image_path(img) {
+            return (400, json!({ "error": e }));
+        }
+    }
+    if let Err(e) = crate::runner::provider_args(
+        &kind,
+        &options,
+        &images,
+        options.get("mode").map(String::as_str),
+    ) {
+        return (400, json!({ "error": e }));
+    }
     match agents::create_agent_and_run(
         app,
         &kind,
@@ -1732,6 +1772,8 @@ fn create_agent_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         labels,
         env,
         cwd,
+        options,
+        images,
     ) {
         Ok((agent, run)) => (200, json!({ "agent": agent, "run": run })),
         Err(e) => (400, json!({ "error": e })),
@@ -1804,6 +1846,16 @@ fn detach_agent_route(app: &Arc<App>, id: &str) -> (u16, Value) {
 }
 
 fn continue_agent_route(app: &Arc<App>, id: &str, req: &Req) -> (u16, Value) {
+    let raw: Value = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
+        Err(e) => return (400, json!({ "error": format!("bad json: {}", e) })),
+    };
+    if raw.get("images").map(|v| !v.is_array()).unwrap_or(false) {
+        return (400, json!({ "error": "images must be an array of paths" }));
+    }
+    if raw.get("options").map(|v| !v.is_object()).unwrap_or(false) {
+        return (400, json!({ "error": "options must be an object" }));
+    }
     let spec: ContinueAgent = match serde_json::from_slice(&req.body) {
         Ok(v) => v,
         Err(e) => return (400, json!({ "error": format!("bad json: {}", e) })),
@@ -1815,6 +1867,16 @@ fn continue_agent_route(app: &Arc<App>, id: &str, req: &Req) -> (u16, Value) {
     if !valid_timeout_s(timeout_s) {
         return (400, json!({ "error": "timeout_s must be in 1..=21600" }));
     }
+    let options = match crate::validate_run_options(&spec.options.unwrap_or_default()) {
+        Ok(o) => o,
+        Err(e) => return (400, json!({ "error": e })),
+    };
+    let images = spec.images.unwrap_or_default();
+    for img in &images {
+        if let Err(e) = crate::validate_image_path(img) {
+            return (400, json!({ "error": e }));
+        }
+    }
     let exists = {
         let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
         st.state.agents.iter().any(|a| a.id == id)
@@ -1822,7 +1884,24 @@ fn continue_agent_route(app: &Arc<App>, id: &str, req: &Req) -> (u16, Value) {
     if !exists {
         return (404, json!({ "error": "no such agent" }));
     }
-    match agents::queue_agent_run(app, id, &spec.prompt, timeout_s) {
+    let agent_kind = {
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        st.state
+            .agents
+            .iter()
+            .find(|a| a.id == id)
+            .map(|a| a.kind.clone())
+            .unwrap_or_default()
+    };
+    if let Err(e) = crate::runner::provider_args(
+        &agent_kind,
+        &options,
+        &images,
+        options.get("mode").map(String::as_str),
+    ) {
+        return (400, json!({ "error": e }));
+    }
+    match agents::queue_agent_run(app, id, &spec.prompt, timeout_s, options, images) {
         Ok(run) => {
             let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
             let agent = st.state.agents.iter().find(|a| a.id == id).cloned();
@@ -2260,6 +2339,16 @@ fn remove_workspace_route(app: &Arc<App>, name: &str) -> (u16, Value) {
 }
 
 fn create_run(app: &Arc<App>, req: &Req) -> (u16, Value) {
+    let raw: Value = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
+        Err(e) => return (400, json!({"error": format!("bad json: {}", e)})),
+    };
+    if raw.get("images").map(|v| !v.is_array()).unwrap_or(false) {
+        return (400, json!({"error": "images must be an array of paths"}));
+    }
+    if raw.get("options").map(|v| !v.is_object()).unwrap_or(false) {
+        return (400, json!({"error": "options must be an object"}));
+    }
     let spec: NewRun = match serde_json::from_slice(&req.body) {
         Ok(v) => v,
         Err(e) => return (400, json!({"error": format!("bad json: {}", e)})),
@@ -2273,6 +2362,24 @@ fn create_run(app: &Arc<App>, req: &Req) -> (u16, Value) {
     let timeout_s = spec.timeout_s.unwrap_or(1800);
     if !valid_timeout_s(timeout_s) {
         return (400, json!({"error": "timeout_s must be in 1..=21600"}));
+    }
+    let options = match crate::validate_run_options(&spec.options.unwrap_or_default()) {
+        Ok(o) => o,
+        Err(e) => return (400, json!({"error": e})),
+    };
+    let images = spec.images.unwrap_or_default();
+    for img in &images {
+        if let Err(e) = crate::validate_image_path(img) {
+            return (400, json!({"error": e}));
+        }
+    }
+    if let Err(e) = crate::runner::provider_args(
+        &spec.agent,
+        &options,
+        &images,
+        options.get("mode").map(String::as_str),
+    ) {
+        return (400, json!({"error": e}));
     }
     let workspace = match spec.workspace.clone().filter(|w| !w.trim().is_empty()) {
         Some(w) => {
@@ -2315,6 +2422,8 @@ fn create_run(app: &Arc<App>, req: &Req) -> (u16, Value) {
             labels: BTreeMap::new(),
             env: Vec::new(),
             cwd: None,
+            options: options.clone(),
+            images: images.clone(),
         };
         st.state.runs.push(r.clone());
         jobs::prune(&mut st);
@@ -2966,6 +3075,8 @@ mod tests {
             labels: BTreeMap::new(),
             env: Vec::new(),
             cwd: None,
+            options: BTreeMap::new(),
+            images: Vec::new(),
         };
         let store = Store {
             dir: dir.clone(),
@@ -3056,6 +3167,8 @@ mod tests {
             labels: BTreeMap::new(),
             env: Vec::new(),
             cwd: None,
+            options: BTreeMap::new(),
+            images: Vec::new(),
         };
         let store = Store {
             dir: dir.to_path_buf(),

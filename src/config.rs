@@ -609,6 +609,8 @@ mod tests {
             labels: BTreeMap::new(),
             env: Vec::new(),
             cwd: None,
+            options: BTreeMap::new(),
+            images: Vec::new(),
         }
     }
 
