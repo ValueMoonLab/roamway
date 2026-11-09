@@ -31,7 +31,7 @@ pub fn iso(ts: i64) -> String {
     )
 }
 
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
     let doe = (z - era * 146097) as i64;
@@ -321,6 +321,7 @@ fn sync_parent_dir(_p: &Path) -> std::io::Result<()> {
 
 pub struct App {
     pub store: Mutex<Store>,
+    pub schedules: Mutex<crate::schedules::ScheduleStore>,
     pub token: Option<String>,
     pub started: i64,
     pub cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,

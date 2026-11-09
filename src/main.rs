@@ -1,9 +1,12 @@
 mod agents;
+mod cron;
 mod hosts;
 mod jobs;
 mod runner;
+mod schedules;
 mod server;
 mod types;
+mod workspaces;
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -17,7 +20,7 @@ use std::thread;
 use std::time::Duration;
 use types::*;
 
-const BOOLS: &[&str] = &["no-wait", "quiet", "json", "allow-overlap", "disabled", "help", "force", "probe", "all"];
+const BOOLS: &[&str] = &["no-wait", "quiet", "json", "allow-overlap", "disabled", "help", "force", "probe", "all", "worktree", "keep-worktree", "run-now", "overlap", "enabled"];
 
 fn usage() {
     println!(
@@ -25,15 +28,18 @@ fn usage() {
 
   roamway serve  [--bind 127.0.0.1:8796] [--data DIR] [--token T] [--tz 8] [--max-concurrent 4] [--max-conn 64]
   roamway run    --agent codex [--model M] [--workspace DIR] [--title T] [--timeout 1800] [--no-wait] [--host H] "prompt"
-  roamway agent run <prompt> [--title --workspace --model --kind --no-wait]
-  roamway agent ls|inspect|logs|wait|attach|archive|reload|update|open|detach|import
+  roamway clone  <owner/repo | git url> [--dir DIR] [--protocol https|ssh] [--json] [--host H]
+  roamway agent run <prompt> [--title --workspace --model --kind --worktree --no-wait]
+  roamway agent ls|inspect|logs|wait|attach|archive [--keep-worktree]|reload|update|open|detach|import
   roamway attach|inspect|wait|archive|import <id>   # 顶层别名
   roamway ls     [--limit 20] [--host H|all]
-  roamway status ID [--host H]
+  roamway status [ID] [--json] [--host H]
   roamway logs   ID [--tail 80] [--host H]
   roamway stop   ID [--host H]
   roamway rm     ID
   roamway jobs
+  roamway schedule create|ls|inspect|logs|pause|resume|delete|run-once|update [--host H]
+  roamway hooks [--json] [--host H]
   roamway jobs-add --agent shell --every 3600 | --daily 08:30 [--model M] [--workspace DIR] [--max-retries 2] "prompt"
   roamway jobs-run ID
   roamway jobs-rm  ID
@@ -44,6 +50,10 @@ fn usage() {
   roamway daemon status|config|start|stop|restart|reload|pair
   roamway onboard [--bind 0.0.0.0:8796]
   roamway restart | reload
+
+运维扩展：
+  roamway workspace ls [--json]
+  roamway workspace rm <name>
 
 通用参数：--host http://127.0.0.1:8796  --token T
 环境变量：ROAMWAY_HOST / ROAMWAY_TOKEN / ROAMWAY_DEEPSEEK_KEY / ROAMWAY_QWEN_KEY
@@ -328,9 +338,19 @@ fn main() {
     let (flags, pos) = parse_flags(&argv[1..]);
     match cmd.as_str() {
         "serve" => cmd_serve(&flags),
+        "clone" => cmd_clone(&flags, &pos),
+        "workspace" => cmd_workspace(&flags, &pos),
         "run" => cmd_run(&flags, &pos),
         "ls" | "list" => cmd_ls(&flags),
-        "status" => cmd_status(&flags, &pos),
+        "status" => {
+            if pos.is_empty() {
+                cmd_status_summary(&flags);
+            } else {
+                cmd_status(&flags, &pos);
+            }
+        }
+        "schedule" => cmd_schedule(&flags, &pos),
+        "hooks" => cmd_hooks(&flags),
         "agent" => cmd_agent(&flags, &pos),
         "attach" => cmd_agent_attach(&flags, &pos),
         "inspect" => cmd_agent_inspect(&flags, &pos),
@@ -427,8 +447,10 @@ fn cmd_serve(flags: &HashMap<String, String>) {
 
     let store = Store::load(&data);
     let loaded_ok = store.loaded_ok;
+    let schedule_store = schedules::ScheduleStore::load(&data);
     let app = Arc::new(App {
         store: Mutex::new(store),
+        schedules: Mutex::new(schedule_store),
         token: token.clone(),
         started: now(),
         cancels: Mutex::new(HashMap::new()),
@@ -442,6 +464,7 @@ fn cmd_serve(flags: &HashMap<String, String>) {
     }
 
     jobs::start_scheduler(app.clone());
+    schedules::start_scheduler(app.clone());
 
     let hb = app.clone();
     thread::spawn(move || loop {
@@ -742,6 +765,255 @@ fn cmd_jobs_rm(flags: &HashMap<String, String>, pos: &[String]) {
     }
 }
 
+fn cmd_schedule(flags: &HashMap<String, String>, pos: &[String]) {
+    match pos.first().map(String::as_str).unwrap_or("help") {
+        "create" => cmd_schedule_create(flags, &pos[1..]),
+        "ls" | "list" => cmd_schedule_ls(flags),
+        "inspect" | "show" => cmd_schedule_inspect(flags, &pos[1..]),
+        "logs" => cmd_schedule_logs(flags, &pos[1..]),
+        "pause" => cmd_schedule_pause(flags, &pos[1..]),
+        "resume" => cmd_schedule_resume(flags, &pos[1..]),
+        "delete" | "rm" | "remove" => cmd_schedule_delete(flags, &pos[1..]),
+        "run-once" | "run" => cmd_schedule_run_once(flags, &pos[1..]),
+        "update" => cmd_schedule_update(flags, &pos[1..]),
+        _ => eprintln!(
+            "usage: roamway schedule create|ls|inspect|logs|pause|resume|delete|run-once|update ..."
+        ),
+    }
+}
+
+fn cmd_schedule_create(flags: &HashMap<String, String>, pos: &[String]) {
+    let name = flags.get("name").cloned().unwrap_or_default();
+    if name.trim().is_empty() {
+        eprintln!("--name is required");
+        return;
+    }
+    let prompt = pos.join(" ");
+    let prompt = if prompt.trim().is_empty() {
+        flags.get("prompt").cloned().unwrap_or_default()
+    } else {
+        prompt
+    };
+    if prompt.trim().is_empty() {
+        eprintln!("prompt is required");
+        return;
+    }
+    let body = json!({
+        "name": name,
+        "prompt": prompt,
+        "agent": flags.get("agent"),
+        "model": flags.get("model"),
+        "workspace": flags.get("workspace"),
+        "cron": flags.get("cron"),
+        "every": flags.get("every"),
+        "timezone": flags.get("tz"),
+        "max_runs": flags.get("max-runs").and_then(|v| v.parse::<u64>().ok()),
+        "expires_in": flags.get("expires-in").and_then(|v| v.parse::<i64>().ok()),
+        "run_now": flags.contains_key("run-now"),
+        "overlap": flags.contains_key("overlap"),
+    });
+    match request(flags, "POST", "/v1/schedules", Some(body)) {
+        Ok(v) => {
+            if flags.contains_key("json") {
+                println!("{}", serde_json::to_string_pretty(&v["schedule"]).unwrap_or_default());
+            } else {
+                let s = &v["schedule"];
+                println!(
+                    "created {} {}\tnext={}",
+                    s["id"].as_str().unwrap_or(""),
+                    s["name"].as_str().unwrap_or(""),
+                    s["next_run_at"].as_i64().map(iso).unwrap_or_else(|| "-".into())
+                );
+            }
+        }
+        Err(e) => eprintln!("schedule create failed: {}", e),
+    }
+}
+
+fn cmd_schedule_ls(flags: &HashMap<String, String>) {
+    let path = if flags.contains_key("all") {
+        "/v1/schedules?all=1"
+    } else {
+        "/v1/schedules"
+    };
+    match request(flags, "GET", path, None) {
+        Ok(v) => {
+            if flags.contains_key("json") {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                return;
+            }
+            let empty = vec![];
+            let scheds = v["schedules"].as_array().unwrap_or(&empty);
+            println!(
+                "{:<13} {:<20} {:<26} {:<6} {:<26} {}",
+                "ID", "NAME", "NEXT", "RUNS", "LAST", "CRON"
+            );
+            for s in scheds {
+                println!(
+                    "{:<13} {:<20} {:<26} {:<6} {:<26} {}",
+                    s["id"].as_str().unwrap_or(""),
+                    trunc(s["name"].as_str().unwrap_or(""), 20),
+                    s["next_run_at"].as_i64().map(iso).unwrap_or_else(|| "-".into()),
+                    s["runs_count"].as_u64().unwrap_or(0),
+                    s["last_run_at"].as_i64().map(iso).unwrap_or_else(|| "-".into()),
+                    trunc(s["cron"].as_str().unwrap_or("-"), 24)
+                );
+            }
+        }
+        Err(e) => eprintln!("schedule ls failed: {}", e),
+    }
+}
+
+fn cmd_schedule_inspect(flags: &HashMap<String, String>, pos: &[String]) {
+    let key = match pos.first() {
+        Some(k) => k,
+        None => return eprintln!("usage: roamway schedule inspect <id|name> [--json]"),
+    };
+    match request(flags, "GET", &format!("/v1/schedules/{}", key), None) {
+        Ok(v) => {
+            if flags.contains_key("json") {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                return;
+            }
+            println!("{}", serde_json::to_string_pretty(&v["schedule"]).unwrap_or_default());
+            let empty = vec![];
+            let runs = v["runs"].as_array().unwrap_or(&empty);
+            println!("{:<12} {:<10} {:<26} {}", "RUN", "STATUS", "CREATED", "ERROR");
+            for r in runs {
+                println!(
+                    "{:<12} {:<10} {:<26} {}",
+                    r["id"].as_str().unwrap_or(""),
+                    r["status"].as_str().unwrap_or(""),
+                    r["created_at"].as_i64().map(iso).unwrap_or_else(|| "-".into()),
+                    trunc(r["error"].as_str().unwrap_or(""), 40)
+                );
+            }
+        }
+        Err(e) => eprintln!("schedule inspect failed: {}", e),
+    }
+}
+
+fn cmd_schedule_logs(flags: &HashMap<String, String>, pos: &[String]) {
+    let key = match pos.first() {
+        Some(k) => k,
+        None => return eprintln!("usage: roamway schedule logs <id|name> [--tail 20]"),
+    };
+    let tail = flags.get("tail").cloned().unwrap_or_else(|| "20".into());
+    match request(flags, "GET", &format!("/v1/schedules/{}/logs?tail={}", key, tail), None) {
+        Ok(v) => {
+            if flags.contains_key("json") {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+            } else {
+                println!("{}", v["logs"].as_str().unwrap_or(""));
+            }
+        }
+        Err(e) => eprintln!("schedule logs failed: {}", e),
+    }
+}
+
+fn cmd_schedule_pause(flags: &HashMap<String, String>, pos: &[String]) {
+    let key = match pos.first() {
+        Some(k) => k,
+        None => return eprintln!("usage: roamway schedule pause <id|name>"),
+    };
+    match request(flags, "POST", &format!("/v1/schedules/{}/pause", key), Some(json!({}))) {
+        Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
+        Err(e) => eprintln!("schedule pause failed: {}", e),
+    }
+}
+
+fn cmd_schedule_resume(flags: &HashMap<String, String>, pos: &[String]) {
+    let key = match pos.first() {
+        Some(k) => k,
+        None => return eprintln!("usage: roamway schedule resume <id|name>"),
+    };
+    match request(flags, "POST", &format!("/v1/schedules/{}/resume", key), Some(json!({}))) {
+        Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
+        Err(e) => eprintln!("schedule resume failed: {}", e),
+    }
+}
+
+fn cmd_schedule_delete(flags: &HashMap<String, String>, pos: &[String]) {
+    let key = match pos.first() {
+        Some(k) => k,
+        None => return eprintln!("usage: roamway schedule delete <id|name>"),
+    };
+    match request(flags, "DELETE", &format!("/v1/schedules/{}", key), None) {
+        Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
+        Err(e) => eprintln!("schedule delete failed: {}", e),
+    }
+}
+
+fn cmd_schedule_run_once(flags: &HashMap<String, String>, pos: &[String]) {
+    let key = match pos.first() {
+        Some(k) => k,
+        None => return eprintln!("usage: roamway schedule run-once <id|name>"),
+    };
+    match request(flags, "POST", &format!("/v1/schedules/{}/run", key), Some(json!({}))) {
+        Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
+        Err(e) => eprintln!("schedule run-once failed: {}", e),
+    }
+}
+
+fn cmd_schedule_update(flags: &HashMap<String, String>, pos: &[String]) {
+    let key = match pos.first() {
+        Some(k) => k,
+        None => return eprintln!("usage: roamway schedule update <id|name> [--cron|--every|--prompt|--max-runs|--tz|--enabled]"),
+    };
+    let mut body = json!({
+        "name": flags.get("name"),
+        "cron": flags.get("cron"),
+        "every": flags.get("every"),
+        "prompt": flags.get("prompt"),
+        "max_runs": flags.get("max-runs").and_then(|v| v.parse::<u64>().ok()),
+        "timezone": flags.get("tz"),
+        "enabled": flags.contains_key("enabled").then(|| true),
+    });
+    if flags.contains_key("disabled") {
+        body["enabled"] = json!(false);
+    }
+    match request(flags, "PATCH", &format!("/v1/schedules/{}", key), Some(body)) {
+        Ok(v) => println!("{}", serde_json::to_string_pretty(&v["schedule"]).unwrap_or_default()),
+        Err(e) => eprintln!("schedule update failed: {}", e),
+    }
+}
+
+fn cmd_hooks(flags: &HashMap<String, String>) {
+    match request(flags, "GET", "/v1/hooks", None) {
+        Ok(v) => println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default()),
+        Err(e) => eprintln!("hooks failed: {}", e),
+    }
+}
+
+fn cmd_status_summary(flags: &HashMap<String, String>) {
+    match request(flags, "GET", "/v1/status", None) {
+        Ok(v) => {
+            if flags.contains_key("json") {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                return;
+            }
+            println!("version   {}", v["version"].as_str().unwrap_or("-"));
+            println!("uptime    {}s", v["uptime"].as_u64().unwrap_or(0));
+            println!("running   {}", v["running"].as_u64().unwrap_or(0));
+            println!("queued    {}", v["queued"].as_u64().unwrap_or(0));
+            println!("max_conn  {}", v["max_concurrent"].as_u64().unwrap_or(0));
+            println!(
+                "schedules {} (enabled {})",
+                v["schedules"].as_u64().unwrap_or(0),
+                v["enabled_schedules"].as_u64().unwrap_or(0)
+            );
+            println!(
+                "next_run  {}",
+                v["next_run_at"].as_i64().map(iso).unwrap_or_else(|| "-".into())
+            );
+            println!(
+                "last_fail {}",
+                v["last_failure"].as_i64().map(iso).unwrap_or_else(|| "-".into())
+            );
+        }
+        Err(e) => eprintln!("status failed: {}", e),
+    }
+}
 fn cmd_health(flags: &HashMap<String, String>) {
     let c = local_client(flags);
     match c.req("GET", "/health", None) {
@@ -751,6 +1023,141 @@ fn cmd_health(flags: &HashMap<String, String>) {
 }
 
 
+
+fn print_workspaces_table(text: &str) {
+    let v: Value = serde_json::from_str(text).unwrap_or_else(|_| json!({}));
+    let empty = vec![];
+    let workspaces = v["workspaces"].as_array().unwrap_or(&empty);
+    println!(
+        "{:<10} {:<16} {:<26} {:<8} {}",
+        "ID", "NAME", "PATH", "HOST", "CREATED"
+    );
+    for w in workspaces {
+        println!(
+            "{:<10} {:<16} {:<26} {:<8} {}",
+            w["id"].as_str().unwrap_or(""),
+            w["name"].as_str().unwrap_or(""),
+            w["path"].as_str().unwrap_or(""),
+            w["host"].as_str().unwrap_or(""),
+            w["created_at"].as_i64().map(iso).unwrap_or_else(|| "-".into())
+        );
+    }
+}
+
+fn cmd_clone(flags: &HashMap<String, String>, pos: &[String]) {
+    let input = match pos.first() {
+        Some(i) if !i.trim().is_empty() => i.clone(),
+        _ => {
+            eprintln!("usage: roamway clone <owner/repo | git url> [--dir DIR] [--protocol https|ssh] [--json] [--host H]");
+            return;
+        }
+    };
+    let protocol = flags.get("protocol").cloned().unwrap_or_else(|| "https".into());
+    let dir = flags.get("dir").cloned();
+    if let Some(h) = resolve_host(flags) {
+        let body = json!({"input": input, "dir": dir, "protocol": protocol});
+        let body_str = serde_json::to_string(&body).unwrap_or_default();
+        match hosts::dispatch(&h, "POST", "/v1/workspaces/clone", Some(&body_str)) {
+            Ok((code, text)) if (200..300).contains(&code) => {
+                let v: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
+                if flags.contains_key("json") {
+                    println!("{}", serde_json::to_string_pretty(&v["workspace"]).unwrap_or_default());
+                } else {
+                    println!(
+                        "cloned {} → {}",
+                        v["workspace"]["name"].as_str().unwrap_or(""),
+                        v["workspace"]["path"].as_str().unwrap_or("")
+                    );
+                }
+            }
+            Ok((code, text)) => eprintln!("clone failed: HTTP {}: {}", code, text),
+            Err(e) => eprintln!("clone failed: {}", e),
+        }
+        return;
+    }
+    match workspaces::clone_repo(&data_dir_for(flags), &input, dir.as_deref(), &protocol) {
+        Ok(ws) => {
+            if flags.contains_key("json") {
+                println!("{}", serde_json::to_string_pretty(&ws).unwrap_or_default());
+            } else {
+                println!("cloned {} → {}", ws.name, ws.path);
+            }
+        }
+        Err(e) => eprintln!("clone failed: {}", e),
+    }
+}
+
+fn cmd_workspace(flags: &HashMap<String, String>, pos: &[String]) {
+    match pos.first().map(String::as_str).unwrap_or("help") {
+        "ls" | "list" => cmd_workspace_ls(flags),
+        "rm" | "remove" => cmd_workspace_rm(flags, &pos[1..]),
+        _ => eprintln!("usage: roamway workspace ls [--json] | workspace rm <name>"),
+    }
+}
+
+fn cmd_workspace_ls(flags: &HashMap<String, String>) {
+    if let Some(h) = resolve_host(flags) {
+        match hosts::dispatch(&h, "GET", "/v1/workspaces", None) {
+            Ok((code, text)) if (200..300).contains(&code) => {
+                if flags.contains_key("json") {
+                    println!("{}", text);
+                } else {
+                    print_workspaces_table(&text);
+                }
+            }
+            Ok((code, text)) => eprintln!("workspace ls failed: HTTP {}: {}", code, text),
+            Err(e) => eprintln!("workspace ls failed: {}", e),
+        }
+        return;
+    }
+    let reg = workspaces::Registry::load(&data_dir_for(flags));
+    if flags.contains_key("json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({"workspaces": reg.workspaces})).unwrap_or_default()
+        );
+        return;
+    }
+    println!(
+        "{:<10} {:<16} {:<26} {:<8} {}",
+        "ID", "NAME", "PATH", "HOST", "CREATED"
+    );
+    for w in &reg.workspaces {
+        println!(
+            "{:<10} {:<16} {:<26} {:<8} {}",
+            w.id,
+            w.name,
+            w.path,
+            w.host,
+            iso(w.created_at)
+        );
+    }
+}
+
+fn cmd_workspace_rm(flags: &HashMap<String, String>, pos: &[String]) {
+    let name = match pos.first() {
+        Some(n) if !n.trim().is_empty() => n,
+        _ => return eprintln!("usage: roamway workspace rm <name>"),
+    };
+    if let Some(h) = resolve_host(flags) {
+        let path = format!("/v1/workspaces/{}", name);
+        match hosts::dispatch(&h, "DELETE", &path, None) {
+            Ok((code, text)) if (200..300).contains(&code) => println!("{}", text),
+            Ok((code, text)) => eprintln!("workspace rm failed: HTTP {}: {}", code, text),
+            Err(e) => eprintln!("workspace rm failed: {}", e),
+        }
+        return;
+    }
+    let mut reg = workspaces::Registry::load(&data_dir_for(flags));
+    if reg.remove(name) {
+        match reg.save() {
+            Ok(()) => println!("removed {}", name),
+            Err(e) => eprintln!("workspace rm failed: {}", e),
+        }
+    } else {
+        eprintln!("no such workspace: {}", name);
+    }
+}
 fn cmd_run_remote(h: &hosts::Host, flags: &HashMap<String, String>, pos: &[String]) {
     let mut prompt = pos.join(" ");
     if prompt.trim().is_empty() {
@@ -1153,6 +1560,7 @@ fn cmd_agent_run(flags: &HashMap<String, String>, pos: &[String]) {
         "workspace": flags.get("workspace"),
         "title": flags.get("title"),
         "prompt": prompt,
+        "worktree": flags.contains_key("worktree"),
     });
     let v = match request(flags, "POST", "/v1/agents", Some(body)) {
         Ok(v) => v,
@@ -1339,7 +1747,12 @@ fn cmd_agent_archive(flags: &HashMap<String, String>, pos: &[String]) {
         Some(i) => i,
         None => return eprintln!("usage: roamway archive <id>"),
     };
-    match request(flags, "DELETE", &format!("/v1/agents/{}", id), None) {
+    let path = if flags.contains_key("keep-worktree") {
+        format!("/v1/agents/{}?keep-worktree=1", id)
+    } else {
+        format!("/v1/agents/{}", id)
+    };
+    match request(flags, "DELETE", &path, None) {
         Ok(v) => {
             if flags.contains_key("json") {
                 println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());

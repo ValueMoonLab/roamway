@@ -609,7 +609,8 @@ fn finalize(app: &Arc<App>, id: &str, status: RunStatus, code: Option<i32>, err:
         Some(i) => i,
         None => return,
     };
-    let job_id = {
+    let result_err = err.clone();
+    let (job_id, result_status) = {
         let r = &mut st.state.runs[idx];
         if r.status == RunStatus::Killed {
             // stop 已判 killed：自然退出/超时都不允许覆盖
@@ -624,8 +625,12 @@ fn finalize(app: &Arc<App>, id: &str, status: RunStatus, code: Option<i32>, err:
                 r.error = err;
             }
         }
-        r.job_id.clone()
+        (r.job_id.clone(), r.status)
     };
+    let schedule_id = job_id
+        .as_deref()
+        .filter(|j| j.starts_with("sch_"))
+        .map(str::to_string);
     if let Some(jid) = job_id {
         let bad = matches!(status, RunStatus::Failed | RunStatus::Timeout);
         let t = now();
@@ -647,8 +652,12 @@ fn finalize(app: &Arc<App>, id: &str, status: RunStatus, code: Option<i32>, err:
     }
     st.save();
     drop(st);
+    if let Some(sid) = schedule_id {
+        crate::schedules::record_result(app, &sid, result_status, result_err);
+    }
     remove_cancel(app, id);
 }
+
 
 #[cfg(test)]
 mod tests {

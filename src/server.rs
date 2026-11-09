@@ -1,7 +1,9 @@
 use crate::agents;
 use crate::hosts;
 use crate::jobs;
+use crate::schedules;
 use crate::types::*;
+use crate::workspaces;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -449,6 +451,16 @@ struct NewJob {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct NewClone {
+    input: String,
+    #[serde(default)]
+    dir: Option<String>,
+    #[serde(default)]
+    protocol: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct NewAgent {
     #[serde(default)]
     title: Option<String>,
@@ -461,6 +473,8 @@ struct NewAgent {
     prompt: String,
     #[serde(default)]
     timeout_s: Option<u64>,
+    #[serde(default)]
+    worktree: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -489,6 +503,62 @@ struct PatchAgent {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct NewSchedule {
+    name: String,
+    prompt: String,
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    cron: Option<String>,
+    #[serde(default)]
+    every: Option<String>,
+    #[serde(default)]
+    timezone: Option<String>,
+    #[serde(default)]
+    max_runs: Option<u64>,
+    #[serde(default)]
+    expires_in: Option<i64>,
+    #[serde(default)]
+    run_now: Option<bool>,
+    #[serde(default)]
+    overlap: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PatchSchedule {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    agent: Option<String>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    workspace: Option<String>,
+    #[serde(default)]
+    cron: Option<String>,
+    #[serde(default)]
+    every: Option<String>,
+    #[serde(default)]
+    timezone: Option<String>,
+    #[serde(default)]
+    max_runs: Option<u64>,
+    #[serde(default)]
+    expires_in: Option<i64>,
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    overlap: Option<bool>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ContinueAgent {
     prompt: String,
     #[serde(default)]
@@ -506,6 +576,9 @@ fn route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         ("GET", ["health"]) => (200, health(app)),
         ("GET", ["v1", "health"]) => (200, v1_health(app)),
         ("GET", ["v1", "hosts"]) => list_hosts(app),
+        ("GET", ["v1", "workspaces"]) => list_workspaces_route(app),
+        ("POST", ["v1", "workspaces", "clone"]) => clone_workspace_route(app, req),
+        ("DELETE", ["v1", "workspaces", name]) => remove_workspace_route(app, name),
         ("GET", ["v1", "runs"]) => list_runs(app, req),
         ("POST", ["v1", "runs"]) => create_run(app, req),
         ("GET", ["v1", "runs", id]) => get_run(app, id),
@@ -542,12 +615,22 @@ fn route(app: &Arc<App>, req: &Req) -> (u16, Value) {
                 (404, json!({"error": "no such job"}))
             }
         }
-        ("GET", ["v1", "agents"]) => list_agents_route(app, req),
+        ("GET", ["v1", "schedules"]) => list_schedules(app, req),
+        ("POST", ["v1", "schedules"]) => create_schedule(app, req),
+        ("GET", ["v1", "schedules", id]) => get_schedule(app, id),
+        ("PATCH", ["v1", "schedules", id]) => patch_schedule(app, id, req),
+        ("DELETE", ["v1", "schedules", id]) => delete_schedule(app, id),
+        ("POST", ["v1", "schedules", id, "run"]) => run_schedule(app, id),
+        ("POST", ["v1", "schedules", id, "pause"]) => pause_schedule(app, id),
+        ("POST", ["v1", "schedules", id, "resume"]) => resume_schedule(app, id),
+        ("GET", ["v1", "schedules", id, "logs"]) => schedule_logs(app, req, id),
+        ("GET", ["v1", "status"]) => status_route(app),
+        ("GET", ["v1", "hooks"]) => hooks_route(app),        ("GET", ["v1", "agents"]) => list_agents_route(app, req),
         ("POST", ["v1", "agents"]) => create_agent_route(app, req),
         ("POST", ["v1", "agents", "import"]) => import_agent_route(app, req),
         ("GET", ["v1", "agents", id]) => get_agent_route(app, id),
         ("PATCH", ["v1", "agents", id]) => patch_agent_route(app, id, req),
-        ("DELETE", ["v1", "agents", id]) => archive_agent_route(app, id),
+        ("DELETE", ["v1", "agents", id]) => archive_agent_route(app, id, req),
         ("POST", ["v1", "agents", id, "reload"]) => reload_agent_route(app, id),
         ("POST", ["v1", "agents", id, "run"]) => continue_agent_route(app, id, req),
         ("POST", ["v1", "agents", id, "detach"]) => detach_agent_route(app, id),
@@ -556,6 +639,365 @@ fn route(app: &Arc<App>, req: &Req) -> (u16, Value) {
     }
 }
 
+fn list_schedules(app: &Arc<App>, req: &Req) -> (u16, Value) {
+    let all = query_true(req, "all");
+    let ss = app.schedules.lock().unwrap_or_else(|e| e.into_inner());
+    let schedules: Vec<&schedules::Schedule> = ss
+        .schedules
+        .iter()
+        .filter(|s| all || s.enabled)
+        .collect();
+    (200, json!({ "schedules": schedules }))
+}
+
+fn validate_schedule_input(
+    app: &Arc<App>,
+    cron: Option<&str>,
+    every: Option<&str>,
+    timezone: Option<&str>,
+) -> Result<(String, u64, String), String> {
+    let cron = cron.map(|s| s.trim().to_string()).unwrap_or_default();
+    let every_secs = match every {
+        Some(e) => schedules::parse_every(e).ok_or_else(|| "every must be like 30s|5m|2h|1d".to_string())?,
+        None => 0,
+    };
+    if every_secs > 0 && !cron.is_empty() {
+        return Err("provide either cron or every, not both".into());
+    }
+    if every_secs == 0 && cron.is_empty() {
+        return Err("one of cron / every is required".into());
+    }
+    let tz = timezone
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| schedules::offset_to_tz(app.tz_offset_hours));
+    let offset = crate::cron::timezone_offset_secs(&tz)
+        .map_err(|e| format!("timezone '{}': {}", tz, e))?;
+    if every_secs == 0 {
+        let expr = crate::cron::parse_cron(&cron).map_err(|e| e)?;
+        if expr.next_after(now(), offset).is_none() {
+            return Err("cron never matches within 366 days".into());
+        }
+    }
+    Ok((cron, every_secs, tz))
+}
+
+fn create_schedule(app: &Arc<App>, req: &Req) -> (u16, Value) {
+    let spec: NewSchedule = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
+        Err(e) => return (400, json!({ "error": format!("bad json: {}", e) })),
+    };
+    let name = spec.name.trim().to_string();
+    if name.is_empty() {
+        return (400, json!({ "error": "name is required" }));
+    }
+    if spec.prompt.trim().is_empty() {
+        return (400, json!({ "error": "prompt is required" }));
+    }
+    let agent = spec.agent.clone().unwrap_or_else(|| "shell".into());
+    if !is_known_agent(&agent) {
+        return (400, json!({ "error": "unknown agent" }));
+    }
+    let (cron, every_secs, tz) =
+        match validate_schedule_input(app, spec.cron.as_deref(), spec.every.as_deref(), spec.timezone.as_deref()) {
+            Ok(v) => v,
+            Err(e) => return (400, json!({ "error": e })),
+        };
+    let workspace = match spec.workspace.clone().filter(|w| !w.trim().is_empty()) {
+        Some(w) => {
+            let resolved = resolve_workspace_input(app, &w);
+            match canonicalize_dir(&resolved) {
+                Some(abs) => abs,
+                None => return (400, json!({ "error": "workspace not found", "path": w })),
+            }
+        }
+        None => std::env::current_dir()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|_| ".".into()),
+    };
+    let max_runs = spec.max_runs.unwrap_or(0);
+    let expires_at = spec.expires_in.map(|s| now() + s);
+    let overlap = spec.overlap.unwrap_or(false);
+    let t = now();
+    let next_run_at = if every_secs > 0 {
+        Some(t + every_secs as i64)
+    } else {
+        crate::cron::parse_cron(&cron)
+            .ok()
+            .and_then(|c| c.next_after(t, crate::cron::timezone_offset_secs(&tz).unwrap_or(0)))
+    };
+    let schedule = schedules::Schedule {
+        id: schedules::gen_schedule_id(),
+        name,
+        agent_kind: agent,
+        prompt: spec.prompt,
+        workspace,
+        model: spec.model.unwrap_or_default(),
+        cron,
+        every_secs,
+        timezone: tz,
+        enabled: true,
+        paused: false,
+        max_runs,
+        runs_count: 0,
+        expires_at,
+        created_at: t,
+        next_run_at,
+        last_run_at: None,
+        last_status: String::new(),
+        consecutive_failures: 0,
+        overlap,
+    };
+    {
+        let mut ss = app.schedules.lock().unwrap_or_else(|e| e.into_inner());
+        if ss.schedules.iter().any(|s| s.name == schedule.name) {
+            return (409, json!({ "error": "schedule name already exists" }));
+        }
+        ss.schedules.push(schedule.clone());
+        ss.save();
+    }
+    if spec.run_now.unwrap_or(false) {
+        let _ = schedules::run_once(app, &schedule.id);
+    }
+    (200, json!({ "schedule": schedule }))
+}
+
+fn get_schedule(app: &Arc<App>, id: &str) -> (u16, Value) {
+    let (schedule, runs) = {
+        let ss = app.schedules.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(s) = schedules::find(&ss, id) else {
+            return (404, json!({ "error": "no such schedule" }));
+        };
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        let mut runs: Vec<&Run> = st
+            .state
+            .runs
+            .iter()
+            .filter(|r| r.job_id.as_deref() == Some(s.id.as_str()))
+            .collect();
+        runs.sort_by(|x, y| y.created_at.cmp(&x.created_at));
+        let runs: Vec<Value> = runs.into_iter().take(5).map(agent_run_summary).collect();
+        (s.clone(), runs)
+    };
+    (200, json!({ "schedule": schedule, "runs": runs }))
+}
+
+fn patch_schedule(app: &Arc<App>, id: &str, req: &Req) -> (u16, Value) {
+    let spec: PatchSchedule = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
+        Err(e) => return (400, json!({ "error": format!("bad json: {}", e) })),
+    };
+    let mut ss = app.schedules.lock().unwrap_or_else(|e| e.into_inner());
+    // 重名检查必须在拿可变借用之前做完，否则 E0502
+    let target_id = match schedules::find(&ss, id) {
+        Some(s) => s.id.clone(),
+        None => return (404, json!({ "error": "no such schedule" })),
+    };
+    if let Some(n) = spec.name.as_deref() {
+        let n = n.trim().to_string();
+        if n.is_empty() {
+            return (400, json!({ "error": "name must not be empty" }));
+        }
+        if ss.schedules.iter().any(|x| x.id != target_id && x.name == n) {
+            return (409, json!({ "error": "schedule name already exists" }));
+        }
+    }
+    let Some(s) = schedules::find_mut(&mut ss, &target_id) else {
+        return (404, json!({ "error": "no such schedule" }));
+    };
+    if let Some(n) = spec.name {
+        s.name = n.trim().to_string();
+    }
+    if let Some(a) = spec.agent {
+        if !is_known_agent(&a) {
+            return (400, json!({ "error": "unknown agent" }));
+        }
+        s.agent_kind = a;
+    }
+    if let Some(p) = spec.prompt {
+        if p.trim().is_empty() {
+            return (400, json!({ "error": "prompt must not be empty" }));
+        }
+        s.prompt = p;
+    }
+    if let Some(m) = spec.model {
+        s.model = m;
+    }
+    if let Some(w) = spec.workspace {
+        let resolved = resolve_workspace_input(app, &w);
+        match canonicalize_dir(&resolved) {
+            Some(abs) => s.workspace = abs,
+            None => return (400, json!({ "error": "workspace not found", "path": w })),
+        }
+    }
+    if let Some(mr) = spec.max_runs {
+        s.max_runs = mr;
+    }
+    if let Some(ei) = spec.expires_in {
+        s.expires_at = Some(now() + ei);
+    }
+    if let Some(ov) = spec.overlap {
+        s.overlap = ov;
+    }
+    if let Some(en) = spec.enabled {
+        s.enabled = en;
+    }
+    let cron = spec.cron.as_deref();
+    let every = spec.every.as_deref();
+    let tz = spec.timezone.as_deref();
+    if cron.is_some() || every.is_some() || tz.is_some() {
+        let current_cron = if cron.is_some() {
+            cron.map(|x| x.trim().to_string())
+        } else if every.is_some() {
+            None
+        } else {
+            Some(s.cron.clone())
+        };
+        let current_every = if every.is_some() {
+            every.map(|x| x.trim().to_string())
+        } else if cron.is_some() {
+            None
+        } else if s.every_secs > 0 {
+            Some(format!("{}s", s.every_secs))
+        } else {
+            None
+        };
+        let current_tz = tz.map(|x| x.trim().to_string()).or_else(|| Some(s.timezone.clone()));
+        let (new_cron, new_every, new_tz) = match validate_schedule_input(
+            app,
+            current_cron.as_deref(),
+            current_every.as_deref(),
+            current_tz.as_deref(),
+        ) {
+            Ok(v) => v,
+            Err(e) => return (400, json!({ "error": e })),
+        };
+        s.cron = new_cron;
+        s.every_secs = new_every;
+        s.timezone = new_tz;
+        if s.enabled && !s.paused {
+            s.next_run_at = schedules::schedule_next_after(s, now());
+        }
+    }
+    let out = s.clone();
+    ss.save();
+    (200, json!({ "schedule": out }))
+}
+
+fn delete_schedule(app: &Arc<App>, id: &str) -> (u16, Value) {
+    match schedules::delete(app, id) {
+        Ok(out) => (200, json!({ "ok": true, "removed": out })),
+        Err(e) => (404, json!({ "error": e })),
+    }
+}
+
+fn run_schedule(app: &Arc<App>, id: &str) -> (u16, Value) {
+    match schedules::run_once(app, id) {
+        Ok(sid) => (200, json!({ "ok": true, "triggered": sid })),
+        Err(e) => (404, json!({ "error": e })),
+    }
+}
+
+fn pause_schedule(app: &Arc<App>, id: &str) -> (u16, Value) {
+    match schedules::pause(app, id) {
+        Ok(s) => (200, json!({ "ok": true, "schedule": s })),
+        Err(e) => (404, json!({ "error": e })),
+    }
+}
+
+fn resume_schedule(app: &Arc<App>, id: &str) -> (u16, Value) {
+    match schedules::resume(app, id) {
+        Ok(s) => (200, json!({ "ok": true, "schedule": s })),
+        Err(e) => (404, json!({ "error": e })),
+    }
+}
+
+fn schedule_logs(app: &Arc<App>, req: &Req, id: &str) -> (u16, Value) {
+    let tail = req
+        .query
+        .get("tail")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(20)
+        .clamp(1, 200);
+    let schedule = {
+        let ss = app.schedules.lock().unwrap_or_else(|e| e.into_inner());
+        match schedules::find(&ss, id) {
+            Some(s) => s.clone(),
+            None => return (404, json!({ "error": "no such schedule" })),
+        }
+    };
+    let mut runs: Vec<Run> = {
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        st.state
+            .runs
+            .iter()
+            .filter(|r| r.job_id.as_deref() == Some(schedule.id.as_str()))
+            .cloned()
+            .collect()
+    };
+    runs.sort_by(|x, y| y.created_at.cmp(&x.created_at));
+    runs.truncate(tail);
+    let mut logs = String::new();
+    for r in runs.iter().rev() {
+        let lp = {
+            let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+            st.log_path(&r.id)
+        };
+        if let Ok(text) = std::fs::read_to_string(&lp) {
+            if !logs.is_empty() {
+                logs.push_str("\n---\n");
+            }
+            logs.push_str(&format!("== {} ==\n{}", r.id, text));
+        }
+    }
+    let runs: Vec<Value> = runs.iter().map(agent_run_summary).collect();
+    (200, json!({ "schedule": schedule, "tail": tail, "runs": runs, "logs": logs }))
+}
+
+fn status_route(app: &Arc<App>) -> (u16, Value) {
+    let (running, queued) = {
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        let running = st.state.runs.iter().filter(|r| r.status == RunStatus::Running).count();
+        let queued = st.state.runs.iter().filter(|r| r.status == RunStatus::Queued).count();
+        (running, queued)
+    };
+    let ss = app.schedules.lock().unwrap_or_else(|e| e.into_inner());
+    let enabled: Vec<&schedules::Schedule> = ss.schedules.iter().filter(|s| s.enabled && !s.paused).collect();
+    let next_run_at = enabled.iter().filter_map(|s| s.next_run_at).min();
+    let last_failure = ss
+        .schedules
+        .iter()
+        .filter_map(|s| {
+            if s.consecutive_failures > 0 {
+                s.last_run_at
+            } else {
+                None
+            }
+        })
+        .max();
+    (200, json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime": now() - app.started,
+        "running": running,
+        "queued": queued,
+        "max_concurrent": app.max_concurrent,
+        "schedules": ss.schedules.len(),
+        "enabled_schedules": enabled.len(),
+        "next_run_at": next_run_at,
+        "last_failure": last_failure,
+    }))
+}
+
+fn hooks_route(app: &Arc<App>) -> (u16, Value) {
+    let ss = app.schedules.lock().unwrap_or_else(|e| e.into_inner());
+    (200, json!({
+        "config": {
+            "schedule_trigger": ["run"],
+            "agent_lifecycle": ["queued", "running", "done", "failed", "timeout"]
+        },
+        "records": ss.hooks,
+    }))
+}
 fn query_true(req: &Req, key: &str) -> bool {
     req.query
         .get(key)
@@ -618,14 +1060,20 @@ fn create_agent_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
     if !valid_timeout_s(timeout_s) {
         return (400, json!({ "error": "timeout_s must be in 1..=21600" }));
     }
+    let workspace = spec
+        .workspace
+        .clone()
+        .filter(|w| !w.trim().is_empty())
+        .map(|w| resolve_workspace_input(app, &w));
     match agents::create_agent_and_run(
         app,
         &kind,
         spec.model,
-        spec.workspace,
+        workspace,
         spec.title,
         &spec.prompt,
         timeout_s,
+        spec.worktree.unwrap_or(false),
     ) {
         Ok((agent, run)) => (200, json!({ "agent": agent, "run": run })),
         Err(e) => (400, json!({ "error": e })),
@@ -664,9 +1112,10 @@ fn patch_agent_route(app: &Arc<App>, id: &str, req: &Req) -> (u16, Value) {
     }
 }
 
-fn archive_agent_route(app: &Arc<App>, id: &str) -> (u16, Value) {
-    match agents::archive_agent(app, id) {
-        Ok(()) => (200, json!({ "ok": true, "archived": id })),
+fn archive_agent_route(app: &Arc<App>, id: &str, req: &Req) -> (u16, Value) {
+    let keep_worktree = query_true(req, "keep-worktree");
+    match agents::archive_agent(app, id, keep_worktree) {
+        Ok(()) => (200, json!({ "ok": true, "archived": id, "keep_worktree": keep_worktree })),
         Err(e) => (404, json!({ "error": e })),
     }
 }
@@ -867,6 +1316,64 @@ fn canonicalize_dir(path: &str) -> Option<String> {
         .map(|p| p.to_string_lossy().to_string())
 }
 
+/// A workspace argument may be an absolute path, a relative path, or a name
+/// registered in `<data>/workspaces.json`.
+fn resolve_workspace_input(app: &Arc<App>, input: &str) -> String {
+    let data_dir = {
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        st.dir.clone()
+    };
+    let reg = workspaces::Registry::load(&data_dir);
+    match reg.get(input) {
+        Some(ws) => ws.path.clone(),
+        None => input.to_string(),
+    }
+}
+
+fn list_workspaces_route(app: &Arc<App>) -> (u16, Value) {
+    let data_dir = {
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        st.dir.clone()
+    };
+    let reg = workspaces::Registry::load(&data_dir);
+    (200, json!({ "workspaces": reg.workspaces }))
+}
+
+fn clone_workspace_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
+    let spec: NewClone = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
+        Err(e) => return (400, json!({ "error": format!("bad json: {}", e) })),
+    };
+    if spec.input.trim().is_empty() {
+        return (400, json!({ "error": "input is required" }));
+    }
+    let data_dir = {
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        st.dir.clone()
+    };
+    let protocol = spec.protocol.unwrap_or_else(|| "https".into());
+    match workspaces::clone_repo(&data_dir, &spec.input, spec.dir.as_deref(), &protocol) {
+        Ok(ws) => (200, json!({ "workspace": ws })),
+        Err(e) => (400, json!({ "error": e })),
+    }
+}
+
+fn remove_workspace_route(app: &Arc<App>, name: &str) -> (u16, Value) {
+    let data_dir = {
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        st.dir.clone()
+    };
+    let mut reg = workspaces::Registry::load(&data_dir);
+    if reg.remove(name) {
+        match reg.save() {
+            Ok(()) => (200, json!({ "ok": true, "removed": name })),
+            Err(e) => (500, json!({ "error": format!("save workspaces.json failed: {}", e) })),
+        }
+    } else {
+        (404, json!({ "error": "no such workspace" }))
+    }
+}
+
 fn create_run(app: &Arc<App>, req: &Req) -> (u16, Value) {
     let spec: NewRun = match serde_json::from_slice(&req.body) {
         Ok(v) => v,
@@ -883,10 +1390,13 @@ fn create_run(app: &Arc<App>, req: &Req) -> (u16, Value) {
         return (400, json!({"error": "timeout_s must be in 1..=21600"}));
     }
     let workspace = match spec.workspace.clone().filter(|w| !w.trim().is_empty()) {
-        Some(w) => match canonicalize_dir(&w) {
-            Some(abs) => abs,
-            None => return (400, json!({"error": "workspace not found", "path": w})),
-        },
+        Some(w) => {
+            let resolved = resolve_workspace_input(app, &w);
+            match canonicalize_dir(&resolved) {
+                Some(abs) => abs,
+                None => return (400, json!({"error": "workspace not found", "path": w})),
+            }
+        }
         None => std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".into()),
@@ -1060,10 +1570,13 @@ fn create_job(app: &Arc<App>, req: &Req) -> (u16, Value) {
     }
     let tz = spec.tz_offset_hours.unwrap_or(app.tz_offset_hours);
     let workspace = match spec.workspace.clone().filter(|w| !w.trim().is_empty()) {
-        Some(w) => match canonicalize_dir(&w) {
-            Some(abs) => abs,
-            None => return (400, json!({"error": "workspace not found", "path": w})),
-        },
+        Some(w) => {
+            let resolved = resolve_workspace_input(app, &w);
+            match canonicalize_dir(&resolved) {
+                Some(abs) => abs,
+                None => return (400, json!({"error": "workspace not found", "path": w})),
+            }
+        }
         None => std::env::current_dir()
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".into()),
@@ -1229,6 +1742,7 @@ mod tests {
         };
         let app = Arc::new(App {
             store: std::sync::Mutex::new(store),
+            schedules: std::sync::Mutex::new(Default::default()),
             token: None,
             started: now(),
             cancels: std::sync::Mutex::new(HashMap::new()),
@@ -1282,6 +1796,7 @@ mod tests {
         };
         Arc::new(App {
             store: std::sync::Mutex::new(store),
+            schedules: std::sync::Mutex::new(Default::default()),
             token: None,
             started: now(),
             cancels: std::sync::Mutex::new(HashMap::new()),

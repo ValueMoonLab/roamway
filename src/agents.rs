@@ -28,6 +28,12 @@ pub struct Agent {
     pub updated_at: i64,
     pub last_run_id: String,
     pub last_error: String,
+    #[serde(default)]
+    pub worktree: bool,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub base_path: Option<String>,
 }
 
 static AGENT_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -188,6 +194,7 @@ pub fn create_agent_and_run(
     title: Option<String>,
     prompt: &str,
     timeout_s: u64,
+    use_worktree: bool,
 ) -> Result<(Agent, Run), String> {
     if !is_known_agent(kind) {
         return Err("unknown agent".into());
@@ -196,17 +203,39 @@ pub fn create_agent_and_run(
         return Err("prompt is required".into());
     }
     let ws = default_workspace(workspace)?;
+    let data_dir = {
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        st.dir.clone()
+    };
+    let id = {
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        let mut id = gen_agent_id();
+        while st.state.agents.iter().any(|a| a.id == id) {
+            id = gen_agent_id();
+        }
+        id
+    };
+    let (agent_workspace, worktree, branch, base_path) = if use_worktree {
+        let root = crate::workspaces::git_repo_root(&ws)?;
+        let path = crate::workspaces::worktree_path(&data_dir, &id);
+        let branch = crate::workspaces::worktree_branch(&id);
+        crate::workspaces::worktree_add(&root, &path, &branch)?;
+        (
+            path.to_string_lossy().to_string(),
+            true,
+            Some(branch),
+            Some(root),
+        )
+    } else {
+        (ws, false, None, None)
+    };
     let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
-    let mut id = gen_agent_id();
-    while st.state.agents.iter().any(|a| a.id == id) {
-        id = gen_agent_id();
-    }
     let mut agent = Agent {
         id: id.clone(),
         title: title.unwrap_or_else(|| title_from_prompt(prompt)),
         kind: kind.to_string(),
         model: model.unwrap_or_default(),
-        workspace: ws,
+        workspace: agent_workspace,
         session_id: String::new(),
         state: "running".into(),
         parent: String::new(),
@@ -215,6 +244,9 @@ pub fn create_agent_and_run(
         updated_at: now(),
         last_run_id: String::new(),
         last_error: String::new(),
+        worktree,
+        branch,
+        base_path,
     };
     let run = push_run_locked(&mut st, &mut agent, prompt, timeout_s)?;
     st.state.agents.push(agent.clone());
@@ -314,7 +346,41 @@ pub fn update_agent_meta(
     Ok(out)
 }
 
-pub fn archive_agent(app: &Arc<App>, agent_id: &str) -> Result<(), String> {
+pub fn archive_agent(app: &Arc<App>, agent_id: &str, keep_worktree: bool) -> Result<(), String> {
+    let (cleanup, data_dir) = {
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        let a = st
+            .state
+            .agents
+            .iter()
+            .find(|a| a.id == agent_id)
+            .ok_or_else(|| "no such agent".to_string())?;
+        (
+            !keep_worktree
+                && a.worktree
+                && a.branch.is_some()
+                && a.base_path.is_some()
+                && !a.workspace.is_empty(),
+            st.dir.clone(),
+        )
+    };
+    if cleanup {
+        let (branch, base_path, workspace) = {
+            let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+            let a = st.state.agents.iter().find(|a| a.id == agent_id).unwrap();
+            (
+                a.branch.clone().unwrap_or_default(),
+                a.base_path.clone().unwrap_or_default(),
+                a.workspace.clone(),
+            )
+        };
+        let wt = crate::workspaces::worktree_path(&data_dir, agent_id);
+        let path = std::path::Path::new(&workspace);
+        let path = if path.exists() { path.to_path_buf() } else { wt };
+        if let Err(e) = crate::workspaces::worktree_remove(&base_path, &path, &branch) {
+            return Err(format!("archive failed: {}", e));
+        }
+    }
     let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
     let a = st
         .state
@@ -378,6 +444,9 @@ pub fn import_agent(
         updated_at: now(),
         last_run_id: String::new(),
         last_error: String::new(),
+        worktree: false,
+        branch: None,
+        base_path: None,
     };
     st.state.agents.push(agent.clone());
     st.save();
@@ -403,6 +472,9 @@ mod tests {
             updated_at: 0,
             last_run_id: String::new(),
             last_error: String::new(),
+            worktree: false,
+            branch: None,
+            base_path: None,
         }
     }
 
