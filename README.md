@@ -54,11 +54,18 @@ cargo build --release
 # 3. 派任务（另一个终端）
 ROAMWAY="./target/release/roamway --token mysecret"
 $ROAMWAY run  --agent shell --title hello "echo hi from roamway"
-$ROAMWAY ls
+$ROAMWAY ls                 # 默认 agent 维度；--runs 看运行记录
 $ROAMWAY logs run_000001
 ```
 
-`run` 默认前台等待并打印尾部日志；长任务加 `--no-wait`，只拿 run id 就走。
+`run` 默认前台等待并打印尾部日志；长任务加 `--no-wait`，只拿 run id 就走。`ls` 默认列出 agent（`ID/STATE/KIND/...`），要回看历史运行记录用 `ls --runs`。
+
+
+worktree 隔离示例（在独立分支跑，不污染当前工作区）：
+
+```bash
+$ROAMWAY run --new-workspace worktree --label stage=p12 --env FOO=1 --agent shell "echo hi"
+```
 
 ## 安装
 

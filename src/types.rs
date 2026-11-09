@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use crate::auth;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -61,6 +61,16 @@ pub const KNOWN_AGENTS: &[&str] = &["shell", "codex", "hermes", "claude", "api:d
 
 pub fn is_known_agent(agent: &str) -> bool {
     KNOWN_AGENTS.contains(&agent.trim())
+}
+
+/// `--env` 的 key 必须是 `[A-Za-z_][A-Za-z0-9_]*`（ASCII 标识符，避免 shell 注入）
+pub fn is_valid_env_key(key: &str) -> bool {
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// 下一次「本地钟点」的时间戳（用固定时区偏移，不依赖系统 tz 数据）
@@ -147,6 +157,12 @@ pub struct Run {
     pub trigger_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<RunUsage>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<(String, String)>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -508,6 +524,9 @@ mod tests {
             agent_id: None,
             trigger_id: None,
             usage: None,
+            labels: BTreeMap::new(),
+            env: Vec::new(),
+            cwd: None,
         };
         let state = State {
             runs: vec![run],

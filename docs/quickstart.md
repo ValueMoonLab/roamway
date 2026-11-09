@@ -38,7 +38,7 @@ roamway run --agent codex --workspace /path/to/repo "修好失败的测试并说
 ## 4. 看列表与状态
 
 ```bash
-roamway ls                   # 最近 run（--json / -o json 输出 JSON）
+roamway ls                   # 默认列 agent（ID/STATE/KIND/...）；--runs 看运行记录
 roamway status <run-id>
 ```
 

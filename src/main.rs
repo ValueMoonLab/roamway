@@ -17,7 +17,7 @@ mod usage;
 mod web;
 
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::net::{TcpStream, ToSocketAddrs};
@@ -28,7 +28,7 @@ use std::thread;
 use std::time::Duration;
 use types::*;
 
-const BOOLS: &[&str] = &["no-wait", "quiet", "json", "allow-overlap", "disabled", "help", "force", "probe", "all", "worktree", "keep-worktree", "run-now", "overlap", "enabled", "enter", "no-enter", "stdin", "no-browser", "no-headers", "no-color", "version"];
+const BOOLS: &[&str] = &["no-wait", "quiet", "json", "allow-overlap", "disabled", "help", "force", "probe", "all", "worktree", "keep-worktree", "run-now", "overlap", "enabled", "enter", "no-enter", "stdin", "no-browser", "no-headers", "no-color", "runs", "background", "global", "version"];
 
 static FAIL_CODE: AtomicI32 = AtomicI32::new(0);
 
@@ -48,10 +48,10 @@ fn usage() {
 核心：
   roamway serve  [--bind 127.0.0.1:8796] [--data DIR] [--token T] [--tz 8] [--max-concurrent 4] [--max-conn 64]
   roamway start                                  # = daemon start
-  roamway run    --agent codex [--model M] [--workspace DIR] [--title T] [--timeout 1800] [--no-wait] [--host H] "prompt"
+  roamway run    --agent codex [--model M] [--workspace DIR] [--title T] [--timeout 1800] [--no-wait] [--wait-timeout N] [--new-workspace local|worktree] [--worktree-mode branch-off|checkout-branch|checkout-pr] [--cwd DIR] [--env K=V] [--label k=v] [--host H] "prompt"
   roamway send   <agent-id> <prompt...>          # 续跑 agent
   roamway delete <id> [--yes]                    # 运行中先 stop 再硬删
-  roamway ls     [--limit 20] [--host H|all] [--trigger ID]
+  roamway ls     [--limit 50] [-a|--all] [-g|--global] [--label k=v] [--kind K] [--host H|all] [--json|--format table|json|yaml] [-q] [--no-headers] ; --runs 看运行记录
   roamway status [ID]
   roamway logs   ID [--tail 80]
   roamway stop   ID
@@ -131,6 +131,16 @@ fn parse_flags(args: &[String]) -> (HashMap<String, String>, Vec<String>) {
                     i += 1;
                     continue;
                 }
+                "a" => {
+                    push_flag(&mut flags, "all", "true".into());
+                    i += 1;
+                    continue;
+                }
+                "g" => {
+                    push_flag(&mut flags, "global", "true".into());
+                    i += 1;
+                    continue;
+                }
                 _ => {}
             }
         }
@@ -169,6 +179,176 @@ fn flag_many(flags: &HashMap<String, String>, key: &str) -> Vec<String> {
         .get(key)
         .map(|v| v.split('\u{1f}').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
         .unwrap_or_default()
+}
+
+
+fn percent_encode(input: &str) -> String {
+    let mut out = String::new();
+    for b in input.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// `--label k=v` 解析；key 不能为空，值可含 `=`
+fn parse_labels(vals: &[String]) -> Result<BTreeMap<String, String>, String> {
+    let mut out = BTreeMap::new();
+    for v in vals {
+        let (k, val) = v
+            .split_once('=')
+            .ok_or_else(|| format!("label must be k=v: {}", v))?;
+        if k.is_empty() {
+            return Err(format!("label key must not be empty: {}", v));
+        }
+        out.insert(k.to_string(), val.to_string());
+    }
+    Ok(out)
+}
+
+/// `--env K=V` 解析；key 必须是合法环境变量名
+fn parse_env(vals: &[String]) -> Result<Vec<(String, String)>, String> {
+    let mut out = Vec::new();
+    for v in vals {
+        let (k, val) = v
+            .split_once('=')
+            .ok_or_else(|| format!("env must be K=V: {}", v))?;
+        if !is_valid_env_key(k) {
+            return Err(format!("invalid env key: {}", k));
+        }
+        out.push((k.to_string(), val.to_string()));
+    }
+    Ok(out)
+}
+
+#[derive(Debug)]
+struct RunPlan {
+    kind: String,
+    model: Option<String>,
+    workspace: Option<String>,
+    title: Option<String>,
+    timeout_s: Option<u64>,
+    worktree: bool,
+    worktree_mode: Option<String>,
+    pr_number: Option<String>,
+    labels: BTreeMap<String, String>,
+    env: Vec<(String, String)>,
+    cwd: Option<String>,
+    wait_timeout: Option<u64>,
+}
+
+/// 把 `run` 的 flags 收敛成 RunPlan；先校验不支持项，避免无效请求打到服务端
+fn run_plan(flags: &HashMap<String, String>) -> Result<RunPlan, String> {
+    for f in [
+        "thinking", "mode", "image", "output-schema", "provider", "worktree-slug", "new-branch",
+        "base", "branch",
+    ] {
+        if flags.contains_key(f) {
+            return Err(format!("run --{}: not supported by roamway", f));
+        }
+    }
+    let worktree_mode = flags.get("worktree-mode").cloned();
+    if let Some(m) = worktree_mode.as_deref() {
+        if !matches!(m, "branch-off" | "checkout-branch" | "checkout-pr") {
+            return Err(format!(
+                "run --worktree-mode: expected branch-off, checkout-branch or checkout-pr, got {}",
+                m
+            ));
+        }
+    }
+    if worktree_mode.as_deref() == Some("checkout-pr")
+        && flags.get("pr-number").map(|p| p.is_empty()).unwrap_or(true)
+    {
+        return Err("checkout-pr requires --pr-number".to_string());
+    }
+    let mut worktree = matches!(worktree_mode.as_deref(), Some("branch-off") | Some("checkout-branch"));
+    if let Some(v) = flags.get("new-workspace") {
+        match v.as_str() {
+            "worktree" => worktree = true,
+            "local" => worktree = false,
+            other => {
+                return Err(format!("run --new-workspace: expected local or worktree, got {}", other))
+            }
+        }
+    }
+    Ok(RunPlan {
+        kind: flags.get("agent").cloned().unwrap_or_else(|| "codex".into()),
+        model: flags.get("model").cloned(),
+        workspace: flags.get("workspace").cloned(),
+        title: flags.get("title").cloned(),
+        timeout_s: flags.get("timeout").and_then(|v| v.parse::<u64>().ok()),
+        worktree,
+        worktree_mode,
+        pr_number: flags.get("pr-number").cloned().filter(|p| !p.is_empty()),
+        labels: parse_labels(&flag_many(flags, "label"))?,
+        env: parse_env(&flag_many(flags, "env"))?,
+        cwd: flags.get("cwd").cloned().filter(|c| !c.is_empty()),
+        wait_timeout: flags.get("wait-timeout").and_then(|v| v.parse::<u64>().ok()),
+    })
+}
+
+/// 构造 `POST /v1/agents` 的 body，避免字段所有权被 json! 移动
+fn run_body(plan: &RunPlan, prompt: &str) -> Value {
+    json!({
+        "kind": plan.kind.clone(),
+        "model": plan.model.clone(),
+        "workspace": plan.workspace.clone(),
+        "title": plan.title.clone(),
+        "prompt": prompt,
+        "timeout_s": plan.timeout_s,
+        "worktree": plan.worktree,
+        "labels": plan.labels.clone(),
+        "env": plan.env.clone(),
+        "cwd": plan.cwd.clone(),
+        "worktree_mode": plan.worktree_mode.clone(),
+        "pr_number": plan.pr_number.clone(),
+    })
+}
+
+struct LsPlan {
+    runs: bool,
+    global: bool,
+    all: bool,
+    labels: Vec<String>,
+    limit: usize,
+    kind: Option<String>,
+}
+
+fn ls_plan(flags: &HashMap<String, String>) -> LsPlan {
+    LsPlan {
+        runs: flags.contains_key("runs"),
+        global: flags.contains_key("global"),
+        all: flags.contains_key("all"),
+        labels: flag_many(flags, "label"),
+        limit: flags
+            .get("limit")
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(50)
+            .clamp(1, 500),
+        kind: flags.get("kind").cloned().filter(|k| !k.is_empty()),
+    }
+}
+
+/// `GET /v1/agents` 的查询串；label 值把 `=` 编码为 `%3D`，顺序固定便于断言
+fn agent_list_url(plan: &LsPlan) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if plan.all {
+        parts.push("all=1".to_string());
+    }
+    for l in &plan.labels {
+        parts.push(format!("label={}", percent_encode(l)));
+    }
+    parts.push(format!("limit={}", plan.limit));
+    if let Some(kind) = plan.kind.as_deref() {
+        parts.push(format!("kind={}", percent_encode(kind)));
+    }
+    if parts.is_empty() {
+        "/v1/agents".to_string()
+    } else {
+        format!("/v1/agents?{}", parts.join("&"))
+    }
 }
 
 fn format_is_json(flags: &HashMap<String, String>) -> bool {
@@ -609,10 +789,10 @@ fn print_command_help(cmd: &str) -> bool {
         "usage" => "roamway usage [ls [--since 7d|24h|ISO] [--provider id]|inspect <run_id>] [--json]",
         "plugin" => "roamway plugin ls|init <name>|logs <name>|reload <name>|enable|disable <name> [--trust]|remove <name> [--keep-files]",
         "speech" => "roamway speech [transcribe <file>|say <text> [--out file]]",
-        "run" => "roamway run --agent codex [--model M] [--workspace DIR] [--title T] [--timeout 1800] [--no-wait] [--host H] \"prompt\"",
+        "run" => "roamway run --agent codex [--model M] [--workspace DIR] [--title T] [--timeout 1800] [--no-wait] [--wait-timeout N] [--new-workspace local|worktree] [--worktree-mode branch-off|checkout-branch|checkout-pr] [--pr-number N] [--cwd DIR] [--env K=V] [--label k=v] [--host H] \"prompt\"",
         "send" => "roamway send <agent-id> <prompt...>",
         "delete" => "roamway delete <id> [--yes]",
-        "ls" | "list" => "roamway ls [--limit 20] [--host H|all] [--trigger ID] [--json|--format table|json|yaml]",
+        "ls" | "list" => "roamway ls [--limit 50] [-a|--all] [-g|--global] [--label k=v] [--kind K] [--host H|all] [-q] [--no-headers] [--json|--format table|json|yaml] ; --runs 看运行记录",
         "status" => "roamway status [ID] [--json] [--host H]",
         "schedule" => "roamway schedule create|ls|inspect|logs|pause|resume|delete|run-once|update [--host H]",
         "hooks" => "roamway hooks [--json] [--host H]",
@@ -906,47 +1086,29 @@ fn cmd_serve(flags: &HashMap<String, String>) {
     }
 }
 
-fn cmd_run(flags: &HashMap<String, String>, pos: &[String]) {
-    let mut prompt = pos.join(" ");
-    if prompt.trim().is_empty() {
-        prompt = flags.get("prompt").cloned().unwrap_or_default();
-    }
-    if prompt.trim().is_empty() {
-        usage_error("prompt required");
-        return;
-    }
-    if let Some(h) = resolve_host(flags) {
-        cmd_run_remote(&h, flags, &pos);
-        return;
-    }
-    let c = local_client(flags);
-    let body = json!({
-        "agent": flags.get("agent").cloned().unwrap_or_else(|| "codex".into()),
-        "model": flags.get("model"),
-        "workspace": flags.get("workspace"),
-        "title": flags.get("title"),
-        "prompt": prompt,
-        "timeout_s": flags.get("timeout").and_then(|v| v.parse::<u64>().ok()),
-    });
-    let v = match c.req("POST", "/v1/runs", Some(body)) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("dispatch failed: {}", e);
-            return;
-        }
-    };
-    let id = v["run"]["id"].as_str().unwrap_or("").to_string();
-    if flags.contains_key("no-wait") {
-        println!("{}", id);
-        return;
-    }
+fn wait_run(
+    flags: &HashMap<String, String>,
+    id: &str,
+    wait_timeout: Option<u64>,
+    fetch_status: &mut dyn FnMut(&str) -> Result<Value, String>,
+    fetch_log: &mut dyn FnMut(&str) -> Result<Value, String>,
+) {
     let started = std::time::Instant::now();
+    let mut last_status = String::from("?");
     loop {
+        if let Some(n) = wait_timeout {
+            if started.elapsed().as_secs() > n {
+                eprintln!("wait timeout after {}s; run {} still {}", n, id, last_status);
+                fail(1);
+                return;
+            }
+        }
         thread::sleep(Duration::from_secs(2));
-        match c.req("GET", &format!("/v1/runs/{}", id), None) {
+        match fetch_status(id) {
             Ok(v) => {
-                let st = v["run"]["status"].as_str().unwrap_or("?");
-                if matches!(st, "done" | "failed" | "timeout" | "killed" | "interrupted") {
+                let st = v["run"]["status"].as_str().unwrap_or("?").to_string();
+                last_status = st.clone();
+                if matches!(st.as_str(), "done" | "failed" | "timeout" | "killed" | "interrupted") {
                     let err = v["run"]["error"].as_str().unwrap_or("");
                     println!(
                         "{}\t{}\t{}s{}",
@@ -959,7 +1121,7 @@ fn cmd_run(flags: &HashMap<String, String>, pos: &[String]) {
                             format!("\t{}", err)
                         }
                     );
-                    if let Ok(l) = c.req("GET", &format!("/v1/runs/{}/log?tail=40", id), None) {
+                    if let Ok(l) = fetch_log(id) {
                         println!("---");
                         println!("{}", l["log"].as_str().unwrap_or(""));
                     }
@@ -978,6 +1140,49 @@ fn cmd_run(flags: &HashMap<String, String>, pos: &[String]) {
     }
 }
 
+fn cmd_run(flags: &HashMap<String, String>, pos: &[String]) {
+    let mut prompt = pos.join(" ");
+    if prompt.trim().is_empty() {
+        prompt = flags.get("prompt").cloned().unwrap_or_default();
+    }
+    if prompt.trim().is_empty() {
+        usage_error("prompt required");
+        return;
+    }
+    let plan = match run_plan(flags) {
+        Ok(p) => p,
+        Err(e) => {
+            usage_error(&e);
+            return;
+        }
+    };
+    if let Some(h) = resolve_host(flags) {
+        cmd_run_remote(&h, flags, &pos, &plan);
+        return;
+    }
+    let c = local_client(flags);
+    let body = run_body(&plan, &prompt);
+    let v = match c.req("POST", "/v1/agents", Some(body)) {
+        Ok(v) => v,
+        Err(e) => {
+            if e.contains("checkout-pr requires gh in PATH") {
+                usage_error("checkout-pr requires gh in PATH");
+            } else {
+                eprintln!("dispatch failed: {}", e);
+            }
+            return;
+        }
+    };
+    let id = v["run"]["id"].as_str().unwrap_or("").to_string();
+    if flags.contains_key("no-wait") {
+        println!("{}", id);
+        return;
+    }
+    let mut fetch_status = |rid: &str| c.req("GET", &format!("/v1/runs/{}", rid), None);
+    let mut fetch_log = |rid: &str| c.req("GET", &format!("/v1/runs/{}/log?tail=40", rid), None);
+    wait_run(flags, &id, plan.wait_timeout, &mut fetch_status, &mut fetch_log);
+}
+
 fn trunc(s: &str, n: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
     if chars.len() <= n {
@@ -987,7 +1192,155 @@ fn trunc(s: &str, n: usize) -> String {
     }
 }
 
+fn print_agents(flags: &HashMap<String, String>, v: &Value) {
+    if format_is_json(flags) || format_is_yaml(flags) {
+        print_formatted(flags, v);
+        return;
+    }
+    let empty = vec![];
+    let agents = v["agents"].as_array().unwrap_or(&empty);
+    if flags.contains_key("quiet") {
+        for a in agents {
+            println!("{}", a["id"].as_str().unwrap_or(""));
+        }
+        return;
+    }
+    if !flags.contains_key("no-headers") {
+        println!(
+            "{:<12} {:<10} {:<14} {:<16} {:<22} {}",
+            "ID", "STATE", "KIND", "MODEL", "TITLE", "UPDATED"
+        );
+    }
+    for a in agents {
+        println!(
+            "{:<12} {:<10} {:<14} {:<16} {:<22} {}",
+            a["id"].as_str().unwrap_or(""),
+            a["state"].as_str().unwrap_or(""),
+            a["kind"].as_str().unwrap_or(""),
+            trunc(a["model"].as_str().unwrap_or("-"), 16),
+            trunc(a["title"].as_str().unwrap_or(""), 22),
+            a["updated_at"]
+                .as_i64()
+                .map(iso)
+                .unwrap_or_else(|| "-".into())
+        );
+    }
+}
+
 fn cmd_ls(flags: &HashMap<String, String>) {
+    let plan = ls_plan(flags);
+    if flags.contains_key("background") {
+        usage_error("ls --background: not supported");
+        return;
+    }
+    if plan.runs {
+        cmd_ls_runs(flags);
+        return;
+    }
+    let global = plan.global || host_flag(flags).as_deref() == Some("all");
+    if global {
+        cmd_ls_agents_global(flags, &plan);
+        return;
+    }
+    cmd_ls_agents_single(flags, &plan);
+}
+
+fn cmd_ls_agents_single(flags: &HashMap<String, String>, plan: &LsPlan) {
+    match request(flags, "GET", &agent_list_url(plan), None) {
+        Ok(v) => print_agents(flags, &v),
+        Err(e) => eprintln!("list failed: {}", e),
+    }
+}
+
+fn cmd_ls_agents_global(flags: &HashMap<String, String>, plan: &LsPlan) {
+    let reg = registry_for(flags);
+    let mut all: Vec<Value> = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
+    match local_only_client(flags).req("GET", &agent_list_url(plan), None) {
+        Ok(v) => {
+            for mut a in v["agents"].as_array().cloned().unwrap_or_default() {
+                a["host"] = json!("local");
+                all.push(a);
+            }
+        }
+        Err(e) => errors.push(format!("local: {}", e)),
+    }
+    let enabled: Vec<hosts::Host> = reg.hosts.iter().filter(|h| h.enabled).cloned().collect();
+    std::thread::scope(|s| {
+        let handles: Vec<_> = enabled
+            .iter()
+            .map(|h| {
+                s.spawn(move || -> Result<Vec<Value>, String> {
+                    let (code, text) = hosts::dispatch(h, "GET", &agent_list_url(plan), None)?;
+                    if !(200..300).contains(&code) {
+                        return Err(format!("{}: HTTP {}: {}", h.name, code, text));
+                    }
+                    let v: Value =
+                        serde_json::from_str(&text).map_err(|e| format!("{}: bad response: {}", h.name, e))?;
+                    Ok(v["agents"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|mut a| {
+                            a["host"] = json!(h.name);
+                            a
+                        })
+                        .collect())
+                })
+            })
+            .collect();
+        for hd in handles {
+            match hd.join() {
+                Ok(Ok(agents)) => all.extend(agents),
+                Ok(Err(e)) => errors.push(e),
+                Err(_) => errors.push("worker panicked".into()),
+            }
+        }
+    });
+    all.sort_by(|a, b| {
+        b["created_at"]
+            .as_i64()
+            .unwrap_or(0)
+            .cmp(&a["created_at"].as_i64().unwrap_or(0))
+    });
+    if format_is_json(flags) || format_is_yaml(flags) {
+        print_formatted(flags, &json!({"agents": all}));
+    } else if flags.contains_key("quiet") {
+        for a in &all {
+            println!("{}", a["id"].as_str().unwrap_or(""));
+        }
+    } else {
+        println!(
+            "{:<10} {:<12} {:<10} {:<14} {:<16} {:<22} {}",
+            "HOST", "ID", "STATE", "KIND", "MODEL", "TITLE", "UPDATED"
+        );
+        for a in &all {
+            println!(
+                "{:<10} {:<12} {:<10} {:<14} {:<16} {:<22} {}",
+                a["host"].as_str().unwrap_or("-"),
+                a["id"].as_str().unwrap_or(""),
+                a["state"].as_str().unwrap_or(""),
+                a["kind"].as_str().unwrap_or(""),
+                trunc(a["model"].as_str().unwrap_or("-"), 16),
+                trunc(a["title"].as_str().unwrap_or(""), 22),
+                a["updated_at"]
+                    .as_i64()
+                    .map(iso)
+                    .unwrap_or_else(|| "-".into())
+            );
+        }
+    }
+    if !errors.is_empty() {
+        eprintln!("errors:");
+        for e in errors {
+            eprintln!("  {}", e);
+        }
+    }
+}
+
+fn cmd_ls_runs(flags: &HashMap<String, String>) {
+
     if let Some(raw) = host_flag(flags) {
         if raw == "all" {
             cmd_ls_all(flags);
@@ -2446,7 +2799,7 @@ fn cmd_script(flags: &HashMap<String, String>, pos: &[String]) {
     }
 }
 
-fn cmd_run_remote(h: &hosts::Host, flags: &HashMap<String, String>, pos: &[String]) {
+fn cmd_run_remote(h: &hosts::Host, flags: &HashMap<String, String>, pos: &[String], plan: &RunPlan) {
     let mut prompt = pos.join(" ");
     if prompt.trim().is_empty() {
         prompt = flags.get("prompt").cloned().unwrap_or_default();
@@ -2455,16 +2808,9 @@ fn cmd_run_remote(h: &hosts::Host, flags: &HashMap<String, String>, pos: &[Strin
         usage_error("prompt required");
         return;
     }
-    let body = json!({
-        "agent": flags.get("agent").cloned().unwrap_or_else(|| "codex".into()),
-        "model": flags.get("model"),
-        "workspace": flags.get("workspace"),
-        "title": flags.get("title"),
-        "prompt": prompt,
-        "timeout_s": flags.get("timeout").and_then(|v| v.parse::<u64>().ok()),
-    });
+    let body = run_body(plan, &prompt);
     let body_str = serde_json::to_string(&body).unwrap_or_default();
-    let (code, text) = match hosts::dispatch(h, "POST", "/v1/runs", Some(&body_str)) {
+    let (code, text) = match hosts::dispatch(h, "POST", "/v1/agents", Some(&body_str)) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("dispatch failed: {}", e);
@@ -2472,53 +2818,22 @@ fn cmd_run_remote(h: &hosts::Host, flags: &HashMap<String, String>, pos: &[Strin
         }
     };
     if !(200..300).contains(&code) {
-        eprintln!("dispatch failed: HTTP {}: {}", code, text);
+        if text.contains("checkout-pr requires gh in PATH") {
+            usage_error("checkout-pr requires gh in PATH");
+        } else {
+            eprintln!("dispatch failed: HTTP {}: {}", code, text);
+        }
         return;
     }
     let v: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
-    let mut out = v.clone();
-    out["host"] = json!(h.name);
-    println!("{}", serde_json::to_string_pretty(&out).unwrap_or_default());
     let id = v["run"]["id"].as_str().unwrap_or("").to_string();
     if flags.contains_key("no-wait") {
+        println!("{}", id);
         return;
     }
-    let started = std::time::Instant::now();
-    loop {
-        thread::sleep(Duration::from_secs(2));
-        match dispatch_json(h, "GET", &format!("/v1/runs/{}", id)) {
-            Ok(v) => {
-                let st = v["run"]["status"].as_str().unwrap_or("?");
-                if matches!(st, "done" | "failed" | "timeout" | "killed" | "interrupted") {
-                    let err = v["run"]["error"].as_str().unwrap_or("");
-                    println!(
-                        "{}\t{}\t{}s{}",
-                        id,
-                        st,
-                        started.elapsed().as_secs(),
-                        if err.is_empty() {
-                            String::new()
-                        } else {
-                            format!("\t{}", err)
-                        }
-                    );
-                    if let Ok(l) = dispatch_json(h, "GET", &format!("/v1/runs/{}/log?tail=40", id)) {
-                        println!("---");
-                        println!("{}", l["log"].as_str().unwrap_or(""));
-                    }
-                    return;
-                }
-                if flags.contains_key("quiet") {
-                    continue;
-                }
-                eprintln!("[{}] {} {}s", id, st, started.elapsed().as_secs());
-            }
-            Err(e) => {
-                eprintln!("poll failed: {}", e);
-                return;
-            }
-        }
-    }
+    let mut fetch_status = |rid: &str| dispatch_json(h, "GET", &format!("/v1/runs/{}", rid));
+    let mut fetch_log = |rid: &str| dispatch_json(h, "GET", &format!("/v1/runs/{}/log?tail=40", rid));
+    wait_run(flags, &id, plan.wait_timeout, &mut fetch_status, &mut fetch_log);
 }
 
 fn print_runs_table(runs: &[Value]) {
@@ -4302,5 +4617,78 @@ mod tests {
             delete_plan("r1", false),
             vec![("DELETE".to_string(), "/v1/runs/r1".to_string())]
         );
+    }
+
+    #[test]
+    fn parse_labels_accepts_multi_and_rejects_missing_equals() {
+        let m = parse_labels(&["a=1".to_string(), "b=2".to_string()]).unwrap();
+        assert_eq!(m.get("a").map(String::as_str), Some("1"));
+        assert_eq!(m.get("b").map(String::as_str), Some("2"));
+        assert!(parse_labels(&["a".to_string()]).is_err());
+        assert!(parse_labels(&["=x".to_string()]).is_err());
+        let m2 = parse_labels(&["a=b=c".to_string()]).unwrap();
+        assert_eq!(m2.get("a").map(String::as_str), Some("b=c"));
+    }
+
+    #[test]
+    fn run_plan_worktree_mode_and_unsupported_validation() {
+        let mut f1: HashMap<String, String> = HashMap::new();
+        f1.insert("new-workspace".to_string(), "worktree".to_string());
+        assert!(run_plan(&f1).unwrap().worktree);
+
+        let mut f2: HashMap<String, String> = HashMap::new();
+        f2.insert("worktree-mode".to_string(), "checkout-pr".to_string());
+        assert!(run_plan(&f2).unwrap_err().contains("checkout-pr requires --pr-number"));
+
+        let mut f3: HashMap<String, String> = HashMap::new();
+        f3.insert("thinking".to_string(), "high".to_string());
+        assert!(run_plan(&f3).unwrap_err().contains("not supported"));
+
+        let mut f4: HashMap<String, String> = HashMap::new();
+        f4.insert("env".to_string(), "1BAD=x".to_string());
+        assert!(run_plan(&f4).unwrap_err().contains("invalid env key"));
+    }
+
+    #[test]
+    fn ls_plan_switches_runs_and_global_limit_defaults() {
+        let mut f1: HashMap<String, String> = HashMap::new();
+        f1.insert("runs".to_string(), "true".to_string());
+        assert!(ls_plan(&f1).runs);
+
+        let mut f2: HashMap<String, String> = HashMap::new();
+        f2.insert("global".to_string(), "true".to_string());
+        f2.insert("host".to_string(), "nas".to_string());
+        assert!(ls_plan(&f2).global);
+
+        let mut f3: HashMap<String, String> = HashMap::new();
+        f3.insert("limit".to_string(), "abc".to_string());
+        assert_eq!(ls_plan(&f3).limit, 50);
+
+        let mut f4: HashMap<String, String> = HashMap::new();
+        f4.insert("limit".to_string(), "10000".to_string());
+        assert_eq!(ls_plan(&f4).limit, 500);
+    }
+
+    #[test]
+    fn agent_list_url_encodes_labels_and_order() {
+        let plan = LsPlan {
+            runs: false,
+            global: false,
+            all: true,
+            labels: vec!["k=1".to_string(), "a=b".to_string()],
+            limit: 10,
+            kind: Some("codex".to_string()),
+        };
+        assert_eq!(
+            agent_list_url(&plan),
+            "/v1/agents?all=1&label=k%3D1&label=a%3Db&limit=10&kind=codex"
+        );
+    }
+
+    #[test]
+    fn parse_flags_short_a_and_g() {
+        let (flags, _) = parse_flags(&["-a".to_string(), "-g".to_string(), "ls".to_string()]);
+        assert_eq!(flags.get("all").map(String::as_str), Some("true"));
+        assert_eq!(flags.get("global").map(String::as_str), Some("true"));
     }
 }

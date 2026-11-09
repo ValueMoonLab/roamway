@@ -283,6 +283,11 @@ fn build_command_with_session(
     session_id: Option<&str>,
     claude_resume_flag: Option<&str>,
 ) -> Result<Command, String> {
+    let effective = run
+        .cwd
+        .as_deref()
+        .filter(|d| !d.is_empty())
+        .unwrap_or(&run.workspace);
     let (prog, args): (String, Vec<String>) = match run.agent.as_str() {
         "shell" => {
             if cfg!(windows) {
@@ -302,9 +307,9 @@ fn build_command_with_session(
                 a.push("resume".into());
                 a.push(sid.to_string());
             }
-            if !run.workspace.is_empty() {
+            if !effective.is_empty() {
                 a.push("-C".into());
-                a.push(run.workspace.clone());
+                a.push(effective.to_string());
             }
             if let Some(m) = run.model.as_ref().filter(|m| !m.is_empty()) {
                 a.push("--model".into());
@@ -337,8 +342,8 @@ fn build_command_with_session(
 
     let mut c = Command::new(prog);
     c.args(args);
-    if !run.workspace.is_empty() && Path::new(&run.workspace).is_dir() {
-        c.current_dir(&run.workspace);
+    if !effective.is_empty() && Path::new(effective).is_dir() {
+        c.current_dir(effective);
     }
     configure_process(&mut c);
     Ok(c)
@@ -457,6 +462,9 @@ fn run_cli(
         Ok(c) => c,
         Err(e) => return (RunStatus::Failed, None, Some(e)),
     };
+    for (key, value) in &run.env {
+        cmd.env(key, value);
+    }
     let out = match File::create(log_path) {
         Ok(f) => f,
         Err(e) => return (RunStatus::Failed, None, Some(format!("log: {}", e))),
@@ -721,6 +729,9 @@ mod tests {
             agent_id: None,
             trigger_id: None,
             usage: None,
+            labels: std::collections::BTreeMap::new(),
+            env: Vec::new(),
+            cwd: None,
         }
     }
 

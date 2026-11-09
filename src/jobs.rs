@@ -1,5 +1,6 @@
 use crate::runner;
 use crate::types::*;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
@@ -116,6 +117,9 @@ pub fn spawn_from_job(app: Arc<App>, job_id: &str) {
             agent_id: None,
             trigger_id: None,
             usage: None,
+            labels: BTreeMap::new(),
+            env: Vec::new(),
+            cwd: None,
         });
         if let Some(jj) = st.state.jobs.iter_mut().find(|x| x.id == job_id) {
             jj.last_run = Some(iso(t));
@@ -262,6 +266,9 @@ mod tests {
             agent_id: None,
             trigger_id: None,
             usage: None,
+            labels: BTreeMap::new(),
+            env: Vec::new(),
+            cwd: None,
         };
         let state = State {
             runs: vec![
@@ -303,6 +310,9 @@ mod tests {
             agent_id: None,
             trigger_id: None,
             usage: None,
+            labels: BTreeMap::new(),
+            env: Vec::new(),
+            cwd: None,
         };
         let dir = std::env::temp_dir().join(format!("roamway-prune-{}", now()));
         let _ = std::fs::create_dir_all(&dir);

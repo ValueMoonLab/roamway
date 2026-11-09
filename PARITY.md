@@ -11,8 +11,8 @@
 | # | Paseo 命令 | 状态 | 证据 | 差异或"不做"理由 |
 |---|---|---|---|---|
 | 1 | `paseo host` | ✅ | `src/main.rs:fn cmd_host` | 主机注册表 add/ls/rm/enable/disable/probe 全量 |
-| 2 | `paseo ls` | ⚠️ | `src/main.rs:fn cmd_ls` | 列 `/v1/runs` 的 run，非 agent 维度；`--host all` 聚合多机 |
-| 3 | `paseo run` | ⚠️ | `src/main.rs:fn cmd_run` | 以 run 为维度，不支持 worktree 隔离与 provider 会话续跑 |
+| 2 | `paseo ls` | ✅ | `src/main.rs:fn cmd_ls` / 测试：`ls_plan_switches_runs_and_global_limit_defaults` | 默认 agent 维度，列 `ID/STATE/KIND/MODEL/TITLE/UPDATED`；`--runs` 看 run 表；`--background` 不做（roamway 无后台列表模型，exit 2） |
+| 3 | `paseo run` | ⚠️ | `src/main.rs:fn run_plan` / 测试：`run_plan_worktree_mode_and_unsupported_validation` | agent-backed，支持 worktree/cwd/env/label；不支持 `--thinking/--mode/--image/--output-schema/--provider`（用 `--agent`）与 `--worktree-slug/--new-branch/--base/--branch`，均 exit 2 |
 | 4 | `paseo import` | ✅ | `src/main.rs:fn cmd_agent_import` | 导入已有 provider 会话 |
 | 5 | `paseo clone` | ✅ | `src/main.rs:fn cmd_clone` | 本地 `workspaces::clone_repo` 或远端 `/v1/workspaces/clone` |
 | 6 | `paseo attach` | ✅ | `src/main.rs:fn cmd_agent_attach` | SSE 长连接接输出流 |
@@ -144,3 +144,5 @@
 | P11 | CLI 面收口 + 文档重写 + v1.0.0 | `src/main.rs:fn dispatch`、`src/main.rs:fn usage_error`、`src/main.rs:fn cmd_send`、`src/main.rs:fn cmd_delete`、`src/main.rs:fn cmd_permit`、`src/main.rs:fn cmd_heartbeat` |
 
 新增单测（`src/main.rs` 内 `#[cfg(test)]`）：`parse_flags_short_o_and_q`、`json_flag_and_format_flag_match`、`yaml_serializer_emits_nested_maps_and_sequences`、`dispatch_returns_usage_exit_code`、`delete_plan_stops_running_runs_before_delete`。
+
+P12 新增单测：`parse_labels_accepts_multi_and_rejects_missing_equals`、`run_plan_worktree_mode_and_unsupported_validation`、`ls_plan_switches_runs_and_global_limit_defaults`、`agent_list_url_encodes_labels_and_order`、`parse_flags_short_a_and_g`（`src/main.rs`）；`filter_agents_applies_label_and_kind_and_limit`（`src/agents.rs`）。

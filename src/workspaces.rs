@@ -335,6 +335,71 @@ pub fn worktree_remove(repo_root: &str, path: &Path, branch: &str) -> Result<(),
     Ok(())
 }
 
+
+pub fn worktree_add_existing(repo_root: &str, path: &Path, branch: &str) -> Result<(), String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["worktree", "add"])
+        .arg(path)
+        .arg(branch)
+        .output()
+        .map_err(|e| format!("git worktree add failed: {}", e))?;
+    if !out.status.success() {
+        return Err(format!("git worktree add failed: {}", stderr_text(&out)));
+    }
+    Ok(())
+}
+
+pub fn worktree_remove_keep_branch(repo_root: &str, path: &Path) -> Result<(), String> {
+    println!(
+        "[worktree] dry-run: git -C {} worktree remove --force {}",
+        repo_root,
+        path.display()
+    );
+    if path.exists() {
+        let out = Command::new("git")
+            .arg("-C")
+            .arg(repo_root)
+            .args(["worktree", "remove", "--force"])
+            .arg(path)
+            .output()
+            .map_err(|e| format!("git worktree remove failed: {}", e))?;
+        if !out.status.success() {
+            return Err(format!("git worktree remove failed: {}", stderr_text(&out)));
+        }
+    }
+    Ok(())
+}
+
+pub fn git_current_branch(repo_root: &str) -> Result<String, String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .map_err(|e| format!("git rev-parse failed: {}", e))?;
+    if !out.status.success() {
+        return Err(format!("git rev-parse failed: {}", stderr_text(&out)));
+    }
+    let branch = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if branch.is_empty() {
+        return Err("cannot resolve current branch".into());
+    }
+    Ok(branch)
+}
+
+pub fn gh_pr_checkout(workspace: &str, pr: &str) -> Result<(), String> {
+    let out = Command::new("gh")
+        .args(["pr", "checkout", pr])
+        .current_dir(workspace)
+        .output()
+        .map_err(|_| "checkout-pr requires gh in PATH".to_string())?;
+    if !out.status.success() {
+        return Err(format!("gh pr checkout failed: {}", stderr_text(&out)));
+    }
+    Ok(())
+}
 #[cfg(test)]
 mod tests {
     use super::*;

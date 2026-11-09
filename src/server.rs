@@ -11,7 +11,7 @@ use crate::usage;
 use crate::workspaces;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
@@ -137,6 +137,7 @@ struct Req {
     method: String,
     path: String,
     query: HashMap<String, String>,
+    raw_query: String,
     headers: HashMap<String, String>,
     body: Vec<u8>,
 }
@@ -228,9 +229,9 @@ fn read_req<C: Conn>(s: &mut C) -> std::io::Result<ReadOutcome> {
         }
     }
 
-    let (path, query) = match target.split_once('?') {
-        Some((p, q)) => (p.to_string(), parse_query(q)),
-        None => (target.clone(), HashMap::new()),
+    let (path, raw_query, query) = match target.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string(), parse_query(q)),
+        None => (target.clone(), String::new(), HashMap::new()),
     };
 
     let len: usize = headers
@@ -256,6 +257,7 @@ fn read_req<C: Conn>(s: &mut C) -> std::io::Result<ReadOutcome> {
         method,
         path,
         query,
+        raw_query,
         headers,
         body,
     }))
@@ -268,6 +270,16 @@ fn parse_query(q: &str) -> HashMap<String, String> {
         m.insert(url_decode(k), url_decode(v));
     }
     m
+}
+
+fn query_many(req: &Req, key: &str) -> Vec<String> {
+    req.raw_query
+        .split('&')
+        .filter_map(|kv| {
+            let (k, v) = kv.split_once('=')?;
+            (url_decode(k) == key).then(|| url_decode(v))
+        })
+        .collect()
 }
 
 fn url_decode(s: &str) -> String {
@@ -816,6 +828,16 @@ struct NewAgent {
     timeout_s: Option<u64>,
     #[serde(default)]
     worktree: Option<bool>,
+    #[serde(default)]
+    labels: Option<BTreeMap<String, String>>,
+    #[serde(default)]
+    env: Option<Vec<(String, String)>>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    worktree_mode: Option<String>,
+    #[serde(default)]
+    pr_number: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1570,7 +1592,7 @@ fn hub_hook_route(app: &Arc<App>, req: &Req, trigger_id: &str) -> (u16, Value) {
     }
 
     let spec = trigger.agent_spec.clone();
-    match agents::create_agent_and_run(app, &spec.provider, None, Some(spec.cwd.clone()), None, &spec.prompt, 1800, false) {
+    match agents::create_agent_and_run(app, &spec.provider, None, Some(spec.cwd.clone()), None, &spec.prompt, 1800, false, None, None, BTreeMap::new(), Vec::new(), None) {
         Ok((_agent, run)) => {
             agents::tag_run_trigger(app, &run.id, trigger_id);
             let mut rt = app.hub_rt.lock().unwrap_or_else(|e| e.into_inner());
@@ -1608,7 +1630,19 @@ fn agent_run_summary(r: &Run) -> Value {
 fn list_agents_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
     let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
     let all = query_true(req, "all");
-    let agents: Vec<&agents::Agent> = agents::filter_visible(&st.state.agents, all);
+    let labels = query_many(req, "label");
+    let kind = req
+        .query
+        .get("kind")
+        .filter(|s| !s.is_empty())
+        .map(String::as_str);
+    let limit = req
+        .query
+        .get("limit")
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|n| n.clamp(1, 500));
+    let agents: Vec<&agents::Agent> =
+        agents::filter_agents(&st.state.agents, all, &labels, kind, limit);
     (200, json!({ "agents": agents }))
 }
 
@@ -1651,6 +1685,18 @@ fn create_agent_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         .clone()
         .filter(|w| !w.trim().is_empty())
         .map(|w| resolve_workspace_input(app, &w));
+    let labels = spec.labels.unwrap_or_default();
+    let env = spec.env.unwrap_or_default();
+    if let Some((key, _)) = env.iter().find(|(k, _)| !is_valid_env_key(k)) {
+        return (400, json!({ "error": format!("invalid env key: {}", key) }));
+    }
+    let cwd = match spec.cwd.clone().filter(|d| !d.trim().is_empty()) {
+        Some(d) => match canonicalize_dir(&d) {
+            Some(c) => Some(c),
+            None => return (400, json!({ "error": format!("cwd not found: {}", d) })),
+        },
+        None => None,
+    };
     match agents::create_agent_and_run(
         app,
         &kind,
@@ -1660,6 +1706,11 @@ fn create_agent_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         &spec.prompt,
         timeout_s,
         spec.worktree.unwrap_or(false),
+        spec.worktree_mode,
+        spec.pr_number,
+        labels,
+        env,
+        cwd,
     ) {
         Ok((agent, run)) => (200, json!({ "agent": agent, "run": run })),
         Err(e) => (400, json!({ "error": e })),
@@ -2238,6 +2289,9 @@ fn create_run(app: &Arc<App>, req: &Req) -> (u16, Value) {
 
             trigger_id: None,
             usage: None,
+            labels: BTreeMap::new(),
+            env: Vec::new(),
+            cwd: None,
         };
         st.state.runs.push(r.clone());
         jobs::prune(&mut st);
@@ -2650,6 +2704,7 @@ mod tests {
             method: "GET".into(),
             path: "/v1/agents".into(),
             query: HashMap::new(),
+            raw_query: String::new(),
             headers: HashMap::from([("authorization".into(), "Bearer abc123".into())]),
             body: vec![],
         };
@@ -2658,6 +2713,7 @@ mod tests {
             method: "GET".into(),
             path: "/v1/agents".into(),
             query: HashMap::new(),
+            raw_query: String::new(),
             headers: HashMap::from([("authorization".into(), "bearer  xyz  ".into())]),
             body: vec![],
         };
@@ -2666,6 +2722,7 @@ mod tests {
             method: "GET".into(),
             path: "/v1/agents".into(),
             query: HashMap::new(),
+            raw_query: String::new(),
             headers: HashMap::from([("authorization".into(), "Basic abc".into())]),
             body: vec![],
         };
@@ -2681,6 +2738,7 @@ mod tests {
             method: "POST".into(),
             path: "/v1/tokens".into(),
             query: HashMap::new(),
+            raw_query: String::new(),
             headers: HashMap::new(),
             body: br#"{"name":"ui","scopes":["read"]}"#.to_vec(),
         };
@@ -2707,6 +2765,7 @@ mod tests {
             method: "POST".into(),
             path: "/v1/hosts".into(),
             query: HashMap::new(),
+            raw_query: String::new(),
             headers: HashMap::new(),
             body: br#"{"name":"nas1","endpoint":"192.0.2.10:8796","token":"secret"}"#.to_vec(),
         };
@@ -2813,6 +2872,9 @@ mod tests {
 
             trigger_id: None,
             usage: None,
+            labels: BTreeMap::new(),
+            env: Vec::new(),
+            cwd: None,
         };
         let store = Store {
             dir: dir.clone(),
@@ -2853,6 +2915,7 @@ mod tests {
             method: "GET".into(),
             path: "/v1/runs".into(),
             query: HashMap::from([("limit".into(), "1".into()), ("offset".into(), "1".into())]),
+            raw_query: String::new(),
             headers: HashMap::new(),
             body: vec![],
         };
@@ -2897,6 +2960,9 @@ mod tests {
             agent_id: None,
             trigger_id: None,
             usage: None,
+            labels: BTreeMap::new(),
+            env: Vec::new(),
+            cwd: None,
         };
         let store = Store {
             dir: dir.to_path_buf(),
@@ -3089,6 +3155,7 @@ mod tests {
             method: "GET".into(),
             path: "/v1/runs".into(),
             query: HashMap::from([("trigger".into(), "trg_a".into())]),
+            raw_query: String::new(),
             headers: HashMap::new(),
             body: vec![],
         };
@@ -3100,6 +3167,7 @@ mod tests {
             method: "GET".into(),
             path: "/v1/runs".into(),
             query: HashMap::from([("trigger".into(), "trg_b".into())]),
+            raw_query: String::new(),
             headers: HashMap::new(),
             body: vec![],
         };
@@ -3137,6 +3205,7 @@ mod tests {
             method: "POST".into(),
             path: "/v1/hub/hooks/trg_00000001".into(),
             query: HashMap::new(),
+            raw_query: String::new(),
             headers: HashMap::from([
                 ("x-hub-signature-256".into(), sig),
                 ("x-github-delivery".into(), "busy-1".into()),

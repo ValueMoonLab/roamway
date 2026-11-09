@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -497,6 +497,9 @@ pub fn create_run_for_schedule(app: &Arc<App>, schedule_id: &str) {
             agent_id: None,
             trigger_id: None,
             usage: None,
+            labels: BTreeMap::new(),
+            env: Vec::new(),
+            cwd: None,
         });
         crate::jobs::prune(&mut st);
         st.save();

@@ -1,5 +1,6 @@
 use crate::types::*;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::Path;
@@ -34,6 +35,10 @@ pub struct Agent {
     pub branch: Option<String>,
     #[serde(default)]
     pub base_path: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_mode: Option<String>,
 }
 
 static AGENT_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -124,11 +129,31 @@ pub fn apply_run_status_to_agent(agent: &mut Agent, run_id: &str, ok: bool, err:
     }
 }
 
-pub fn filter_visible(agents: &[Agent], all: bool) -> Vec<&Agent> {
-    agents
+/// `GET /v1/agents` 的过滤：all 控制是否含 archived，多个 label 按 AND 语义匹配，kind 精确匹配
+/// 结果按 created_at 降序排序；limit 为 None 时不截断
+pub fn filter_agents<'a>(
+    agents: &'a [Agent],
+    all: bool,
+    labels: &[String],
+    kind: Option<&str>,
+    limit: Option<usize>,
+) -> Vec<&'a Agent> {
+    let mut out: Vec<&Agent> = agents
         .iter()
         .filter(|a| all || a.state != "archived")
-        .collect()
+        .filter(|a| {
+            labels.iter().all(|lv| match lv.split_once('=') {
+                Some((k, v)) => a.labels.get(k).map(|x| x == v).unwrap_or(false),
+                None => false,
+            })
+        })
+        .filter(|a| kind.map(|k| a.kind == k).unwrap_or(true))
+        .collect();
+    out.sort_by(|x, y| y.created_at.cmp(&x.created_at));
+    if let Some(n) = limit {
+        out.truncate(n);
+    }
+    out
 }
 
 fn canonicalize_dir(path: &str) -> Option<String> {
@@ -152,6 +177,9 @@ fn push_run_locked(
     agent: &mut Agent,
     prompt: &str,
     timeout_s: u64,
+    labels: BTreeMap<String, String>,
+    env: Vec<(String, String)>,
+    cwd: Option<String>,
 ) -> Result<Run, String> {
     let id = st.next_id("run");
     let run = Run {
@@ -178,6 +206,9 @@ fn push_run_locked(
         agent_id: Some(agent.id.clone()),
         trigger_id: None,
         usage: None,
+        labels,
+        env,
+        cwd,
     };
     st.state.runs.push(run.clone());
     agent.last_run_id = id;
@@ -197,6 +228,11 @@ pub fn create_agent_and_run(
     prompt: &str,
     timeout_s: u64,
     use_worktree: bool,
+    worktree_mode: Option<String>,
+    pr_number: Option<String>,
+    labels: BTreeMap<String, String>,
+    env: Vec<(String, String)>,
+    cwd: Option<String>,
 ) -> Result<(Agent, Run), String> {
     if !is_known_agent(kind) {
         return Err("unknown agent".into());
@@ -217,17 +253,34 @@ pub fn create_agent_and_run(
         }
         id
     };
-    let (agent_workspace, worktree, branch, base_path) = if use_worktree {
+    let (agent_workspace, worktree, branch, base_path) = if worktree_mode.as_deref() == Some("checkout-pr") {
+        let pr = pr_number
+            .as_deref()
+            .ok_or_else(|| "checkout-pr requires --pr-number".to_string())?;
+        crate::workspaces::gh_pr_checkout(&ws, pr)?;
+        (ws, false, None, None)
+    } else if use_worktree {
         let root = crate::workspaces::git_repo_root(&ws)?;
         let path = crate::workspaces::worktree_path(&data_dir, &id);
-        let branch = crate::workspaces::worktree_branch(&id);
-        crate::workspaces::worktree_add(&root, &path, &branch)?;
-        (
-            path.to_string_lossy().to_string(),
-            true,
-            Some(branch),
-            Some(root),
-        )
+        if worktree_mode.as_deref() == Some("checkout-branch") {
+            let branch = crate::workspaces::git_current_branch(&root)?;
+            crate::workspaces::worktree_add_existing(&root, &path, &branch)?;
+            (
+                path.to_string_lossy().to_string(),
+                true,
+                Some(branch),
+                Some(root),
+            )
+        } else {
+            let branch = crate::workspaces::worktree_branch(&id);
+            crate::workspaces::worktree_add(&root, &path, &branch)?;
+            (
+                path.to_string_lossy().to_string(),
+                true,
+                Some(branch),
+                Some(root),
+            )
+        }
     } else {
         (ws, false, None, None)
     };
@@ -249,8 +302,10 @@ pub fn create_agent_and_run(
         worktree,
         branch,
         base_path,
+        labels: labels.clone(),
+        worktree_mode: worktree_mode.clone(),
     };
-    let run = push_run_locked(&mut st, &mut agent, prompt, timeout_s)?;
+    let run = push_run_locked(&mut st, &mut agent, prompt, timeout_s, labels, env, cwd)?;
     st.state.agents.push(agent.clone());
     st.save();
     drop(st);
@@ -286,7 +341,7 @@ pub fn queue_agent_run(
     if agent.state == "archived" {
         return Err("agent is archived".into());
     }
-    let run = push_run_locked(&mut st, &mut agent, prompt, timeout_s)?;
+    let run = push_run_locked(&mut st, &mut agent, prompt, timeout_s, BTreeMap::new(), Vec::new(), None)?;
     if let Some(a) = st.state.agents.iter_mut().find(|a| a.id == agent_id) {
         *a = agent.clone();
     }
@@ -317,7 +372,7 @@ pub fn reload_agent(app: &Arc<App>, agent_id: &str, timeout_s: u64) -> Result<Ru
     agent.session_id.clear();
     agent.history.clear();
     agent.last_error.clear();
-    let run = push_run_locked(&mut st, &mut agent, &first_prompt, timeout_s)?;
+    let run = push_run_locked(&mut st, &mut agent, &first_prompt, timeout_s, BTreeMap::new(), Vec::new(), None)?;
     if let Some(a) = st.state.agents.iter_mut().find(|a| a.id == agent_id) {
         *a = agent.clone();
     }
@@ -357,7 +412,7 @@ pub fn update_agent_meta(
 }
 
 pub fn archive_agent(app: &Arc<App>, agent_id: &str, keep_worktree: bool) -> Result<(), String> {
-    let (cleanup, data_dir) = {
+    let (cleanup, keep_branch, data_dir) = {
         let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
         let a = st
             .state
@@ -371,6 +426,7 @@ pub fn archive_agent(app: &Arc<App>, agent_id: &str, keep_worktree: bool) -> Res
                 && a.branch.is_some()
                 && a.base_path.is_some()
                 && !a.workspace.is_empty(),
+            a.worktree_mode.as_deref() == Some("checkout-branch"),
             st.dir.clone(),
         )
     };
@@ -387,7 +443,12 @@ pub fn archive_agent(app: &Arc<App>, agent_id: &str, keep_worktree: bool) -> Res
         let wt = crate::workspaces::worktree_path(&data_dir, agent_id);
         let path = std::path::Path::new(&workspace);
         let path = if path.exists() { path.to_path_buf() } else { wt };
-        if let Err(e) = crate::workspaces::worktree_remove(&base_path, &path, &branch) {
+        let result = if keep_branch {
+            crate::workspaces::worktree_remove_keep_branch(&base_path, &path)
+        } else {
+            crate::workspaces::worktree_remove(&base_path, &path, &branch)
+        };
+        if let Err(e) = result {
             return Err(format!("archive failed: {}", e));
         }
     }
@@ -457,6 +518,8 @@ pub fn import_agent(
         worktree: false,
         branch: None,
         base_path: None,
+        labels: BTreeMap::new(),
+        worktree_mode: None,
     };
     st.state.agents.push(agent.clone());
     st.save();
@@ -485,6 +548,8 @@ mod tests {
             worktree: false,
             branch: None,
             base_path: None,
+            labels: BTreeMap::new(),
+            worktree_mode: None,
         }
     }
 
@@ -521,8 +586,49 @@ mod tests {
         a.state = "archived".into();
         let b = sample("codex");
         let agents = vec![a, b];
-        assert_eq!(filter_visible(&agents, false).len(), 1);
-        assert_eq!(filter_visible(&agents, true).len(), 2);
+        assert_eq!(filter_agents(&agents, false, &[], None, None).len(), 1);
+        assert_eq!(filter_agents(&agents, true, &[], None, None).len(), 2);
+    }
+
+    #[test]
+    fn filter_agents_applies_label_and_kind_and_limit() {
+        let mut a = sample("shell");
+        a.id = "ag_a".into();
+        a.created_at = 1;
+        a.labels.insert("stage".into(), "p12".into());
+        a.labels.insert("env".into(), "dev".into());
+
+        let mut b = sample("codex");
+        b.id = "ag_b".into();
+        b.created_at = 2;
+        b.labels.insert("stage".into(), "p12".into());
+
+        let mut c = sample("shell");
+        c.id = "ag_c".into();
+        c.created_at = 3;
+        c.state = "archived".into();
+        c.labels.insert("stage".into(), "p12".into());
+
+        let agents = vec![a, b, c];
+
+        let and_labels = vec!["stage=p12".to_string(), "env=dev".to_string()];
+        let out = filter_agents(&agents, false, &and_labels, None, None);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "ag_a");
+
+        let all = filter_agents(&agents, true, &["stage=p12".to_string()], None, None);
+        assert_eq!(all.len(), 3);
+
+        let limited = filter_agents(&agents, true, &["stage=p12".to_string()], None, Some(2));
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited[0].id, "ag_c");
+        assert_eq!(limited[1].id, "ag_b");
+
+        let kind = filter_agents(&agents, true, &[], Some("codex"), None);
+        assert_eq!(kind.len(), 1);
+        assert_eq!(kind[0].id, "ag_b");
+
+        assert!(filter_agents(&agents, false, &["stage=nope".to_string()], None, None).is_empty());
     }
 
     #[test]

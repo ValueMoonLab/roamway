@@ -284,6 +284,9 @@ mod tests {
                 model: model.into(),
                 provider: provider.into(),
             })),
+            labels: std::collections::BTreeMap::new(),
+            env: Vec::new(),
+            cwd: None,
         }
     }
 
