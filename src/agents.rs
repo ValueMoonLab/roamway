@@ -176,6 +176,7 @@ fn push_run_locked(
         pid: None,
         attempts: 0,
         agent_id: Some(agent.id.clone()),
+        usage: None,
     };
     st.state.runs.push(run.clone());
     agent.last_run_id = id;

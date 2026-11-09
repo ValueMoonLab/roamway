@@ -94,6 +94,27 @@ impl RunStatus {
     }
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct Usage {
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    #[serde(default)]
+    pub total_tokens: u64,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub provider: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(untagged)]
+pub enum RunUsage {
+    Data(Usage),
+    Note(String),
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Run {
     pub id: String,
@@ -122,6 +143,8 @@ pub struct Run {
     pub attempts: u32,
     #[serde(default)]
     pub agent_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<RunUsage>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -480,6 +503,7 @@ mod tests {
             pid: None,
             attempts: 0,
             agent_id: None,
+            usage: None,
         };
         let state = State {
             runs: vec![run],

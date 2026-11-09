@@ -62,15 +62,21 @@ fn execute(app: Arc<App>, id: String) {
     };
 
     if cancel.load(Ordering::Relaxed) {
-        finalize(&app, &id, RunStatus::Killed, None, None);
+        finalize(&app, &id, RunStatus::Killed, None, None, None);
         return;
     }
+
+    crate::plugins::fire(
+        &app,
+        "agent.created",
+        json!({ "run_id": id.clone(), "agent": run.agent.clone(), "status": "running" }),
+    );
 
     {
         let mut f = match File::create(&log_path) {
             Ok(f) => f,
             Err(e) => {
-                finalize(&app, &id, RunStatus::Failed, None, Some(format!("log: {}", e)));
+                finalize(&app, &id, RunStatus::Failed, None, Some(format!("log: {}", e)), None);
                 return;
             }
         };
@@ -109,8 +115,8 @@ fn execute(app: Arc<App>, id: String) {
     }
 
     let outcome = if run.agent.starts_with("api:") {
-        let (status, code, err, text) = run_api(&run, &log_path, &cancel, &history);
-        (status, code, err, text)
+        let (status, code, err, text, usage) = run_api(&run, &log_path, &cancel, &history);
+        (status, code, err, text, usage)
     } else {
         let session_for_run = if matches!(agent_kind.as_str(), "codex" | "claude") {
             if session.is_empty() {
@@ -122,9 +128,12 @@ fn execute(app: Arc<App>, id: String) {
             None
         };
         let (status, code, err) = run_cli(&app, &run, &log_path, &cancel, session_for_run, claude_flag);
-        (status, code, err, String::new())
+        (status, code, err, String::new(), None)
     };
-    let (status, code, err, assistant) = outcome;
+    let (status, code, err, assistant, mut usage) = outcome;
+    if usage.is_none() && status == RunStatus::Done && !run.agent.starts_with("api:") {
+        usage = Some(RunUsage::Note("unavailable".into()));
+    }
 
     if let Ok(mut f) = OpenOptions::new().append(true).open(&log_path) {
         let _ = writeln!(f, "\n# end {} status={:?} exit={:?}", iso(now()), status, code);
@@ -154,7 +163,21 @@ fn execute(app: Arc<App>, id: String) {
         }
     }
 
-    finalize(&app, &id, status, code, err);
+    finalize(&app, &id, status, code, err, usage);
+
+    if status == RunStatus::Done {
+        crate::plugins::fire(
+            &app,
+            "agent.finished",
+            json!({ "run_id": id.clone(), "agent": run.agent.clone(), "status": "done" }),
+        );
+    } else if matches!(status, RunStatus::Failed | RunStatus::Timeout) {
+        crate::plugins::fire(
+            &app,
+            "run.failed",
+            json!({ "run_id": id.clone(), "agent": run.agent.clone(), "status": format!("{:?}", status).to_lowercase() }),
+        );
+    }
 }
 
 fn update_agent_run_status(app: &Arc<App>, agent_id: &Option<String>, run_id: &str, status: &RunStatus, err: Option<&str>) {
@@ -501,7 +524,7 @@ fn run_api(
     log_path: &Path,
     _cancel: &Arc<AtomicBool>,
     history: &[agents::Msg],
-) -> (RunStatus, Option<i32>, Option<String>, String) {
+ ) -> (RunStatus, Option<i32>, Option<String>, String, Option<RunUsage>) {
     let (default_url, key_env, url_env, default_model) = match run.agent.as_str() {
         "api:deepseek" => (
             "https://api.deepseek.com/chat/completions",
@@ -521,6 +544,7 @@ fn run_api(
                 None,
                 Some(format!("unknown api agent {}", other)),
                 String::new(),
+                None,
             )
         }
     };
@@ -536,6 +560,7 @@ fn run_api(
                 None,
                 Some(format!("missing env {}", key_env)),
                 String::new(),
+                None,
             )
         }
     };
@@ -564,7 +589,7 @@ fn run_api(
 
     let mut f = match OpenOptions::new().append(true).create(true).open(log_path) {
         Ok(f) => f,
-        Err(e) => return (RunStatus::Failed, None, Some(e.to_string()), String::new()),
+        Err(e) => return (RunStatus::Failed, None, Some(e.to_string()), String::new(), None),
     };
     match resp {
         Ok(r) => match r.into_json::<serde_json::Value>() {
@@ -581,11 +606,19 @@ fn run_api(
                         Some(0),
                         Some("empty completion".into()),
                         String::new(),
+                        None,
                     );
                 }
-                (RunStatus::Done, Some(0), None, text)
+                let usage = Some(RunUsage::Data(Usage {
+                    prompt_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
+                    completion_tokens: v["usage"]["completion_tokens"].as_u64().unwrap_or(0),
+                    total_tokens: v["usage"]["total_tokens"].as_u64().unwrap_or(0),
+                    model: model.clone(),
+                    provider: run.agent.clone(),
+                }));
+                (RunStatus::Done, Some(0), None, text, usage)
             }
-            Err(e) => (RunStatus::Failed, None, Some(e.to_string()), String::new()),
+            Err(e) => (RunStatus::Failed, None, Some(e.to_string()), String::new(), None),
         },
         Err(ureq::Error::Status(code, r)) => {
             let body = r.into_string().unwrap_or_default();
@@ -595,15 +628,16 @@ fn run_api(
                 Some(code as i32),
                 Some(format!("http {}", code)),
                 String::new(),
+                None,
             )
         }
         Err(e) => {
             let _ = writeln!(f, "request error: {}", e);
-            (RunStatus::Failed, None, Some(e.to_string()), String::new())
+            (RunStatus::Failed, None, Some(e.to_string()), String::new(), None)
         }
     }
 }
-fn finalize(app: &Arc<App>, id: &str, status: RunStatus, code: Option<i32>, err: Option<String>) {
+fn finalize(app: &Arc<App>, id: &str, status: RunStatus, code: Option<i32>, err: Option<String>, usage: Option<RunUsage>) {
     let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
     let idx = match st.state.runs.iter().position(|r| r.id == id) {
         Some(i) => i,
@@ -621,6 +655,9 @@ fn finalize(app: &Arc<App>, id: &str, status: RunStatus, code: Option<i32>, err:
             r.status = status;
             r.exit_code = code;
             r.ended_at = Some(now());
+            if usage.is_some() {
+                r.usage = usage;
+            }
             if err.is_some() {
                 r.error = err;
             }
@@ -682,6 +719,7 @@ mod tests {
             pid: None,
             attempts: 0,
             agent_id: None,
+            usage: None,
         }
     }
 

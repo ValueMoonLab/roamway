@@ -103,14 +103,12 @@ pub fn pbkdf2_hmac_sha256(password: &[u8], salt: &[u8], iterations: u32, out: &m
     let mut input = Vec::with_capacity(salt.len() + 4);
     input.extend_from_slice(salt);
     input.extend_from_slice(&[0u8; 4]);
-    let mut u = [0u8; 32];
-    let mut t = [0u8; 32];
     let mut offset = 0usize;
     for block in 1u32..=blocks {
         let idx = input.len() - 4;
         input[idx..].copy_from_slice(&block.to_be_bytes());
-        u = hmac_sha256(password, &input);
-        t = u;
+        let mut u = hmac_sha256(password, &input);
+        let mut t = u;
         for _ in 1..iterations {
             u = hmac_sha256(password, &u);
             for b in 0..32 { t[b] ^= u[b]; }
@@ -509,7 +507,7 @@ impl ApprovalStore {
             .unwrap_or_default();
         let before = records.len();
         records.retain(|r| r.ts >= now() - APPROVAL_RETENTION_SECS || r.status == "pending");
-        let mut store = ApprovalStore { path, records };
+        let store = ApprovalStore { path, records };
         if store.records.len() != before { store.save(); }
         store
     }

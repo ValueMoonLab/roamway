@@ -1727,6 +1727,7 @@ fn create_run(app: &Arc<App>, req: &Req) -> (u16, Value) {
             pid: None,
             attempts: 0,
             agent_id: None,
+            usage: None,
         };
         st.state.runs.push(r.clone());
         jobs::prune(&mut st);
@@ -2185,6 +2186,7 @@ mod tests {
             pid: None,
             attempts: 0,
             agent_id: None,
+            usage: None,
         };
         let store = Store {
             dir: dir.clone(),
@@ -2257,6 +2259,7 @@ mod tests {
             pid: None,
             attempts: 0,
             agent_id: None,
+            usage: None,
         };
         let store = Store {
             dir: dir.to_path_buf(),

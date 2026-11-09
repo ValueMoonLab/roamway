@@ -495,6 +495,7 @@ pub fn create_run_for_schedule(app: &Arc<App>, schedule_id: &str) {
             pid: None,
             attempts: 0,
             agent_id: None,
+            usage: None,
         });
         crate::jobs::prune(&mut st);
         st.save();

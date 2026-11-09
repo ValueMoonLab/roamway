@@ -9,6 +9,10 @@ mod server;
 mod terminals;
 mod types;
 mod workspaces;
+mod plugins;
+mod providers;
+mod speech;
+mod usage;
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -66,6 +70,12 @@ fn usage() {
   roamway script ls [--json] | add --name N --cmd C [--workspace P] | rm <name>
   roamway script start <name> | stop <name>
   注：受管终端无 TTY，TUI 程序（vim/top 交互界面）不支持
+
+生态扩展：
+  roamway provider [ls|models [<id>] [--refresh]|diagnostic <id>]
+  roamway usage [ls [--since 7d|24h|ISO] [--provider id]|inspect <run_id>] [--json]
+  roamway plugin [ls|init <name>|logs <name>|reload <name>|enable|disable <name> [--trust]|remove <name> [--keep-files]]
+  roamway speech [transcribe <file>|say <text> [--out file]]
 
 通用参数：--host http://127.0.0.1:8796  --token T
 环境变量：ROAMWAY_HOST / ROAMWAY_TOKEN / ROAMWAY_DEEPSEEK_KEY / ROAMWAY_QWEN_KEY
@@ -373,6 +383,10 @@ fn main() {
         "workspace" => cmd_workspace(&flags, &pos),
         "terminal" | "term" => cmd_terminal(&flags, &pos),
         "script" | "scripts" => cmd_script(&flags, &pos),
+        "provider" => cmd_provider(&flags, &pos),
+        "usage" => cmd_usage(&flags, &pos),
+        "plugin" => cmd_plugin(&flags, &pos),
+        "speech" => cmd_speech(&flags, &pos),
         "run" => cmd_run(&flags, &pos),
         "ls" | "list" => cmd_ls(&flags),
         "status" => {
@@ -2523,16 +2537,17 @@ fn cmd_token_create(flags: &HashMap<String, String>, data: &std::path::Path) {
 
 fn cmd_token_ls(flags: &HashMap<String, String>, data: &std::path::Path) {
     let store = auth::TokenStore::load(data);
+    let tokens = store.list();
     if flags.contains_key("json") {
-        println!("{}", serde_json::to_string_pretty(&store.tokens).unwrap_or_default());
+        println!("{}", serde_json::to_string_pretty(&tokens).unwrap_or_default());
         return;
     }
-    if store.tokens.is_empty() {
+    if tokens.is_empty() {
         println!("no tokens");
         return;
     }
     println!("{:<34} {:<20} {:<18} {:<21} sha256", "id", "name", "scopes", "expires");
-    for t in &store.tokens {
+    for t in &tokens {
         let name: String = t.name.chars().take(20).collect();
         let exp = match t.expires_at {
             Some(e) => iso(e),
@@ -2687,6 +2702,330 @@ fn cmd_reload(flags: &HashMap<String, String>) {
         return;
     }
     cmd_daemon_reload(flags);
+}
+
+fn cmd_provider(flags: &HashMap<String, String>, pos: &[String]) {
+    let dir = data_dir_for(flags);
+    let providers = providers::load(&dir);
+    match pos.first().map(String::as_str).unwrap_or("ls") {
+        "ls" | "list" | "" => {
+            println!(
+                "{:<14} {:<6} {:<10} {:<7} {:<9} {}",
+                "ID", "KIND", "STATUS", "MODELS", "KEY", "ENDPOINT"
+            );
+            for p in &providers {
+                let key = if p.kind == "api" {
+                    if p.env_key.is_empty() {
+                        "-".to_string()
+                    } else {
+                        match std::env::var(&p.env_key) {
+                            Ok(v) if !v.trim().is_empty() => "[set]".to_string(),
+                            _ => "[missing]".to_string(),
+                        }
+                    }
+                } else {
+                    "-".to_string()
+                };
+                let endpoint = if p.base_url.is_empty() { "-".to_string() } else { p.base_url.clone() };
+                println!(
+                    "{:<14} {:<6} {:<10} {:<7} {:<9} {}",
+                    p.id,
+                    p.kind,
+                    providers::state(p),
+                    p.models.len(),
+                    key,
+                    endpoint
+                );
+            }
+        }
+        "models" => cmd_provider_models(flags, &dir, &providers, &pos[1..]),
+        "diagnostic" => {
+            let id = match pos.get(1) {
+                Some(id) => id,
+                None => {
+                    eprintln!("usage: roamway provider diagnostic <id>");
+                    return;
+                }
+            };
+            match providers::get(&providers, id) {
+                Some(p) => {
+                    for line in providers::diagnostic_lines(&dir, p) {
+                        println!("{}", line);
+                    }
+                }
+                None => eprintln!("provider '{}' not found", id),
+            }
+        }
+        _ => eprintln!("usage: roamway provider [ls|models [<id>] [--refresh]|diagnostic <id>]"),
+    }
+}
+
+fn cmd_provider_models(
+    flags: &HashMap<String, String>,
+    dir: &std::path::Path,
+    providers: &[providers::Provider],
+    pos: &[String],
+) {
+    let want = pos.first().map(String::as_str);
+    for p in providers {
+        if let Some(id) = want {
+            if p.id != id {
+                continue;
+            }
+        }
+        let mut models = p.models.clone();
+        if flags.contains_key("refresh") && p.kind == "api" && !p.base_url.is_empty() {
+            match providers::fetch_models(&p.base_url) {
+                Ok(list) => models = list,
+                Err(e) => eprintln!("roamway: refresh {} models failed: {} (using builtins)", p.id, e),
+            }
+        }
+        let rendered = if models.is_empty() {
+            "-".to_string()
+        } else {
+            models.join(", ")
+        };
+        println!("{}: {}", p.id, rendered);
+    }
+    if let Some(id) = want {
+        if !providers.iter().any(|p| p.id == id) {
+            eprintln!("provider '{}' not found", id);
+        }
+    }
+    let _ = dir;
+}
+
+fn cmd_usage(flags: &HashMap<String, String>, pos: &[String]) {
+    let dir = data_dir_for(flags);
+    let state = usage::read_state(&dir);
+    match pos.first().map(String::as_str).unwrap_or("") {
+        "ls" | "list" => {
+            let since = match usage::since_ts(flags.get("since").map(String::as_str)) {
+                Some(s) => s,
+                None => {
+                    eprintln!("usage: invalid --since (expected 7d, 24h or ISO timestamp)");
+                    return;
+                }
+            };
+            let provider = flags.get("provider").map(String::as_str);
+            let rows = usage::aggregate(&state, since, provider);
+            println!(
+                "{:<12} {:<14} {:<20} {:<6} {:<8} {:<8} {}",
+                "DAY", "PROVIDER", "MODEL", "RUNS", "IN", "OUT", "TOTAL"
+            );
+            for r in rows {
+                println!(
+                    "{:<12} {:<14} {:<20} {:<6} {:<8} {:<8} {}",
+                    r.day, r.provider, r.model, r.runs, r.in_tokens, r.out_tokens, r.total_tokens
+                );
+            }
+        }
+        "inspect" => {
+            let id = match pos.get(1) {
+                Some(id) => id,
+                None => {
+                    eprintln!("usage: roamway usage inspect <run_id>");
+                    return;
+                }
+            };
+            match usage::inspect_lines(&state, id) {
+                Some(lines) => {
+                    for line in lines {
+                        println!("{}", line);
+                    }
+                }
+                None => eprintln!("no such run: {}", id),
+            }
+        }
+        "" => {
+            let report = usage::report_json(&state);
+            if flags.contains_key("json") {
+                println!("{}", serde_json::to_string_pretty(&report).unwrap_or_default());
+                return;
+            }
+            let ov = &report["overview"];
+            println!(
+                "overview: runs={} prompt_tokens={} completion_tokens={} total_tokens={}",
+                ov["runs"], ov["prompt_tokens"], ov["completion_tokens"], ov["total_tokens"]
+            );
+            println!("\nby provider:");
+            let empty: Vec<Value> = Vec::new();
+            for item in report["by_provider"].as_array().unwrap_or(&empty) {
+                println!(
+                    "  {:<20} in={:<10} out={:<10} total={}",
+                    item["provider"].as_str().unwrap_or("-"),
+                    item["prompt_tokens"],
+                    item["completion_tokens"],
+                    item["total_tokens"]
+                );
+            }
+            println!("\nby model:");
+            for item in report["by_model"].as_array().unwrap_or(&empty) {
+                println!(
+                    "  {:<20} in={:<10} out={:<10} total={}",
+                    item["model"].as_str().unwrap_or("-"),
+                    item["prompt_tokens"],
+                    item["completion_tokens"],
+                    item["total_tokens"]
+                );
+            }
+            println!("\ntop 20 most expensive runs:");
+            for item in report["top_expensive"].as_array().unwrap_or(&empty) {
+                println!(
+                    "  {:<12} model={:<16} provider={:<14} total={}",
+                    item["run_id"].as_str().unwrap_or("-"),
+                    item["model"].as_str().unwrap_or("-"),
+                    item["provider"].as_str().unwrap_or("-"),
+                    item["total_tokens"]
+                );
+            }
+        }
+        _ => eprintln!("usage: roamway usage [ls [--since 7d|24h|ISO] [--provider id]|inspect <run_id>] [--json]"),
+    }
+}
+
+fn cmd_plugin(flags: &HashMap<String, String>, pos: &[String]) {
+    let dir = data_dir_for(flags);
+    match pos.first().map(String::as_str).unwrap_or("ls") {
+        "ls" | "list" | "" => {
+            let reg = plugins::Registry::load(&dir);
+            println!(
+                "{:<16} {:<10} {:<8} {:<8} {:<8} {}",
+                "NAME", "VERSION", "ENABLED", "TRUSTED", "TIMEOUT", "ENTRY"
+            );
+            for p in &reg.plugins {
+                println!(
+                    "{:<16} {:<10} {:<8} {:<8} {:<8} {}",
+                    p.name,
+                    p.version,
+                    p.enabled,
+                    p.trusted,
+                    p.timeout_s,
+                    p.entry.join(" ")
+                );
+            }
+        }
+        "init" => {
+            let name = match pos.get(1) {
+                Some(n) => n,
+                None => {
+                    eprintln!("usage: roamway plugin init <name>");
+                    return;
+                }
+            };
+            match plugins::init(&dir, name) {
+                Ok(()) => println!("plugin '{}' initialized (not enabled)", name),
+                Err(e) => eprintln!("plugin init failed: {}", e),
+            }
+        }
+        "logs" => {
+            let name = match pos.get(1) {
+                Some(n) => n,
+                None => {
+                    eprintln!("usage: roamway plugin logs <name>");
+                    return;
+                }
+            };
+            let reg = plugins::Registry::load(&dir);
+            if reg.get(name).is_none() {
+                eprintln!("plugin '{}' not registered", name);
+            }
+            print!("{}", plugins::read_log(&dir, name));
+        }
+        "reload" => {
+            let name = match pos.get(1) {
+                Some(n) => n,
+                None => {
+                    eprintln!("usage: roamway plugin reload <name>");
+                    return;
+                }
+            };
+            match plugins::reload(&dir, name) {
+                Ok(()) => println!("plugin '{}' reloaded", name),
+                Err(e) => eprintln!("plugin reload failed: {}", e),
+            }
+        }
+        "enable" | "disable" => {
+            let name = match pos.get(1) {
+                Some(n) => n,
+                None => {
+                    eprintln!("usage: roamway plugin enable|disable <name> [--trust]");
+                    return;
+                }
+            };
+            let enable = pos.first().map(String::as_str) == Some("enable");
+            let trust = flags.contains_key("trust");
+            let result = if enable {
+                plugins::enable(&dir, name, trust)
+            } else {
+                plugins::disable(&dir, name)
+            };
+            match result {
+                Ok(()) => println!(
+                    "plugin '{}' {}",
+                    name,
+                    if enable { "enabled" } else { "disabled" }
+                ),
+                Err(e) => eprintln!("plugin {} failed: {}", name, e),
+            }
+        }
+        "remove" => {
+            let name = match pos.get(1) {
+                Some(n) => n,
+                None => {
+                    eprintln!("usage: roamway plugin remove <name> [--keep-files]");
+                    return;
+                }
+            };
+            match plugins::remove(&dir, name, flags.contains_key("keep-files")) {
+                Ok(()) => println!("plugin '{}' removed", name),
+                Err(e) => eprintln!("plugin remove failed: {}", e),
+            }
+        }
+        _ => eprintln!("usage: roamway plugin ls|init|logs|reload|enable|disable|remove ..."),
+    }
+}
+
+fn cmd_speech(flags: &HashMap<String, String>, pos: &[String]) {
+    let dir = data_dir_for(flags);
+    match pos.first().map(String::as_str).unwrap_or("") {
+        "" => {
+            for line in speech::status_lines(&dir) {
+                println!("{}", line);
+            }
+        }
+        "transcribe" => {
+            let file = match pos.get(1) {
+                Some(f) => f,
+                None => {
+                    eprintln!("usage: roamway speech transcribe <file>");
+                    return;
+                }
+            };
+            match speech::transcribe(&dir, file) {
+                Ok(text) => print!("{}", text),
+                Err(e) => {
+                    eprintln!("{}", e);
+                    eprintln!("example config: {}", speech::example_config());
+                }
+            }
+        }
+        "say" => {
+            let text = pos[1..].join(" ");
+            if text.trim().is_empty() {
+                eprintln!("usage: roamway speech say <text> [--out file]");
+                return;
+            }
+            match speech::say(&dir, &text, flags.get("out").map(String::as_str)) {
+                Ok(path) => println!("{}", path),
+                Err(e) => {
+                    eprintln!("{}", e);
+                    eprintln!("example config: {}", speech::example_config());
+                }
+            }
+        }
+        _ => eprintln!("usage: roamway speech [transcribe <file>|say <text> [--out file]]"),
+    }
 }
 
 /// 测试用的最小 App：共享给 server.rs / terminals.rs 的单测，避免每处重复拼装结构体。
