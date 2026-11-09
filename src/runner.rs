@@ -43,19 +43,21 @@ fn execute(app: Arc<App>, id: String) {
             remove_cancel(&app, &id);
             return;
         }
-        st.state.runs[idx].status = RunStatus::Running;
-        st.state.runs[idx].started_at = Some(now());
-        let r = st.state.runs[idx].clone();
-        let ctx = match r.agent_id.as_deref() {
+        let run_ref = &st.state.runs[idx];
+        let ctx = match run_ref.agent_id.as_deref() {
             Some(aid) => st
                 .state
                 .agents
                 .iter()
                 .find(|a| a.id == aid)
                 .map(|a| (a.kind.clone(), a.session_id.clone(), a.history.clone()))
-                .unwrap_or_else(|| (r.agent.clone(), String::new(), Vec::new())),
-            None => (r.agent.clone(), String::new(), Vec::new()),
+                .unwrap_or_else(|| (run_ref.agent.clone(), String::new(), Vec::new())),
+            None => (run_ref.agent.clone(), String::new(), Vec::new()),
         };
+        st.state.runs[idx].status = RunStatus::Running;
+        st.state.runs[idx].started_at = Some(now());
+        st.state.runs[idx].resumed = agents::should_resume(&ctx.0, &ctx.1);
+        let r = st.state.runs[idx].clone();
         let lp = st.log_path(&id);
         st.save();
         (r, lp, ctx)
@@ -157,13 +159,17 @@ fn execute(app: Arc<App>, id: String) {
         push_assistant(&app, &run.agent_id, &assistant);
     }
     update_agent_run_status(&app, &run.agent_id, &id, &status, err.as_deref());
-    if status == RunStatus::Done {
-        if let Some(note) = resume_note.take() {
-            mark_agent_error(&app, &run.agent_id, &note);
-        }
-    }
-
     finalize(&app, &id, status, code, err, usage);
+
+    if let Some(note) = resume_note.take() {
+        eprintln!(
+            "[resume] unsupported kind={} agent={}",
+            agent_kind,
+            run.agent_id.as_deref().unwrap_or(&run.agent)
+        );
+        apply_resume_note_to_run(&app, &id, &note);
+        mark_agent_error(&app, &run.agent_id, &note);
+    }
 
     if status == RunStatus::Done {
         crate::plugins::fire(
@@ -201,6 +207,22 @@ fn record_agent_session(app: &Arc<App>, agent_id: &Option<String>, sid: &str) {
     let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(a) = st.state.agents.iter_mut().find(|a| a.id == aid) {
         agents::record_session_id(a, sid);
+    }
+    st.save();
+}
+
+/// 把 resume_note 落到 run：Done 时同时写 error，不改 status / exit_code
+fn apply_resume_note(run: &mut Run, note: &str) {
+    run.resume_note = Some(note.to_string());
+    if run.status == RunStatus::Done {
+        run.error = Some(note.to_string());
+    }
+}
+
+fn apply_resume_note_to_run(app: &Arc<App>, run_id: &str, note: &str) {
+    let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(r) = st.state.runs.iter_mut().find(|r| r.id == run_id) {
+        apply_resume_note(r, note);
     }
     st.save();
 }
@@ -722,6 +744,8 @@ mod tests {
             ended_at: None,
             exit_code: None,
             error: None,
+            resumed: false,
+            resume_note: None,
             timeout_s: 10,
             job_id: None,
             pid: None,
@@ -748,6 +772,28 @@ mod tests {
         assert!(start_times_near(1_700_000_000, 1_700_000_010));
         assert!(start_times_near(1_700_000_000, 1_700_000_000));
         assert!(!start_times_near(1_700_000_000, 1_700_000_100));
+    }
+
+    #[test]
+    fn apply_resume_note_marks_done_run_error_without_changing_status() {
+        let mut run = sample_run("shell");
+        run.status = RunStatus::Done;
+        run.exit_code = Some(0);
+        apply_resume_note(&mut run, "resume unsupported");
+        assert_eq!(run.status, RunStatus::Done);
+        assert_eq!(run.exit_code, Some(0));
+        assert_eq!(run.error.as_deref(), Some("resume unsupported"));
+        assert_eq!(run.resume_note.as_deref(), Some("resume unsupported"));
+    }
+
+    #[test]
+    fn apply_resume_note_on_non_done_run_keeps_error_untouched() {
+        let mut run = sample_run("shell");
+        run.status = RunStatus::Failed;
+        apply_resume_note(&mut run, "resume unsupported");
+        assert_eq!(run.status, RunStatus::Failed);
+        assert_eq!(run.error, None);
+        assert_eq!(run.resume_note.as_deref(), Some("resume unsupported"));
     }
 
     #[test]

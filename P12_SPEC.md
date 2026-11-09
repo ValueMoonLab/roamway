@@ -103,10 +103,10 @@
 ## 五、验收（keeper 逐条实测，NAS）
 
 - `source ~/.cargo/env && cargo build --release && cargo test` 全绿，`cargo build --release 2>&1 | grep -c warning` = 0。
-- 在 `/home/GZX/rw-src` 上：
+- 在部署机源码目录 `$RW_SRC` 上：
   - `roamway ls` 表头首列是 `ID`、第二列 `STATE`；`roamway ls --runs` 出现 `STATUS` 列
   - `roamway run --new-workspace worktree --label stage=p12 --env FOO=1 "echo hi"` → 退出码 0，
-    `ls --runs` 里 run 状态 done，`git -C /home/GZX/rw-src worktree list` 出现 `…/worktrees/ag_…`
+    `ls --runs` 里 run 状态 done，`git -C $RW_SRC worktree list` 出现 `…/worktrees/ag_…`
   - `roamway ls --label stage=p12` 命中该 agent；`roamway ls --label stage=nope` 为空表（非报错）
   - `roamway run --thinking high "x"` → rc=2；`roamway ls --background` → rc=2
   - `roamway run --no-wait "echo hi"` 只输出一行且是 `run_` 前缀 id

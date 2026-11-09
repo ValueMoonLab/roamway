@@ -77,6 +77,11 @@ pub fn is_resumable_kind(kind: &str) -> bool {
     matches!(kind, "codex" | "claude")
 }
 
+/// run 是否使用了 provider 会话：codex / claude 且已有 session id
+pub fn should_resume(kind: &str, session_id: &str) -> bool {
+    is_resumable_kind(kind) && !session_id.trim().is_empty()
+}
+
 pub fn cap_history(agent: &mut Agent) {
     let max = if agent.kind.starts_with("api:") { 40 } else { 20 };
     if agent.history.len() > max {
@@ -177,6 +182,8 @@ fn push_run_locked(
     agent: &mut Agent,
     prompt: &str,
     timeout_s: u64,
+    resumed: bool,
+    resume_note: Option<String>,
     labels: BTreeMap<String, String>,
     env: Vec<(String, String)>,
     cwd: Option<String>,
@@ -199,6 +206,8 @@ fn push_run_locked(
         ended_at: None,
         exit_code: None,
         error: None,
+        resumed,
+        resume_note,
         timeout_s,
         job_id: None,
         pid: None,
@@ -305,7 +314,7 @@ pub fn create_agent_and_run(
         labels: labels.clone(),
         worktree_mode: worktree_mode.clone(),
     };
-    let run = push_run_locked(&mut st, &mut agent, prompt, timeout_s, labels, env, cwd)?;
+    let run = push_run_locked(&mut st, &mut agent, prompt, timeout_s, false, None, labels, env, cwd)?;
     st.state.agents.push(agent.clone());
     st.save();
     drop(st);
@@ -341,7 +350,13 @@ pub fn queue_agent_run(
     if agent.state == "archived" {
         return Err("agent is archived".into());
     }
-    let run = push_run_locked(&mut st, &mut agent, prompt, timeout_s, BTreeMap::new(), Vec::new(), None)?;
+    let resumed = should_resume(&agent.kind, &agent.session_id);
+    let resume_note = if is_resumable_kind(&agent.kind) {
+        None
+    } else {
+        Some("resume unsupported".to_string())
+    };
+    let run = push_run_locked(&mut st, &mut agent, prompt, timeout_s, resumed, resume_note, BTreeMap::new(), Vec::new(), None)?;
     if let Some(a) = st.state.agents.iter_mut().find(|a| a.id == agent_id) {
         *a = agent.clone();
     }
@@ -372,7 +387,7 @@ pub fn reload_agent(app: &Arc<App>, agent_id: &str, timeout_s: u64) -> Result<Ru
     agent.session_id.clear();
     agent.history.clear();
     agent.last_error.clear();
-    let run = push_run_locked(&mut st, &mut agent, &first_prompt, timeout_s, BTreeMap::new(), Vec::new(), None)?;
+    let run = push_run_locked(&mut st, &mut agent, &first_prompt, timeout_s, false, None, BTreeMap::new(), Vec::new(), None)?;
     if let Some(a) = st.state.agents.iter_mut().find(|a| a.id == agent_id) {
         *a = agent.clone();
     }
@@ -653,6 +668,14 @@ mod tests {
         let mut shell = sample("shell");
         assert!(!record_session_id(&mut shell, "sid-3"));
         assert!(shell.session_id.is_empty());
+    }
+
+    #[test]
+    fn should_resume_requires_resumable_kind_and_session() {
+        assert!(!should_resume("codex", ""));
+        assert!(should_resume("codex", "x"));
+        assert!(!should_resume("shell", "x"));
+        assert!(!should_resume("api:deepseek", ""));
     }
 
     #[test]

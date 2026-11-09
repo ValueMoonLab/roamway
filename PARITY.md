@@ -146,3 +146,11 @@
 新增单测（`src/main.rs` 内 `#[cfg(test)]`）：`parse_flags_short_o_and_q`、`json_flag_and_format_flag_match`、`yaml_serializer_emits_nested_maps_and_sequences`、`dispatch_returns_usage_exit_code`、`delete_plan_stops_running_runs_before_delete`。
 
 P12 新增单测：`parse_labels_accepts_multi_and_rejects_missing_equals`、`run_plan_worktree_mode_and_unsupported_validation`、`ls_plan_switches_runs_and_global_limit_defaults`、`agent_list_url_encodes_labels_and_order`、`parse_flags_short_a_and_g`（`src/main.rs`）；`filter_agents_applies_label_and_kind_and_limit`（`src/agents.rs`）。
+
+## 五、provider 会话续跑（P13）
+
+| 项 | 状态 | 证据 | 说明 |
+|---|---|---|---|
+| provider 会话续跑 | ⚠️ | `src/agents.rs:fn should_resume`、`src/runner.rs:fn apply_resume_note`、`src/server.rs:fn agent_session_route`、`src/main.rs:fn resume_target` / 测试：`should_resume_requires_resumable_kind_and_session`、`session_route_hits_session_endpoint_before_agent_route`、`resume_target_parses_agent_and_prompt_and_rejects_conflicts`、`apply_resume_note_marks_done_run_error_without_changing_status` | 首轮续跑 ✅（`run --resume/--continue` + `GET /v1/agents/{id}/session`）；unsupported 显式化 ✅（`run.resume_note="resume unsupported"`）；`--thinking` 等未对齐项仍在 |
+
+P13 新增单测：`should_resume_requires_resumable_kind_and_session`（`src/agents.rs`）；`apply_resume_note_marks_done_run_error_without_changing_status`、`apply_resume_note_on_non_done_run_keeps_error_untouched`（`src/runner.rs`）；`session_route_hits_session_endpoint_before_agent_route`、`session_route_missing_agent_returns_404`（`src/server.rs`）；`resume_target_parses_agent_and_prompt_and_rejects_conflicts`（`src/main.rs`）。

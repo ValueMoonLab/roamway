@@ -490,6 +490,8 @@ pub fn create_run_for_schedule(app: &Arc<App>, schedule_id: &str) {
             ended_at: None,
             exit_code: None,
             error: None,
+            resumed: false,
+            resume_note: None,
             timeout_s: SCHEDULE_TIMEOUT_S,
             job_id: Some(s.id.clone()),
             pid: None,

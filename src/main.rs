@@ -28,7 +28,7 @@ use std::thread;
 use std::time::Duration;
 use types::*;
 
-const BOOLS: &[&str] = &["no-wait", "quiet", "json", "allow-overlap", "disabled", "help", "force", "probe", "all", "worktree", "keep-worktree", "run-now", "overlap", "enabled", "enter", "no-enter", "stdin", "no-browser", "no-headers", "no-color", "runs", "background", "global", "version"];
+const BOOLS: &[&str] = &["no-wait", "quiet", "json", "allow-overlap", "disabled", "help", "force", "probe", "all", "worktree", "keep-worktree", "run-now", "overlap", "enabled", "enter", "no-enter", "stdin", "no-browser", "no-headers", "no-color", "runs", "background", "global", "resume", "continue", "version"];
 
 static FAIL_CODE: AtomicI32 = AtomicI32::new(0);
 
@@ -789,7 +789,7 @@ fn print_command_help(cmd: &str) -> bool {
         "usage" => "roamway usage [ls [--since 7d|24h|ISO] [--provider id]|inspect <run_id>] [--json]",
         "plugin" => "roamway plugin ls|init <name>|logs <name>|reload <name>|enable|disable <name> [--trust]|remove <name> [--keep-files]",
         "speech" => "roamway speech [transcribe <file>|say <text> [--out file]]",
-        "run" => "roamway run --agent codex [--model M] [--workspace DIR] [--title T] [--timeout 1800] [--no-wait] [--wait-timeout N] [--new-workspace local|worktree] [--worktree-mode branch-off|checkout-branch|checkout-pr] [--pr-number N] [--cwd DIR] [--env K=V] [--label k=v] [--host H] \"prompt\"",
+        "run" => "roamway run --agent codex [--model M] [--workspace DIR] [--title T] [--timeout 1800] [--no-wait] [--wait-timeout N] [--resume <agent-id> | --continue <agent-id>] [--new-workspace local|worktree] [--worktree-mode branch-off|checkout-branch|checkout-pr] [--pr-number N] [--cwd DIR] [--env K=V] [--label k=v] [--host H] \"prompt\"",
         "send" => "roamway send <agent-id> <prompt...>",
         "delete" => "roamway delete <id> [--yes]",
         "ls" | "list" => "roamway ls [--limit 50] [-a|--all] [-g|--global] [--label k=v] [--kind K] [--host H|all] [-q] [--no-headers] [--json|--format table|json|yaml] ; --runs 看运行记录",
@@ -1140,7 +1140,65 @@ fn wait_run(
     }
 }
 
+fn resume_target(
+    flags: &HashMap<String, String>,
+    pos: &[String],
+) -> Result<(String, String), String> {
+    let has_resume = flags.contains_key("resume");
+    let has_continue = flags.contains_key("continue");
+    if has_resume && has_continue {
+        return Err("run: --resume and --continue are mutually exclusive".into());
+    }
+    if !has_resume && !has_continue {
+        return Err("run: --resume requires an agent id".into());
+    }
+    let agent_id = pos
+        .first()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "resume agent required".to_string())?
+        .clone();
+    let prompt = pos[1..].join(" ");
+    if prompt.trim().is_empty() {
+        return Err("prompt required".into());
+    }
+    Ok((agent_id, prompt))
+}
+
+fn cmd_run_resume(flags: &HashMap<String, String>, pos: &[String]) {
+    let (agent_id, prompt) = match resume_target(flags, pos) {
+        Ok(v) => v,
+        Err(e) => {
+            usage_error(&e);
+            return;
+        }
+    };
+    let body = json!({
+        "prompt": prompt,
+        "timeout_s": flags.get("timeout").and_then(|v| v.parse::<u64>().ok()),
+    });
+    match request(flags, "POST", &format!("/v1/agents/{}/run", agent_id), Some(body)) {
+        Ok(v) => {
+            let id = v["run"]["id"].as_str().unwrap_or("").to_string();
+            if flags.contains_key("no-wait") {
+                println!("{}", id);
+                return;
+            }
+            let mut fetch_status =
+                |rid: &str| request(flags, "GET", &format!("/v1/runs/{}", rid), None);
+            let mut fetch_log =
+                |rid: &str| request(flags, "GET", &format!("/v1/runs/{}/log?tail=40", rid), None);
+            let wait_timeout = flags.get("wait-timeout").and_then(|v| v.parse::<u64>().ok());
+            wait_run(flags, &id, wait_timeout, &mut fetch_status, &mut fetch_log);
+        }
+        Err(e) => eprintln!("resume failed: {}", e),
+    }
+}
+
 fn cmd_run(flags: &HashMap<String, String>, pos: &[String]) {
+    if flags.contains_key("resume") || flags.contains_key("continue") {
+        cmd_run_resume(flags, pos);
+        return;
+    }
     let mut prompt = pos.join(" ");
     if prompt.trim().is_empty() {
         prompt = flags.get("prompt").cloned().unwrap_or_default();
@@ -3278,13 +3336,18 @@ fn cmd_agent_inspect(flags: &HashMap<String, String>, pos: &[String]) {
             println!("model:      {}", a["model"].as_str().unwrap_or("-"));
             println!("workspace:  {}", a["workspace"].as_str().unwrap_or(""));
             println!("session_id: {}", a["session_id"].as_str().unwrap_or(""));
+            let resumable = v["resumable"].as_bool().unwrap_or(false);
+            println!("resumable:  {}", if resumable { "yes" } else { "no" });
+            let session = a["session_id"].as_str().unwrap_or("");
+            println!("session:    {}", if session.is_empty() { "-" } else { session });
             println!("state:      {}", a["state"].as_str().unwrap_or(""));
             println!("parent:     {}", a["parent"].as_str().unwrap_or(""));
             println!("history:    {} msgs", a["history"].as_array().map(|h| h.len()).unwrap_or(0));
             println!("created_at: {}", a["created_at"].as_i64().map(iso).unwrap_or_else(|| "-".into()));
             println!("updated_at: {}", a["updated_at"].as_i64().map(iso).unwrap_or_else(|| "-".into()));
             println!("last_run:   {}", a["last_run_id"].as_str().unwrap_or(""));
-            println!("last_error: {}", a["last_error"].as_str().unwrap_or(""));
+            let last_error = a["last_error"].as_str().unwrap_or("");
+            println!("last_error: {}", if last_error.is_empty() { "-" } else { last_error });
             let empty = vec![];
             let runs = v["runs"].as_array().unwrap_or(&empty);
             println!("runs (recent 5):");
@@ -4602,6 +4665,23 @@ mod tests {
     fn dispatch_returns_usage_exit_code() {
         assert_eq!(dispatch(&["workspace".to_string(), "setup".to_string()]), 2);
         assert_eq!(dispatch(&["roamway-bogus-command".to_string()]), 2);
+    }
+
+    #[test]
+    fn resume_target_parses_agent_and_prompt_and_rejects_conflicts() {
+        let mut flags = HashMap::new();
+        flags.insert("resume".to_string(), "true".to_string());
+        let pos = vec!["ag_1".to_string(), "do".to_string()];
+        assert_eq!(
+            resume_target(&flags, &pos).unwrap(),
+            ("ag_1".to_string(), "do".to_string())
+        );
+
+        let no_prompt = vec!["ag_1".to_string()];
+        assert_eq!(resume_target(&flags, &no_prompt).unwrap_err(), "prompt required");
+
+        flags.insert("continue".to_string(), "true".to_string());
+        assert!(resume_target(&flags, &pos).is_err());
     }
 
     #[test]

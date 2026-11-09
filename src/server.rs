@@ -1104,6 +1104,7 @@ fn route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         ("POST", ["v1", "agents"]) => create_agent_route(app, req),
         ("POST", ["v1", "agents", "import"]) => import_agent_route(app, req),
         ("GET", ["v1", "agents", id, "diff"]) => agent_diff_route(app, id),
+        ("GET", ["v1", "agents", id, "session"]) => agent_session_route(app, id),
         ("GET", ["v1", "agents", id]) => get_agent_route(app, id),
         ("PATCH", ["v1", "agents", id]) => patch_agent_route(app, id, req),
         ("DELETE", ["v1", "agents", id]) => archive_agent_route(app, id, req),
@@ -1658,9 +1659,29 @@ fn get_agent_route(app: &Arc<App>, id: &str) -> (u16, Value) {
                 .collect();
             runs.sort_by(|x, y| y.created_at.cmp(&x.created_at));
             let runs: Vec<Value> = runs.into_iter().map(agent_run_summary).collect();
-            (200, json!({ "agent": a, "runs": runs }))
+            (200, json!({ "agent": a, "runs": runs, "resumable": agents::is_resumable_kind(&a.kind) }))
         }
         None => (404, json!({ "error": "no such agent" })),
+    }
+}
+
+fn agent_session_route(app: &Arc<App>, id: &str) -> (u16, Value) {
+    let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+    match st.state.agents.iter().find(|a| a.id == id) {
+        Some(a) => {
+            let has_session = !a.session_id.trim().is_empty();
+            (200, json!({
+                "agent_id": a.id,
+                "kind": a.kind,
+                "resumable": agents::is_resumable_kind(&a.kind),
+                "has_session": has_session,
+                "session_id": a.session_id,
+                "state": a.state,
+                "last_error": a.last_error,
+                "last_run_id": a.last_run_id,
+            }))
+        }
+        None => (404, json!({"error": "no such agent"})),
     }
 }
 
@@ -2281,6 +2302,8 @@ fn create_run(app: &Arc<App>, req: &Req) -> (u16, Value) {
             ended_at: None,
             exit_code: None,
             error: None,
+            resumed: false,
+            resume_note: None,
             timeout_s,
             job_id: None,
             pid: None,
@@ -2729,6 +2752,72 @@ mod tests {
         assert_eq!(bearer_header(&req), None);
     }
 
+    #[test]
+    fn session_route_hits_session_endpoint_before_agent_route() {
+        let dir = std::env::temp_dir().join(format!("roamway-session-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let app = test_app(&dir, "shell", RunStatus::Done);
+        {
+            let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+            st.state.agents.push(agents::Agent {
+                id: "ag_00000001".into(),
+                title: "t".into(),
+                kind: "codex".into(),
+                model: String::new(),
+                workspace: String::new(),
+                session_id: "sid_1".into(),
+                state: "idle".into(),
+                parent: String::new(),
+                history: vec![],
+                created_at: 0,
+                updated_at: 0,
+                last_run_id: "run_000001".into(),
+                last_error: String::new(),
+                worktree: false,
+                branch: None,
+                base_path: None,
+                labels: BTreeMap::new(),
+                worktree_mode: None,
+            });
+            st.save();
+        }
+        let req = Req {
+            method: "GET".into(),
+            path: "/v1/agents/ag_00000001/session".into(),
+            query: HashMap::new(),
+            raw_query: String::new(),
+            headers: HashMap::new(),
+            body: vec![],
+        };
+        let (code, body) = route(&app, &req);
+        assert_eq!(code, 200);
+        assert_eq!(body["agent_id"].as_str(), Some("ag_00000001"));
+        assert_eq!(body["resumable"].as_bool(), Some(true));
+        assert_eq!(body["has_session"].as_bool(), Some(true));
+        assert_eq!(body["session_id"].as_str(), Some("sid_1"));
+        assert!(body.get("agent").is_none(), "session 路径不能被 get_agent_route 吞掉");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_route_missing_agent_returns_404() {
+        let dir = std::env::temp_dir().join(format!("roamway-session-missing-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let app = test_app(&dir, "shell", RunStatus::Done);
+        let req = Req {
+            method: "GET".into(),
+            path: "/v1/agents/ag_nope/session".into(),
+            query: HashMap::new(),
+            raw_query: String::new(),
+            headers: HashMap::new(),
+            body: vec![],
+        };
+        let (code, body) = route(&app, &req);
+        assert_eq!(code, 404);
+        assert_eq!(body["error"].as_str(), Some("no such agent"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 #[test]
     fn token_create_list_revoke() {
         let dir = std::env::temp_dir().join(format!("roamway-tokens-{}", now()));
@@ -2864,6 +2953,8 @@ mod tests {
             ended_at: None,
             exit_code: None,
             error: None,
+            resumed: false,
+            resume_note: None,
             timeout_s: 60,
             job_id: None,
             pid: None,
@@ -2953,6 +3044,8 @@ mod tests {
             ended_at: None,
             exit_code: None,
             error: None,
+            resumed: false,
+            resume_note: None,
             timeout_s: 60,
             job_id: None,
             pid: None,

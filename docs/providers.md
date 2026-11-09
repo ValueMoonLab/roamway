@@ -32,6 +32,21 @@ ROAMWAY_DEEPSEEK_URL=http://127.0.0.1:11434/v1/chat/completions \
   roamway run --agent api:deepseek --model qwen3:8b "你好"
 ```
 
+## 会话续跑
+
+- `codex` / `claude` 有 provider 侧会话：`codex` 在 run 结束后从日志提取 `session id:`，`claude` 通过 `claude --help` 探测 `--session-id` / `--resume`。
+- `shell` / `api:*` 没有可 resume 的会话 id，续跑时 run 会带 `resume_note: "resume unsupported"`。
+
+```bash
+roamway run --resume <agent-id> "继续上次会话"
+roamway run --continue <agent-id> "继续上次会话"   # --resume 的别名
+```
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" $BASE/v1/agents/<id>/session
+# {"agent_id":"ag_…","kind":"codex","resumable":true,"has_session":true,"session_id":"…","state":"idle","last_error":"","last_run_id":"run_…"}
+```
+
 ## 新增 agent
 
 白名单在 `src/types.rs` 的 `KNOWN_AGENTS`，执行命令映射在 `src/runner.rs` 的 `build_command`；各加一条后重新编译。

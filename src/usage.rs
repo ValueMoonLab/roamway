@@ -271,6 +271,8 @@ mod tests {
             ended_at: Some(day + 5),
             exit_code: Some(0),
             error: None,
+            resumed: false,
+            resume_note: None,
             timeout_s: 60,
             job_id: None,
             pid: None,

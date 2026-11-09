@@ -96,7 +96,7 @@
 ## 六、验收（keeper 实测，NAS）
 
 - NAS `cargo build --release && cargo test` 全绿、0 warning。
-- 在 `/home/GZX/.roamway` 的**副本**目录上实测（不动生产数据）：
+- 在部署机数据目录 `$RW_DATA` 的**副本**上实测（不动生产数据）：
   - `roamway --data /tmp/rwcfg daemon config` → 每行带来源；`--json` 里 `sources.bind == "default"`
   - `roamway --data /tmp/rwcfg daemon config set bind 127.0.0.1:8899` → 文件里出现 `"bind": "127.0.0.1:8899"`，
     `daemon config get bind` 回显该值；`daemon config set token abc` → rc=2 且文件未变

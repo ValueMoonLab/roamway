@@ -144,6 +144,10 @@ pub struct Run {
     pub exit_code: Option<i32>,
     #[serde(default)]
     pub error: Option<String>,
+    #[serde(default)]
+    pub resumed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_note: Option<String>,
     pub timeout_s: u64,
     #[serde(default)]
     pub job_id: Option<String>,
@@ -517,6 +521,8 @@ mod tests {
             ended_at: None,
             exit_code: None,
             error: None,
+            resumed: false,
+            resume_note: None,
             timeout_s: 60,
             job_id: None,
             pid: None,
