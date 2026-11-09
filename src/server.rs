@@ -1,6 +1,7 @@
 use crate::agents;
 use crate::auth;
 use crate::hosts;
+use crate::hub;
 use crate::jobs;
 use crate::schedules;
 use crate::terminals;
@@ -56,6 +57,17 @@ pub fn serve(app: Arc<App>, bind: &str) -> std::io::Result<()> {
         println!("roamway listening on unix://{}", path.display());
         let a = app.clone();
         thread::spawn(move || serve_unix(a, listener));
+    }
+
+    #[cfg(not(unix))]
+    if let Some(path) = app.unix_socket.clone() {
+        // 非 unix 平台没有 unix socket 实现：明确告警而不是静默忽略参数。
+        // 该分支同时让字段在 not(unix) 下也被读取，否则 CI 的 RUSTFLAGS=-D warnings
+        // 会把 types.rs 的 `field unix_socket is never read` 变成 error（Windows job 红）。
+        eprintln!(
+            "roamway: warning: --unix-socket {} is not supported on this platform; ignoring",
+            path.display()
+        );
     }
 
     println!("roamway listening on http://{}", actual);
@@ -417,6 +429,14 @@ enum AuthOutcome {
     Identity { token_id: String, scopes: Vec<String> },
 }
 
+fn legacy_token_on_disk(app: &App) -> Option<String> {
+    let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+    std::fs::read_to_string(st.dir.join("token"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn authenticate(app: &Arc<App>, presented: Option<&str>) -> AuthOutcome {
     let has_tokens = {
         let st = app.tokens.lock().unwrap_or_else(|e| e.into_inner());
@@ -426,8 +446,12 @@ fn authenticate(app: &Arc<App>, presented: Option<&str>) -> AuthOutcome {
         return AuthOutcome::Open;
     }
     let got = presented.unwrap_or_default();
-    if let Some(legacy) = app.token.as_deref().filter(|t| !t.is_empty()) {
-        if auth::ct_eq_str(legacy, got) {
+    let legacy_token = match app.token.as_deref().filter(|t| !t.is_empty()) {
+        Some(flag_token) => legacy_token_on_disk(app).unwrap_or_else(|| flag_token.to_string()),
+        None => String::new(),
+    };
+    if !legacy_token.is_empty() {
+        if auth::ct_eq_str(&legacy_token, got) {
             return AuthOutcome::Identity {
                 token_id: "legacy".to_string(),
                 scopes: auth::ALL_SCOPES.iter().map(|s| s.to_string()).collect(),
@@ -546,6 +570,7 @@ fn stream_agent_events<C: Conn>(app: &Arc<App>, s: &mut C, id: &str) {
 }
 fn needs_auth(path: &str) -> bool {
     !matches!(path, "/health" | "/v1/auth/login" | "/v1/auth/pair")
+        && !path.starts_with("/v1/hub/hooks/")
 }
 
 /// 常量时间比较，避免按字节提前返回泄露 token 前缀
@@ -930,7 +955,13 @@ fn route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         ("POST", ["v1", "schedules", id, "resume"]) => resume_schedule(app, id),
         ("GET", ["v1", "schedules", id, "logs"]) => schedule_logs(app, req, id),
         ("GET", ["v1", "status"]) => status_route(app),
-        ("GET", ["v1", "hooks"]) => hooks_route(app),        ("GET", ["v1", "agents"]) => list_agents_route(app, req),
+        ("GET", ["v1", "hooks"]) => hooks_route(app),
+        ("GET", ["v1", "hub"]) => hub_overview_route(app),
+        ("GET", ["v1", "hub", "triggers"]) => hub_triggers_route(app),
+        ("POST", ["v1", "hub", "triggers", id, "enable"]) => hub_trigger_enabled_route(app, id, true),
+        ("POST", ["v1", "hub", "triggers", id, "disable"]) => hub_trigger_enabled_route(app, id, false),
+        ("POST", ["v1", "hub", "hooks", trigger_id]) => hub_hook_route(app, req, trigger_id),
+        ("GET", ["v1", "agents"]) => list_agents_route(app, req),
         ("POST", ["v1", "agents"]) => create_agent_route(app, req),
         ("POST", ["v1", "agents", "import"]) => import_agent_route(app, req),
         ("GET", ["v1", "agents", id]) => get_agent_route(app, id),
@@ -1303,6 +1334,138 @@ fn hooks_route(app: &Arc<App>) -> (u16, Value) {
         "records": ss.hooks,
     }))
 }
+fn hub_data_dir(app: &Arc<App>) -> std::path::PathBuf {
+    let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+    st.dir.clone()
+}
+
+fn hub_overview_route(app: &Arc<App>) -> (u16, Value) {
+    let dir = hub_data_dir(app);
+    let hub = match hub::load(&dir) {
+        Some(h) => h,
+        None => return (404, json!({"error": "hub not initialized"})),
+    };
+    let enabled = hub.triggers.iter().filter(|t| t.enabled).count();
+    let recent = {
+        let rt = app.hub_rt.lock().unwrap_or_else(|e| e.into_inner());
+        rt.recent()
+    };
+    (200, json!({
+        "hub_id": hub.hub_id,
+        "name": hub.name,
+        "created_at": hub.created_at,
+        "projects": hub.projects.len(),
+        "permissions": hub.permissions.len(),
+        "triggers": hub.triggers.len(),
+        "triggers_enabled": enabled,
+        "triggers_disabled": hub.triggers.len() - enabled,
+        "recent": recent,
+    }))
+}
+
+fn hub_triggers_route(app: &Arc<App>) -> (u16, Value) {
+    let dir = hub_data_dir(app);
+    let hub = match hub::load(&dir) {
+        Some(h) => h,
+        None => return (404, json!({"error": "hub not initialized"})),
+    };
+    (200, json!({"triggers": hub.triggers}))
+}
+
+fn hub_trigger_enabled_route(app: &Arc<App>, id: &str, enabled: bool) -> (u16, Value) {
+    let dir = hub_data_dir(app);
+    let mut hub = match hub::load(&dir) {
+        Some(h) => h,
+        None => return (404, json!({"error": "hub not initialized"})),
+    };
+    match hub.triggers.iter_mut().find(|t| t.id == id) {
+        Some(t) => {
+            t.enabled = enabled;
+            match hub::save(&dir, &hub) {
+                Ok(()) => (200, json!({"ok": true, "id": id, "enabled": enabled})),
+                Err(e) => (500, json!({"error": e})),
+            }
+        }
+        None => (404, json!({"error": "no such trigger"})),
+    }
+}
+
+fn hub_hook_route(app: &Arc<App>, req: &Req, trigger_id: &str) -> (u16, Value) {
+    let dir = hub_data_dir(app);
+    let hub = match hub::load(&dir) {
+        Some(h) => h,
+        None => return (404, json!({"error": "hub not initialized"})),
+    };
+    let trigger = match hub.triggers.iter().find(|t| t.id == trigger_id) {
+        Some(t) => t,
+        None => return (404, json!({"error": "no such trigger"})),
+    };
+    if !trigger.enabled {
+        return (403, json!({"error": "trigger disabled"}));
+    }
+    let ip = req
+        .headers
+        .get("x-forwarded-for")
+        .or_else(|| req.headers.get("x-real-ip"))
+        .map(|v| v.as_str())
+        .unwrap_or("");
+    let source = hub::mask_ip(ip);
+
+    let secret = match std::env::var(&trigger.secret_env) {
+        Ok(s) if !s.is_empty() => s,
+        _ => return (403, json!({"error": "missing webhook secret"})),
+    };
+    let sig = req
+        .headers
+        .get("x-hub-signature-256")
+        .map(|v| v.as_str())
+        .unwrap_or("");
+    if let Err(e) = hub::verify_signature(secret.as_bytes(), &req.body, sig) {
+        let mut rt = app.hub_rt.lock().unwrap_or_else(|e| e.into_inner());
+        rt.record_activity(source.clone(), format!("auth_failed:{}", e));
+        return (403, json!({"error": "bad signature"}));
+    }
+
+    let github_event = req.headers.get("x-github-event").map(|v| v.as_str());
+    if !hub::event_matches(trigger, github_event) {
+        return (200, json!({"skipped": "event"}));
+    }
+
+    let delivery = req.headers.get("x-github-delivery").map(|v| v.as_str());
+    {
+        let mut rt = app.hub_rt.lock().unwrap_or_else(|e| e.into_inner());
+        if rt.check_delivery(delivery) {
+            return (200, json!({"duplicate": true}));
+        }
+    }
+
+    let busy = {
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        let running = st.state.runs.iter().filter(|r| r.status == RunStatus::Running).count();
+        let queued = st.state.runs.iter().filter(|r| r.status == RunStatus::Queued).count();
+        running + queued >= app.max_concurrent
+    };
+    if busy {
+        let mut rt = app.hub_rt.lock().unwrap_or_else(|e| e.into_inner());
+        rt.record_activity(source.clone(), "skipped:busy".into());
+        return (429, json!({"error": "busy", "skipped": "busy"}));
+    }
+
+    let spec = trigger.agent_spec.clone();
+    match agents::create_agent_and_run(app, &spec.provider, None, Some(spec.cwd.clone()), None, &spec.prompt, 1800, false) {
+        Ok((_agent, run)) => {
+            agents::tag_run_trigger(app, &run.id, trigger_id);
+            let mut rt = app.hub_rt.lock().unwrap_or_else(|e| e.into_inner());
+            rt.record_activity(source, format!("run:{}", run.id));
+            (202, json!({"run_id": run.id}))
+        }
+        Err(e) => {
+            let mut rt = app.hub_rt.lock().unwrap_or_else(|e| e.into_inner());
+            rt.record_activity(source, format!("failed:{}", e));
+            (400, json!({"error": e}))
+        }
+    }
+}
 fn query_true(req: &Req, key: &str) -> bool {
     req.query
         .get(key)
@@ -1587,6 +1750,9 @@ fn list_runs(app: &Arc<App>, req: &Req) -> (u16, Value) {
         .unwrap_or(0);
     let mut list: Vec<Run> = st.state.runs.clone();
     list.reverse();
+    if let Some(t) = req.query.get("trigger") {
+        list.retain(|r| r.trigger_id.as_deref() == Some(t.as_str()));
+    }
     let start = offset.min(list.len());
     let end = (start + limit).min(list.len());
     let mut page: Vec<Run> = list[start..end].to_vec();
@@ -1726,7 +1892,8 @@ fn create_run(app: &Arc<App>, req: &Req) -> (u16, Value) {
             job_id: None,
             pid: None,
             attempts: 0,
-            agent_id: None,
+            agent_id: None,
+            trigger_id: None,
             usage: None,
         };
         st.state.runs.push(r.clone());
@@ -2185,7 +2352,8 @@ mod tests {
             job_id: None,
             pid: None,
             attempts: 0,
-            agent_id: None,
+            agent_id: None,
+            trigger_id: None,
             usage: None,
         };
         let store = Store {
@@ -2214,6 +2382,7 @@ mod tests {
             approvals: std::sync::Mutex::new(auth::ApprovalStore::load(&dir)),
             passwords: std::sync::Mutex::new(auth::PasswordStore::load(&dir)),
             pairings: std::sync::Mutex::new(auth::PairingStore::load(&dir)),
+            hub_rt: std::sync::Mutex::new(Default::default()),
             allow_hosts: vec![],
             allow_origins: vec![],
             require_approval: vec![],
@@ -2241,6 +2410,15 @@ mod tests {
     }
 
     fn test_app(dir: &std::path::Path, agent: &str, status: RunStatus) -> Arc<App> {
+        test_app_with_max(dir, agent, status, 4)
+    }
+
+    fn test_app_with_max(
+        dir: &std::path::Path,
+        agent: &str,
+        status: RunStatus,
+        max_concurrent: usize,
+    ) -> Arc<App> {
         let run = Run {
             id: "run_000001".into(),
             title: String::new(),
@@ -2259,6 +2437,7 @@ mod tests {
             pid: None,
             attempts: 0,
             agent_id: None,
+            trigger_id: None,
             usage: None,
         };
         let store = Store {
@@ -2275,13 +2454,14 @@ mod tests {
             started: now(),
             cancels: std::sync::Mutex::new(HashMap::new()),
             tz_offset_hours: 8,
-            max_concurrent: 4,
+            max_concurrent,
             max_conn: 64,
             conns: std::sync::atomic::AtomicUsize::new(0),
             tokens: std::sync::Mutex::new(auth::TokenStore::load(dir)),
             approvals: std::sync::Mutex::new(auth::ApprovalStore::load(dir)),
             passwords: std::sync::Mutex::new(auth::PasswordStore::load(dir)),
             pairings: std::sync::Mutex::new(auth::PairingStore::load(dir)),
+            hub_rt: std::sync::Mutex::new(Default::default()),
             allow_hosts: vec![],
             allow_origins: vec![],
             require_approval: vec![],
@@ -2381,6 +2561,135 @@ mod tests {
         sender.join().unwrap();
     }
 
+    #[test]
+    fn hub_webhook_paths_are_public() {
+        assert!(!needs_auth("/v1/hub/hooks/trg_00000001"));
+        assert!(needs_auth("/v1/hub"));
+        assert!(needs_auth("/v1/hub/triggers"));
+    }
+
+    #[test]
+    fn hub_overview_404_without_init() {
+        let dir = std::env::temp_dir().join(format!("roamway-hub-404-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let app = test_app(&dir, "shell", RunStatus::Done);
+        let (code, body) = hub_overview_route(&app);
+        assert_eq!(code, 404);
+        assert_eq!(body["error"].as_str(), Some("hub not initialized"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hub_legacy_token_reads_disk_for_rotation() {
+        let dir = std::env::temp_dir().join(format!("roamway-hub-rotate-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let app = test_app(&dir, "shell", RunStatus::Done);
+        assert_eq!(legacy_token_on_disk(&app), None);
+        std::fs::write(dir.join("token"), "rotated-token\n").unwrap();
+        assert_eq!(legacy_token_on_disk(&app).as_deref(), Some("rotated-token"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hub_trigger_enable_disable_and_missing() {
+        let dir = std::env::temp_dir().join(format!("roamway-hub-trig-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut hub = hub::init(&dir, None, false).unwrap();
+        hub.triggers.push(hub::HubTrigger {
+            id: "trg_00000001".into(),
+            source: "generic".into(),
+            repo: None,
+            events: vec![],
+            secret_env: "ROAMWAY_HOOK_TRG_00000001".into(),
+            agent_spec: hub::HubAgentSpec {
+                provider: "shell".into(),
+                cwd: ".".into(),
+                prompt: "echo hi".into(),
+            },
+            enabled: true,
+        });
+        hub::save(&dir, &hub).unwrap();
+        let app = test_app(&dir, "shell", RunStatus::Done);
+        let (code, body) = hub_trigger_enabled_route(&app, "trg_00000001", false);
+        assert_eq!(code, 200);
+        assert_eq!(body["enabled"].as_bool(), Some(false));
+        let (code2, _) = hub_trigger_enabled_route(&app, "trg_missing", true);
+        assert_eq!(code2, 404);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn list_runs_filters_by_trigger() {
+        let dir = std::env::temp_dir().join(format!("roamway-trig-filter-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let app = test_app(&dir, "shell", RunStatus::Done);
+        {
+            let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+            st.state.runs[0].trigger_id = Some("trg_a".into());
+        }
+        let req = Req {
+            method: "GET".into(),
+            path: "/v1/runs".into(),
+            query: HashMap::from([("trigger".into(), "trg_a".into())]),
+            headers: HashMap::new(),
+            body: vec![],
+        };
+        let (code, body) = list_runs(&app, &req);
+        assert_eq!(code, 200);
+        assert_eq!(body["runs"].as_array().unwrap().len(), 1);
+
+        let req = Req {
+            method: "GET".into(),
+            path: "/v1/runs".into(),
+            query: HashMap::from([("trigger".into(), "trg_b".into())]),
+            headers: HashMap::new(),
+            body: vec![],
+        };
+        let (code, body) = list_runs(&app, &req);
+        assert_eq!(code, 200);
+        assert_eq!(body["runs"].as_array().unwrap().len(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hub_hook_busy_returns_429() {
+        let dir = std::env::temp_dir().join(format!("roamway-hub-busy-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let secret_env = format!("ROAMWAY_HOOK_BUSY_{}", now());
+        std::env::set_var(&secret_env, "s3cret");
+        let mut hub = hub::init(&dir, None, false).unwrap();
+        hub.triggers.push(hub::HubTrigger {
+            id: "trg_00000001".into(),
+            source: "generic".into(),
+            repo: None,
+            events: vec![],
+            secret_env: secret_env.clone(),
+            agent_spec: hub::HubAgentSpec {
+                provider: "shell".into(),
+                cwd: ".".into(),
+                prompt: "echo hi".into(),
+            },
+            enabled: true,
+        });
+        hub::save(&dir, &hub).unwrap();
+        let app = test_app_with_max(&dir, "shell", RunStatus::Running, 1);
+        let mac = auth::hmac_sha256(b"s3cret", b"{}");
+        let sig = format!("sha256={}", auth::hex_encode(&mac));
+        let req = Req {
+            method: "POST".into(),
+            path: "/v1/hub/hooks/trg_00000001".into(),
+            query: HashMap::new(),
+            headers: HashMap::from([
+                ("x-hub-signature-256".into(), sig),
+                ("x-github-delivery".into(), "busy-1".into()),
+            ]),
+            body: b"{}".to_vec(),
+        };
+        let (code, body) = hub_hook_route(&app, &req, "trg_00000001");
+        assert_eq!(code, 429);
+        assert_eq!(body["skipped"].as_str(), Some("busy"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     #[test]
     #[cfg(unix)]
     fn unix_socket_path_permissions_are_0600() {

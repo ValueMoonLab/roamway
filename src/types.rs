@@ -144,6 +144,8 @@ pub struct Run {
     #[serde(default)]
     pub agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trigger_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<RunUsage>,
 }
 
@@ -359,6 +361,7 @@ pub struct App {
     pub approvals: Mutex<auth::ApprovalStore>,
     pub passwords: Mutex<auth::PasswordStore>,
     pub pairings: Mutex<auth::PairingStore>,
+    pub hub_rt: Mutex<crate::hub::HubRuntime>,
     pub allow_hosts: Vec<String>,
     pub allow_origins: Vec<String>,
     pub require_approval: Vec<String>,
@@ -503,6 +506,7 @@ mod tests {
             pid: None,
             attempts: 0,
             agent_id: None,
+            trigger_id: None,
             usage: None,
         };
         let state = State {

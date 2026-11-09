@@ -176,6 +176,7 @@ fn push_run_locked(
         pid: None,
         attempts: 0,
         agent_id: Some(agent.id.clone()),
+        trigger_id: None,
         usage: None,
     };
     st.state.runs.push(run.clone());
@@ -255,6 +256,14 @@ pub fn create_agent_and_run(
     drop(st);
     crate::jobs::drain_queued(app);
     Ok((agent, run))
+}
+
+pub fn tag_run_trigger(app: &Arc<App>, run_id: &str, trigger_id: &str) {
+    let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(r) = st.state.runs.iter_mut().find(|r| r.id == run_id) {
+        r.trigger_id = Some(trigger_id.to_string());
+        st.save();
+    }
 }
 
 pub fn queue_agent_run(

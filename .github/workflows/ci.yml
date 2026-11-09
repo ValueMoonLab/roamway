@@ -2,7 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    # ci-probe-* 是驱动器的预演分支：先在那里跑三平台 CI，全绿才推 main。
+    # 没有这个过滤器，探针分支不会触发 workflow，门禁就形同虚设。
+    branches: [main, 'ci-probe-*']
   pull_request:
 
 jobs:

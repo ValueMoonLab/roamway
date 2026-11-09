@@ -2,6 +2,7 @@ mod agents;
 mod auth;
 mod cron;
 mod hosts;
+mod hub;
 mod jobs;
 mod runner;
 mod schedules;
@@ -38,7 +39,7 @@ fn usage() {
   roamway agent run <prompt> [--title --workspace --model --kind --worktree --no-wait]
   roamway agent ls|inspect|logs|wait|attach|archive [--keep-worktree]|reload|update|open|detach|import
   roamway attach|inspect|wait|archive|import <id>   # 顶层别名
-  roamway ls     [--limit 20] [--host H|all]
+  roamway ls     [--limit 20] [--host H|all] [--trigger ID]
   roamway status [ID] [--json] [--host H]
   roamway logs   ID [--tail 80] [--host H]
   roamway stop   ID [--host H]
@@ -46,6 +47,7 @@ fn usage() {
   roamway jobs
   roamway schedule create|ls|inspect|logs|pause|resume|delete|run-once|update [--host H]
   roamway hooks [--json] [--host H]
+  roamway hub [init [--name N] [--force] | permissions | projects | deploy | logout | status | token rotate]
   roamway jobs-add --agent shell --every 3600 | --daily 08:30 [--model M] [--workspace DIR] [--max-retries 2] "prompt"
   roamway jobs-run ID
   roamway jobs-rm  ID
@@ -398,6 +400,7 @@ fn main() {
         }
         "schedule" => cmd_schedule(&flags, &pos),
         "hooks" => cmd_hooks(&flags),
+        "hub" => cmd_hub(&flags, &pos),
         "agent" => cmd_agent(&flags, &pos),
         "attach" => cmd_agent_attach(&flags, &pos),
         "inspect" => cmd_agent_inspect(&flags, &pos),
@@ -530,6 +533,7 @@ fn cmd_serve(flags: &HashMap<String, String>) {
         approvals: Mutex::new(approval_store),
         passwords: Mutex::new(password_store),
         pairings: Mutex::new(pairing_store),
+        hub_rt: Mutex::new(crate::hub::HubRuntime::default()),
         allow_hosts,
         allow_origins,
         require_approval,
@@ -668,7 +672,12 @@ fn cmd_ls(flags: &HashMap<String, String>) {
         .get("limit")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(20);
-    match c.req("GET", &format!("/v1/runs?limit={}", limit), None) {
+    let trigger = flags.get("trigger").cloned().filter(|t| !t.is_empty() && t != "true");
+    let mut url = format!("/v1/runs?limit={}", limit);
+    if let Some(t) = trigger {
+        url.push_str(&format!("&trigger={}", t));
+    }
+    match c.req("GET", &url, None) {
         Ok(v) => {
             let empty = vec![];
             let runs = v["runs"].as_array().unwrap_or(&empty);
@@ -1065,6 +1074,273 @@ fn cmd_hooks(flags: &HashMap<String, String>) {
     }
 }
 
+fn load_hub_or_exit(flags: &HashMap<String, String>) -> hub::Hub {
+    match hub::load(&data_dir_for(flags)) {
+        Some(h) => h,
+        None => {
+            eprintln!("hub not initialized (run 'roamway hub init')");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn cmd_hub(flags: &HashMap<String, String>, pos: &[String]) {
+    let sub = pos.first().map(String::as_str).unwrap_or("");
+    match sub {
+        "" => cmd_hub_overview(flags),
+        "init" => cmd_hub_init(flags),
+        "permissions" | "perm" => cmd_hub_permissions(flags, pos),
+        "projects" | "project" => cmd_hub_projects(flags, pos),
+        "deploy" => cmd_hub_deploy(flags),
+        "logout" => cmd_hub_logout(flags),
+        "status" => cmd_hub_status(flags),
+        "token" => cmd_hub_token(flags, pos),
+        other => {
+            eprintln!("unknown hub subcommand: {}", other);
+            eprintln!("usage: roamway hub [init|permissions|projects|deploy|logout|status|token rotate]");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn cmd_hub_overview(flags: &HashMap<String, String>) {
+    let h = load_hub_or_exit(flags);
+    let enabled = h.triggers.iter().filter(|t| t.enabled).count();
+    println!("hub_id      {}", h.hub_id);
+    println!("name        {}", h.name);
+    println!("created_at  {}", h.created_at);
+    println!("projects    {}", h.projects.len());
+    println!("permissions {}", h.permissions.len());
+    println!("triggers    {} (enabled {})", h.triggers.len(), enabled);
+}
+
+fn cmd_hub_init(flags: &HashMap<String, String>) {
+    let dir = data_dir_for(flags);
+    let _ = std::fs::create_dir_all(&dir);
+    let name = flags.get("name").cloned().filter(|s| !s.is_empty());
+    let force = flags.contains_key("force");
+    match hub::init(&dir, name, force) {
+        Ok(h) => {
+            println!("hub_id  {}", h.hub_id);
+            println!("name    {}", h.name);
+            println!("next:   roamway hub projects add <path>");
+            println!("        roamway hub deploy --file .paseo/organization.json");
+        }
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(2);
+        }
+    }
+}
+
+fn cmd_hub_permissions(flags: &HashMap<String, String>, pos: &[String]) {
+    let action = pos.get(1).map(String::as_str).unwrap_or("ls");
+    match action {
+        "ls" => {
+            let h = load_hub_or_exit(flags);
+            if flags.contains_key("json") {
+                println!("{}", serde_json::to_string_pretty(&h.permissions).unwrap_or_default());
+            } else {
+                for p in &h.permissions {
+                    println!("{:<20} {:<8} {}", p.subject, p.scope, p.granted_at);
+                }
+            }
+        }
+        "grant" => {
+            let subject = pos.get(2).cloned().unwrap_or_default();
+            let scope = pos.get(3).cloned().unwrap_or_default();
+            if subject.is_empty() || scope.is_empty() {
+                eprintln!("usage: roamway hub permissions grant <subject> <scope>");
+                std::process::exit(2);
+            }
+            if !hub::valid_scope(&scope) {
+                eprintln!("invalid scope '{}' (read|run|admin)", scope);
+                std::process::exit(2);
+            }
+            let dir = data_dir_for(flags);
+            let mut h = load_hub_or_exit(flags);
+            hub::grant(&mut h, &subject, &scope, &iso(now()));
+            if let Err(e) = hub::save(&dir, &h) {
+                eprintln!("save failed: {}", e);
+                std::process::exit(2);
+            }
+            println!("granted {} {}", scope, subject);
+        }
+        "revoke" => {
+            let subject = pos.get(2).cloned().unwrap_or_default();
+            if subject.is_empty() {
+                eprintln!("usage: roamway hub permissions revoke <subject>");
+                std::process::exit(2);
+            }
+            let dir = data_dir_for(flags);
+            let mut h = load_hub_or_exit(flags);
+            if hub::revoke(&mut h, &subject) {
+                if let Err(e) = hub::save(&dir, &h) {
+                    eprintln!("save failed: {}", e);
+                    std::process::exit(2);
+                }
+                println!("revoked {}", subject);
+            } else {
+                eprintln!("no such permission: {}", subject);
+                std::process::exit(2);
+            }
+        }
+        _ => {
+            eprintln!("usage: roamway hub permissions [ls|grant <subject> <scope>|revoke <subject>]");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn cmd_hub_projects(flags: &HashMap<String, String>, pos: &[String]) {
+    let action = pos.get(1).map(String::as_str).unwrap_or("ls");
+    match action {
+        "ls" => {
+            let h = load_hub_or_exit(flags);
+            if flags.contains_key("json") {
+                println!("{}", serde_json::to_string_pretty(&h.projects).unwrap_or_default());
+            } else {
+                for p in &h.projects {
+                    println!("{}", p);
+                }
+            }
+        }
+        "add" => {
+            let path = pos.get(2).cloned().unwrap_or_default();
+            if path.is_empty() {
+                eprintln!("usage: roamway hub projects add <path>");
+                std::process::exit(2);
+            }
+            if !std::path::Path::new(&path).is_dir() {
+                eprintln!("not a directory: {}", path);
+                std::process::exit(2);
+            }
+            let dir = data_dir_for(flags);
+            let mut h = load_hub_or_exit(flags);
+            if hub::add_project(&mut h, &path) {
+                if let Err(e) = hub::save(&dir, &h) {
+                    eprintln!("save failed: {}", e);
+                    std::process::exit(2);
+                }
+                println!("added {}", path);
+            } else {
+                println!("already registered: {}", path);
+            }
+        }
+        "rm" => {
+            let path = pos.get(2).cloned().unwrap_or_default();
+            if path.is_empty() {
+                eprintln!("usage: roamway hub projects rm <path>");
+                std::process::exit(2);
+            }
+            let dir = data_dir_for(flags);
+            let mut h = load_hub_or_exit(flags);
+            if hub::remove_project(&mut h, &path) {
+                if let Err(e) = hub::save(&dir, &h) {
+                    eprintln!("save failed: {}", e);
+                    std::process::exit(2);
+                }
+                println!("removed {}", path);
+            } else {
+                eprintln!("not registered: {}", path);
+                std::process::exit(2);
+            }
+        }
+        _ => {
+            eprintln!("usage: roamway hub projects [ls|add <path>|rm <path>]");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn cmd_hub_deploy(flags: &HashMap<String, String>) {
+    let dir = data_dir_for(flags);
+    let file = flags
+        .get("file")
+        .cloned()
+        .unwrap_or_else(|| ".paseo/organization.json".into());
+    let path = std::path::PathBuf::from(&file);
+    if !path.is_file() {
+        eprintln!("organization file not found: {}", file);
+        std::process::exit(2);
+    }
+    match hub::deploy(&dir, &path) {
+        Ok((imported, updated, skipped)) => {
+            println!("imported {}, updated {}, skipped {}", imported, updated, skipped)
+        }
+        Err(e) => {
+            eprintln!("{}", e);
+            std::process::exit(2);
+        }
+    }
+}
+
+fn cmd_hub_logout(flags: &HashMap<String, String>) {
+    let dir = data_dir_for(flags);
+    hub::logout(&dir, flags.contains_key("keep-data"));
+    println!("logged out");
+}
+
+fn cmd_hub_status(flags: &HashMap<String, String>) {
+    match request(flags, "GET", "/v1/hub", None) {
+        Ok(v) => {
+            if flags.contains_key("json") {
+                println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                return;
+            }
+            println!("endpoint  ready");
+            println!("hub_id   {}", v["hub_id"].as_str().unwrap_or("-"));
+            println!("name     {}", v["name"].as_str().unwrap_or("-"));
+            println!(
+                "triggers {} (enabled {})",
+                v["triggers"].as_u64().unwrap_or(0),
+                v["triggers_enabled"].as_u64().unwrap_or(0)
+            );
+            let dir = data_dir_for(flags);
+            if let Some(h) = hub::load(&dir) {
+                for t in &h.triggers {
+                    println!(
+                        "webhook  POST /v1/hub/hooks/{} [{}]",
+                        t.id,
+                        if t.enabled { "enabled" } else { "disabled" }
+                    );
+                }
+            }
+            if let Some(recent) = v["recent"].as_array() {
+                println!("recent   {}", recent.len());
+                for r in recent {
+                    println!(
+                        "  {}  {}  {}",
+                        r["ts"].as_i64().map(iso).unwrap_or_else(|| "-".into()),
+                        r["source"].as_str().unwrap_or("-"),
+                        r["result"].as_str().unwrap_or("-")
+                    );
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("hub status failed: {}", e);
+            std::process::exit(2);
+        }
+    }
+}
+
+fn cmd_hub_token(flags: &HashMap<String, String>, pos: &[String]) {
+    let sub = pos.get(1).map(String::as_str).unwrap_or("");
+    if sub != "rotate" {
+        eprintln!("usage: roamway hub token rotate");
+        std::process::exit(2);
+    }
+    let dir = data_dir_for(flags);
+    let _ = std::fs::create_dir_all(&dir);
+    match hub::rotate_token(&dir) {
+        Ok(t) => println!("token:   {}   # shown once, store it safely", t),
+        Err(e) => {
+            eprintln!("rotate failed: {}", e);
+            std::process::exit(2);
+        }
+    }
+}
 fn cmd_status_summary(flags: &HashMap<String, String>) {
     match request(flags, "GET", "/v1/status", None) {
         Ok(v) => {
@@ -3053,6 +3329,7 @@ pub mod test_support {
             approvals: Mutex::new(auth::ApprovalStore::load(dir)),
             passwords: Mutex::new(auth::PasswordStore::load(dir)),
             pairings: Mutex::new(auth::PairingStore::load(dir)),
+            hub_rt: Mutex::new(crate::hub::HubRuntime::default()),
             allow_hosts: vec![],
             allow_origins: vec![],
             require_approval: vec![],

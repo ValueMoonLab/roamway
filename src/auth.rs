@@ -206,6 +206,7 @@ pub fn required_scope(method: &str, segs: &[&str]) -> &'static str {
     if method == "GET" || method == "HEAD" || method == "OPTIONS" {
         return match segs.get(1).copied() {
             Some("hosts") | Some("schedules") | Some("approvals") => "admin",
+            Some("hub") if segs.get(2) == Some(&"triggers") => "admin",
             _ => "read",
         };
     }

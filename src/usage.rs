@@ -276,6 +276,7 @@ mod tests {
             pid: None,
             attempts: 0,
             agent_id: None,
+            trigger_id: None,
             usage: Some(RunUsage::Data(Usage {
                 prompt_tokens: prompt,
                 completion_tokens: completion,

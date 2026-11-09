@@ -114,6 +114,7 @@ pub fn spawn_from_job(app: Arc<App>, job_id: &str) {
             pid: None,
             attempts: 0,
             agent_id: None,
+            trigger_id: None,
             usage: None,
         });
         if let Some(jj) = st.state.jobs.iter_mut().find(|x| x.id == job_id) {
@@ -259,6 +260,7 @@ mod tests {
             pid: None,
             attempts: 0,
             agent_id: None,
+            trigger_id: None,
             usage: None,
         };
         let state = State {
@@ -299,6 +301,7 @@ mod tests {
             pid: None,
             attempts: 0,
             agent_id: None,
+            trigger_id: None,
             usage: None,
         };
         let dir = std::env::temp_dir().join(format!("roamway-prune-{}", now()));
