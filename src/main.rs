@@ -209,6 +209,21 @@ fn parse_labels(vals: &[String]) -> Result<BTreeMap<String, String>, String> {
     Ok(out)
 }
 
+/// `ls --label` 与 `run --label` 用同一套语法校验：必须有 `=`、key 非空。
+/// 历史实现只 `flag_many` 原样收集，`ls --label team` 被静默忽略并返回全部 agent（R1）。
+/// 与 `parse_labels` 不同，这里保留原顺序与重复项（列表查询要把每个 filter 都传给服务端）。
+fn validate_label_filters(vals: &[String]) -> Result<Vec<String>, String> {
+    for v in vals {
+        let (k, _) = v
+            .split_once('=')
+            .ok_or_else(|| format!("label must be k=v: {}", v))?;
+        if k.is_empty() {
+            return Err(format!("label key must not be empty: {}", v));
+        }
+    }
+    Ok(vals.to_vec())
+}
+
 /// `--env K=V` 解析；key 必须是合法环境变量名
 fn parse_env(vals: &[String]) -> Result<Vec<(String, String)>, String> {
     let mut out = Vec::new();
@@ -317,19 +332,19 @@ struct LsPlan {
     kind: Option<String>,
 }
 
-fn ls_plan(flags: &HashMap<String, String>) -> LsPlan {
-    LsPlan {
+fn ls_plan(flags: &HashMap<String, String>) -> Result<LsPlan, String> {
+    Ok(LsPlan {
         runs: flags.contains_key("runs"),
         global: flags.contains_key("global"),
         all: flags.contains_key("all"),
-        labels: flag_many(flags, "label"),
+        labels: validate_label_filters(&flag_many(flags, "label"))?,
         limit: flags
             .get("limit")
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(50)
             .clamp(1, 500),
         kind: flags.get("kind").cloned().filter(|k| !k.is_empty()),
-    }
+    })
 }
 
 /// `GET /v1/agents` 的查询串；label 值把 `=` 编码为 `%3D`，顺序固定便于断言
@@ -1290,11 +1305,17 @@ fn print_agents(flags: &HashMap<String, String>, v: &Value) {
 }
 
 fn cmd_ls(flags: &HashMap<String, String>) {
-    let plan = ls_plan(flags);
     if flags.contains_key("background") {
         usage_error("ls --background: not supported");
         return;
     }
+    let plan = match ls_plan(flags) {
+        Ok(p) => p,
+        Err(e) => {
+            usage_error(&e);
+            return;
+        }
+    };
     if plan.runs {
         cmd_ls_runs(flags);
         return;
@@ -1402,6 +1423,11 @@ fn cmd_ls_agents_global(flags: &HashMap<String, String>, plan: &LsPlan) {
 }
 
 fn cmd_ls_runs(flags: &HashMap<String, String>) {
+    // run 列表接口没有 label 过滤；静默忽略会让 `ls --runs --label k=v` 返回全部（同类 R1）
+    if flags.contains_key("label") {
+        usage_error("ls --runs: --label is not supported (run list has no label filter)");
+        return;
+    }
 
     if let Some(raw) = host_flag(flags) {
         if raw == "all" {
@@ -4879,20 +4905,42 @@ mod tests {
     fn ls_plan_switches_runs_and_global_limit_defaults() {
         let mut f1: HashMap<String, String> = HashMap::new();
         f1.insert("runs".to_string(), "true".to_string());
-        assert!(ls_plan(&f1).runs);
+        assert!(ls_plan(&f1).unwrap().runs);
 
         let mut f2: HashMap<String, String> = HashMap::new();
         f2.insert("global".to_string(), "true".to_string());
         f2.insert("host".to_string(), "nas".to_string());
-        assert!(ls_plan(&f2).global);
+        assert!(ls_plan(&f2).unwrap().global);
 
         let mut f3: HashMap<String, String> = HashMap::new();
         f3.insert("limit".to_string(), "abc".to_string());
-        assert_eq!(ls_plan(&f3).limit, 50);
+        assert_eq!(ls_plan(&f3).unwrap().limit, 50);
 
         let mut f4: HashMap<String, String> = HashMap::new();
         f4.insert("limit".to_string(), "10000".to_string());
-        assert_eq!(ls_plan(&f4).limit, 500);
+        assert_eq!(ls_plan(&f4).unwrap().limit, 500);
+    }
+
+    /// R1：`ls --label team` 曾被静默忽略（rc=0 忽略过滤器，返回全部 agent）
+    #[test]
+    fn ls_plan_rejects_label_without_equals() {
+        let mut f: HashMap<String, String> = HashMap::new();
+        f.insert("label".to_string(), "team".to_string());
+        let err = ls_plan(&f).unwrap_err();
+        assert!(err.contains("label must be k=v"), "unexpected: {}", err);
+
+        let mut f2: HashMap<String, String> = HashMap::new();
+        f2.insert("label".to_string(), "=x".to_string());
+        assert!(ls_plan(&f2).unwrap_err().contains("label key must not be empty"));
+
+        let mut f3: HashMap<String, String> = HashMap::new();
+        f3.insert("label".to_string(), "team=p12".to_string());
+        assert_eq!(ls_plan(&f3).unwrap().labels, vec!["team=p12".to_string()]);
+
+        // 值里含 `=` 也合法，且原样保留（不重排、不去重）
+        let mut f4: HashMap<String, String> = HashMap::new();
+        f4.insert("label".to_string(), "team=a=b".to_string());
+        assert_eq!(ls_plan(&f4).unwrap().labels, vec!["team=a=b".to_string()]);
     }
 
     #[test]
