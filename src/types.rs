@@ -322,6 +322,8 @@ fn sync_parent_dir(_p: &Path) -> std::io::Result<()> {
 pub struct App {
     pub store: Mutex<Store>,
     pub schedules: Mutex<crate::schedules::ScheduleStore>,
+    pub terms: Mutex<crate::terminals::TerminalStore>,
+    pub term_rt: Mutex<HashMap<String, crate::terminals::Runtime>>,
     pub token: Option<String>,
     pub started: i64,
     pub cancels: Mutex<HashMap<String, Arc<AtomicBool>>>,

@@ -2,6 +2,7 @@ use crate::agents;
 use crate::hosts;
 use crate::jobs;
 use crate::schedules;
+use crate::terminals;
 use crate::types::*;
 use crate::workspaces;
 use serde::Deserialize;
@@ -579,6 +580,17 @@ fn route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         ("GET", ["v1", "workspaces"]) => list_workspaces_route(app),
         ("POST", ["v1", "workspaces", "clone"]) => clone_workspace_route(app, req),
         ("DELETE", ["v1", "workspaces", name]) => remove_workspace_route(app, name),
+        ("GET", ["v1", "terminals"]) => (200, json!({ "terminals": terminals::list(app) })),
+        ("POST", ["v1", "terminals"]) => create_terminal_route(app, req),
+        ("GET", ["v1", "terminals", id]) => get_terminal_route(app, id),
+        ("DELETE", ["v1", "terminals", id]) => kill_terminal_route(app, id),
+        ("GET", ["v1", "terminals", id, "output"]) => terminal_output_route(app, req, id),
+        ("POST", ["v1", "terminals", id, "keys"]) => terminal_keys_route(app, req, id),
+        ("GET", ["v1", "scripts"]) => (200, json!({ "scripts": terminals::scripts(app) })),
+        ("POST", ["v1", "scripts"]) => create_script_route(app, req),
+        ("DELETE", ["v1", "scripts", name]) => remove_script_route(app, name),
+        ("POST", ["v1", "scripts", name, "start"]) => script_action_route(app, name, true),
+        ("POST", ["v1", "scripts", name, "stop"]) => script_action_route(app, name, false),
         ("GET", ["v1", "runs"]) => list_runs(app, req),
         ("POST", ["v1", "runs"]) => create_run(app, req),
         ("GET", ["v1", "runs", id]) => get_run(app, id),
@@ -1624,6 +1636,157 @@ fn set_job_enabled(app: &Arc<App>, id: &str, enabled: bool) -> (u16, Value) {
     }
 }
 
+#[derive(Deserialize)]
+struct NewTerminal {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    workspace: String,
+    #[serde(default)]
+    shell: String,
+    #[serde(default)]
+    buffer_kb: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct KeysBody {
+    #[serde(default)]
+    keys: String,
+    #[serde(default)]
+    enter: bool,
+}
+
+#[derive(Deserialize)]
+struct NewScript {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    cmd: String,
+    #[serde(default)]
+    workspace: String,
+}
+
+fn create_terminal_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
+    let spec: NewTerminal = if req.body.is_empty() {
+        NewTerminal {
+            name: String::new(),
+            workspace: String::new(),
+            shell: String::new(),
+            buffer_kb: None,
+        }
+    } else {
+        match serde_json::from_slice(&req.body) {
+            Ok(v) => v,
+            Err(e) => return (400, json!({ "error": format!("bad json: {}", e) })),
+        }
+    };
+    let kb = spec
+        .buffer_kb
+        .unwrap_or(terminals::DEFAULT_BUFFER_KB)
+        .clamp(1, 65536);
+    match terminals::create(app, &spec.name, &spec.workspace, &spec.shell, kb) {
+        Ok(t) => (200, json!({ "terminal": t })),
+        Err(e) => (400, json!({ "error": e })),
+    }
+}
+
+fn get_terminal_route(app: &Arc<App>, id: &str) -> (u16, Value) {
+    match terminals::get(app, id) {
+        Ok(t) => (200, json!({ "terminal": t })),
+        Err(e) => terminal_error(e),
+    }
+}
+
+fn kill_terminal_route(app: &Arc<App>, id: &str) -> (u16, Value) {
+    match terminals::kill(app, id) {
+        Ok(t) => (200, json!({ "killed": true, "terminal": t })),
+        Err(e) => terminal_error(e),
+    }
+}
+
+fn terminal_output_route(app: &Arc<App>, req: &Req, id: &str) -> (u16, Value) {
+    let since: Option<u64> = req.query.get("since").and_then(|v| v.parse().ok());
+    let tail: Option<usize> = req.query.get("tail").and_then(|v| v.parse().ok());
+    match terminals::capture(app, id, since, tail) {
+        Ok((bytes, total)) => (
+            200,
+            json!({
+                "id": id,
+                "output": String::from_utf8_lossy(&bytes).to_string(),
+                "bytes": bytes.len(),
+                "total": total,
+                "next": total,
+            }),
+        ),
+        Err(e) => terminal_error(e),
+    }
+}
+
+fn terminal_keys_route(app: &Arc<App>, req: &Req, id: &str) -> (u16, Value) {
+    let spec: KeysBody = if req.body.is_empty() {
+        KeysBody {
+            keys: String::new(),
+            enter: false,
+        }
+    } else {
+        match serde_json::from_slice(&req.body) {
+            Ok(v) => v,
+            Err(e) => return (400, json!({ "error": format!("bad json: {}", e) })),
+        }
+    };
+    match terminals::send_keys(app, id, &spec.keys, spec.enter) {
+        Ok(()) => (
+            200,
+            json!({ "ok": true, "sent": spec.keys.len() + if spec.enter { 1 } else { 0 } }),
+        ),
+        Err(e) => terminal_error(e),
+    }
+}
+
+fn create_script_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
+    let spec: NewScript = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
+        Err(e) => return (400, json!({ "error": format!("bad json: {}", e) })),
+    };
+    match terminals::script_add(app, &spec.name, &spec.cmd, &spec.workspace) {
+        Ok(s) => (200, json!({ "script": s })),
+        Err(e) => (400, json!({ "error": e })),
+    }
+}
+
+fn remove_script_route(app: &Arc<App>, name: &str) -> (u16, Value) {
+    match terminals::script_rm(app, name) {
+        Ok(n) => (200, json!({ "ok": true, "removed": n, "name": name })),
+        Err(e) => (404, json!({ "error": e })),
+    }
+}
+
+fn script_action_route(app: &Arc<App>, name: &str, start: bool) -> (u16, Value) {
+    let r = if start {
+        terminals::script_start(app, name)
+    } else {
+        terminals::script_stop(app, name)
+    };
+    match r {
+        Ok(s) => (200, json!({ "script": s })),
+        Err(e) => {
+            if e.contains("no such") {
+                (404, json!({ "error": e }))
+            } else {
+                (400, json!({ "error": e }))
+            }
+        }
+    }
+}
+
+fn terminal_error(e: String) -> (u16, Value) {
+    if e.contains("no such") {
+        (404, json!({ "error": e }))
+    } else {
+        (400, json!({ "error": e }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1743,6 +1906,8 @@ mod tests {
         let app = Arc::new(App {
             store: std::sync::Mutex::new(store),
             schedules: std::sync::Mutex::new(Default::default()),
+            terms: std::sync::Mutex::new(Default::default()),
+            term_rt: std::sync::Mutex::new(HashMap::new()),
             token: None,
             started: now(),
             cancels: std::sync::Mutex::new(HashMap::new()),
@@ -1797,6 +1962,8 @@ mod tests {
         Arc::new(App {
             store: std::sync::Mutex::new(store),
             schedules: std::sync::Mutex::new(Default::default()),
+            terms: std::sync::Mutex::new(Default::default()),
+            term_rt: std::sync::Mutex::new(HashMap::new()),
             token: None,
             started: now(),
             cancels: std::sync::Mutex::new(HashMap::new()),

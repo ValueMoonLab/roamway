@@ -5,6 +5,7 @@ mod jobs;
 mod runner;
 mod schedules;
 mod server;
+mod terminals;
 mod types;
 mod workspaces;
 
@@ -20,7 +21,7 @@ use std::thread;
 use std::time::Duration;
 use types::*;
 
-const BOOLS: &[&str] = &["no-wait", "quiet", "json", "allow-overlap", "disabled", "help", "force", "probe", "all", "worktree", "keep-worktree", "run-now", "overlap", "enabled"];
+const BOOLS: &[&str] = &["no-wait", "quiet", "json", "allow-overlap", "disabled", "help", "force", "probe", "all", "worktree", "keep-worktree", "run-now", "overlap", "enabled", "enter", "no-enter"];
 
 fn usage() {
     println!(
@@ -54,6 +55,12 @@ fn usage() {
 运维扩展：
   roamway workspace ls [--json]
   roamway workspace rm <name>
+  roamway terminal create [--name N] [--workspace DIR] [--shell bash] [--buffer-kb 256]
+  roamway terminal ls [--json] | capture <id> [--since N] [--tail N] | kill <id>
+  roamway terminal send-keys <id> <keys...> [--enter|--no-enter]
+  roamway script ls [--json] | add --name N --cmd C [--workspace P] | rm <name>
+  roamway script start <name> | stop <name>
+  注：受管终端无 TTY，TUI 程序（vim/top 交互界面）不支持
 
 通用参数：--host http://127.0.0.1:8796  --token T
 环境变量：ROAMWAY_HOST / ROAMWAY_TOKEN / ROAMWAY_DEEPSEEK_KEY / ROAMWAY_QWEN_KEY
@@ -340,6 +347,8 @@ fn main() {
         "serve" => cmd_serve(&flags),
         "clone" => cmd_clone(&flags, &pos),
         "workspace" => cmd_workspace(&flags, &pos),
+        "terminal" | "term" => cmd_terminal(&flags, &pos),
+        "script" | "scripts" => cmd_script(&flags, &pos),
         "run" => cmd_run(&flags, &pos),
         "ls" | "list" => cmd_ls(&flags),
         "status" => {
@@ -448,9 +457,13 @@ fn cmd_serve(flags: &HashMap<String, String>) {
     let store = Store::load(&data);
     let loaded_ok = store.loaded_ok;
     let schedule_store = schedules::ScheduleStore::load(&data);
+    // 受管终端：元数据落 data/terminals.json，运行态只在内存，重启后标 exited 不复活
+    let terminal_store = terminals::TerminalStore::load(&data);
     let app = Arc::new(App {
         store: Mutex::new(store),
         schedules: Mutex::new(schedule_store),
+        terms: Mutex::new(terminal_store),
+        term_rt: Mutex::new(HashMap::new()),
         token: token.clone(),
         started: now(),
         cancels: Mutex::new(HashMap::new()),
@@ -465,6 +478,7 @@ fn cmd_serve(flags: &HashMap<String, String>) {
 
     jobs::start_scheduler(app.clone());
     schedules::start_scheduler(app.clone());
+    terminals::start_reaper(app.clone());
 
     let hb = app.clone();
     thread::spawn(move || loop {
@@ -1158,6 +1172,205 @@ fn cmd_workspace_rm(flags: &HashMap<String, String>, pos: &[String]) {
         eprintln!("no such workspace: {}", name);
     }
 }
+fn cmd_terminal(flags: &HashMap<String, String>, pos: &[String]) {
+    let c = local_client(flags);
+    let json_out = flags.contains_key("json");
+    match pos.first().map(String::as_str).unwrap_or("help") {
+        "create" | "new" => {
+            let mut body = json!({
+                "name": flags.get("name").cloned().unwrap_or_default(),
+                "workspace": flags.get("workspace").cloned().unwrap_or_default(),
+                "shell": flags.get("shell").cloned().unwrap_or_default(),
+            });
+            if let Some(kb) = flags.get("buffer-kb").and_then(|v| v.parse::<u64>().ok()) {
+                body["buffer_kb"] = json!(kb);
+            }
+            match c.req("POST", "/v1/terminals", Some(body)) {
+                Ok(v) => {
+                    if json_out {
+                        println!("{}", serde_json::to_string_pretty(&v["terminal"]).unwrap_or_default());
+                    } else {
+                        let t = &v["terminal"];
+                        println!(
+                            "{}\t{}\t{}\t{}",
+                            t["id"].as_str().unwrap_or(""),
+                            t["state"].as_str().unwrap_or(""),
+                            t["pid"].as_u64().map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+                            t["workspace"].as_str().unwrap_or("")
+                        );
+                    }
+                }
+                Err(e) => eprintln!("terminal create failed: {}", e),
+            }
+        }
+        "ls" | "list" => match c.req("GET", "/v1/terminals", None) {
+            Ok(v) => {
+                if json_out {
+                    println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                    return;
+                }
+                let empty = Vec::new();
+                let list = v["terminals"].as_array().unwrap_or(&empty);
+                println!(
+                    "{:<14} {:<16} {:<8} {:<7} {:>9} {}",
+                    "ID", "NAME", "STATE", "PID", "BYTES", "WORKSPACE"
+                );
+                for t in list {
+                    println!(
+                        "{:<14} {:<16} {:<8} {:<7} {:>9} {}",
+                        t["id"].as_str().unwrap_or(""),
+                        t["name"].as_str().unwrap_or(""),
+                        t["state"].as_str().unwrap_or(""),
+                        t["pid"].as_u64().map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+                        t["bytes_out"].as_u64().unwrap_or(0),
+                        t["workspace"].as_str().unwrap_or("")
+                    );
+                }
+            }
+            Err(e) => eprintln!("terminal ls failed: {}", e),
+        },
+        "capture" | "output" => {
+            let id = match pos.get(1).filter(|s| !s.trim().is_empty()) {
+                Some(v) => v,
+                None => return eprintln!("usage: roamway terminal capture <id> [--since N] [--tail N]"),
+            };
+            let mut path = format!("/v1/terminals/{}/output", id);
+            let mut qs: Vec<String> = Vec::new();
+            if let Some(s) = flags.get("since") {
+                qs.push(format!("since={}", s));
+            }
+            if let Some(t) = flags.get("tail") {
+                qs.push(format!("tail={}", t));
+            }
+            if !qs.is_empty() {
+                path.push('?');
+                path.push_str(&qs.join("&"));
+            }
+            match c.req("GET", &path, None) {
+                Ok(v) => {
+                    if json_out {
+                        println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                    } else {
+                        print!("{}", v["output"].as_str().unwrap_or(""));
+                    }
+                }
+                Err(e) => eprintln!("terminal capture failed: {}", e),
+            }
+        }
+        "send-keys" | "send" | "keys" => {
+            let id = match pos.get(1).filter(|s| !s.trim().is_empty()) {
+                Some(v) => v,
+                None => return eprintln!("usage: roamway terminal send-keys <id> <keys...> [--enter]"),
+            };
+            let keys = pos[2..].join(" ");
+            let enter = flags.contains_key("enter") && !flags.contains_key("no-enter");
+            let body = json!({ "keys": keys, "enter": enter });
+            match c.req("POST", &format!("/v1/terminals/{}/keys", id), Some(body)) {
+                Ok(v) => println!("sent {} bytes", v["sent"].as_u64().unwrap_or(0)),
+                Err(e) => eprintln!("terminal send-keys failed: {}", e),
+            }
+        }
+        "kill" | "rm" | "close" => {
+            let id = match pos.get(1).filter(|s| !s.trim().is_empty()) {
+                Some(v) => v,
+                None => return eprintln!("usage: roamway terminal kill <id>"),
+            };
+            match c.req("DELETE", &format!("/v1/terminals/{}", id), None) {
+                Ok(_) => println!("killed {}", id),
+                Err(e) => eprintln!("terminal kill failed: {}", e),
+            }
+        }
+        _ => eprintln!(
+            "usage: roamway terminal create|ls|capture|send-keys|kill  (受管终端无 TTY，TUI 程序不支持)"
+        ),
+    }
+}
+
+fn cmd_script(flags: &HashMap<String, String>, pos: &[String]) {
+    let c = local_client(flags);
+    let json_out = flags.contains_key("json");
+    match pos.first().map(String::as_str).unwrap_or("help") {
+        "ls" | "list" => match c.req("GET", "/v1/scripts", None) {
+            Ok(v) => {
+                if json_out {
+                    println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
+                    return;
+                }
+                let empty = Vec::new();
+                let list = v["scripts"].as_array().unwrap_or(&empty);
+                println!("{:<16} {:<9} {:<7} {:<6} {}", "NAME", "STATE", "PID", "EXIT", "CMD");
+                for s in list {
+                    println!(
+                        "{:<16} {:<9} {:<7} {:<6} {}",
+                        s["name"].as_str().unwrap_or(""),
+                        s["state"].as_str().unwrap_or(""),
+                        s["pid"].as_u64().map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+                        s["last_exit"].as_i64().map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+                        s["cmd"].as_str().unwrap_or("")
+                    );
+                }
+            }
+            Err(e) => eprintln!("script ls failed: {}", e),
+        },
+        "add" => {
+            let name = flags.get("name").cloned().unwrap_or_default();
+            let cmd = flags.get("cmd").cloned().unwrap_or_default();
+            if name.trim().is_empty() || cmd.trim().is_empty() {
+                return eprintln!("usage: roamway script add --name N --cmd \"...\" [--workspace DIR]");
+            }
+            let body = json!({
+                "name": name,
+                "cmd": cmd,
+                "workspace": flags.get("workspace").cloned().unwrap_or_default(),
+            });
+            match c.req("POST", "/v1/scripts", Some(body)) {
+                Ok(v) => {
+                    if json_out {
+                        println!("{}", serde_json::to_string_pretty(&v["script"]).unwrap_or_default());
+                    } else {
+                        println!("added {}", v["script"]["name"].as_str().unwrap_or(&name));
+                    }
+                }
+                Err(e) => eprintln!("script add failed: {}", e),
+            }
+        }
+        "rm" | "remove" => {
+            let name = match pos.get(1).filter(|s| !s.trim().is_empty()) {
+                Some(v) => v,
+                None => return eprintln!("usage: roamway script rm <name>"),
+            };
+            match c.req("DELETE", &format!("/v1/scripts/{}", name), None) {
+                Ok(_) => println!("removed {}", name),
+                Err(e) => eprintln!("script rm failed: {}", e),
+            }
+        }
+        "start" | "stop" => {
+            let name = match pos.get(1).filter(|s| !s.trim().is_empty()) {
+                Some(v) => v,
+                None => return eprintln!("usage: roamway script start|stop <name>"),
+            };
+            let action = if pos[0] == "start" { "start" } else { "stop" };
+            match c.req("POST", &format!("/v1/scripts/{}/{}", name, action), None) {
+                Ok(v) => {
+                    if json_out {
+                        println!("{}", serde_json::to_string_pretty(&v["script"]).unwrap_or_default());
+                    } else {
+                        let s = &v["script"];
+                        println!(
+                            "{}\t{}\t{}",
+                            s["name"].as_str().unwrap_or(name),
+                            s["state"].as_str().unwrap_or(""),
+                            s["pid"].as_u64().map(|p| p.to_string()).unwrap_or_else(|| "-".into())
+                        );
+                    }
+                }
+                Err(e) => eprintln!("script {} failed: {}", action, e),
+            }
+        }
+        _ => eprintln!("usage: roamway script ls|add|rm|start|stop"),
+    }
+}
+
 fn cmd_run_remote(h: &hosts::Host, flags: &HashMap<String, String>, pos: &[String]) {
     let mut prompt = pos.join(" ");
     if prompt.trim().is_empty() {
@@ -2210,6 +2423,31 @@ fn cmd_reload(flags: &HashMap<String, String>) {
         return;
     }
     cmd_daemon_reload(flags);
+}
+
+/// 测试用的最小 App：共享给 server.rs / terminals.rs 的单测，避免每处重复拼装结构体。
+#[cfg(test)]
+pub mod test_support {
+    use super::*;
+    use std::path::Path;
+
+    pub fn test_app(dir: &Path) -> Arc<App> {
+        let _ = std::fs::create_dir_all(dir);
+        let store = Store::load(dir);
+        Arc::new(App {
+            store: Mutex::new(store),
+            schedules: Mutex::new(schedules::ScheduleStore::load(dir)),
+            terms: Mutex::new(terminals::TerminalStore::load(dir)),
+            term_rt: Mutex::new(HashMap::new()),
+            token: None,
+            started: now(),
+            cancels: Mutex::new(HashMap::new()),
+            tz_offset_hours: 8,
+            max_concurrent: 4,
+            max_conn: 64,
+            conns: AtomicUsize::new(0),
+        })
+    }
 }
 
 #[cfg(test)]
