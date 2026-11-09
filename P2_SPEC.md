@@ -30,7 +30,7 @@ impl Registry {
 }
 ```
 
-- `endpoint` 归一化：`10.0.0.91:8796` / `tcp://10.0.0.91:8796` / `http://10.0.0.91:8796/` 都接受，存 `http://10.0.0.91:8796`。
+- `endpoint` 归一化：`192.0.2.10:8796` / `tcp://192.0.2.10:8796` / `http://192.0.2.10:8796/` 都接受，存 `http://192.0.2.10:8796`。
 - 退避：`next_retry_at = now + min(30 * 2^(failures-1), 3600)`；探测成功清零。
 - `mask(token)` → `abcd…wxyz`（长度 <8 时 `****`）。
 
@@ -94,7 +94,7 @@ pub fn dispatch(h: &Host, method: &str, path: &str, body: Option<&str>) -> Resul
 
 ## 7. 验收（NAS 上执行）
 
-1. PC `roamway host add nas --endpoint 10.0.0.91:8796 --token $T` → `host ls --probe` 显示 `online` + 版本 + 延迟
+1. PC `roamway host add nas --endpoint 192.0.2.10:8796 --token $T` → `host ls --probe` 显示 `online` + 版本 + 延迟
 2. `roamway run --host nas --agent shell --prompt "echo ok"` → NAS 侧 `roamway ls` 能看到同一条 run
 3. `roamway ls --host all` → 合并 PC + NAS，字段含 `host`
 4. 杀掉 NAS daemon → `host ls` 显示 `error` + `retry` 秒数；重启后自动恢复 `online`

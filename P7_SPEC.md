@@ -67,7 +67,7 @@ pub struct Script { pub id: String, pub name: String, pub cmd: String, pub works
 1. `terminal create` → `send-keys "echo hi" --enter` → 2 秒后 `capture` 出现 `hi`
 2. 连续发 3 条命令，`capture --since 0` 包含全部三条
 3. `terminal kill` 后 `terminal ls` 显示 `exited`，进程表无残留
-4. `script add --name build --cmd "sleep 30" --workspace /home/GZX` → `script start` → `script ls` running → `script stop` → 进程消失
+4. `script add --name build --cmd "sleep 30" --workspace /home/roamway` → `script start` → `script ls` running → `script stop` → 进程消失
 5. 重启 daemon 后终端标 `exited`，脚本不自动复活
 6. 8 个单测全过，`cargo build --release` 0 warning
 

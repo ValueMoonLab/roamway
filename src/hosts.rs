@@ -43,8 +43,8 @@ fn default_true() -> bool {
     true
 }
 
-/// `10.0.0.91:8796` / `tcp://10.0.0.91:8796` / `http://10.0.0.91:8796/`
-/// 都归一化为 `http://10.0.0.91:8796`。
+/// `192.0.2.10:8796` / `tcp://192.0.2.10:8796` / `http://192.0.2.10:8796/`
+/// 都归一化为 `http://192.0.2.10:8796`。
 pub fn endpoint_normalize(s: &str) -> String {
     let s = s.trim();
     let s = if let Some(rest) = s.strip_prefix("tcp://") {
@@ -296,23 +296,23 @@ mod tests {
 
     #[test]
     fn endpoint_normalize_accepts_three_forms() {
-        assert_eq!(endpoint_normalize("10.0.0.91:8796"), "http://10.0.0.91:8796");
-        assert_eq!(endpoint_normalize("tcp://10.0.0.91:8796"), "http://10.0.0.91:8796");
-        assert_eq!(endpoint_normalize("http://10.0.0.91:8796/"), "http://10.0.0.91:8796");
+        assert_eq!(endpoint_normalize("192.0.2.10:8796"), "http://192.0.2.10:8796");
+        assert_eq!(endpoint_normalize("tcp://192.0.2.10:8796"), "http://192.0.2.10:8796");
+        assert_eq!(endpoint_normalize("http://192.0.2.10:8796/"), "http://192.0.2.10:8796");
     }
 
     #[test]
     fn registry_roundtrip() {
         let dir = std::env::temp_dir().join(format!("roamway-hosts-roundtrip-{}", crate::types::now()));
         let mut reg = Registry::load(&dir);
-        let h = reg.add("nas", "10.0.0.91:8796", "secret-token").unwrap().clone();
-        assert_eq!(h.endpoint, "http://10.0.0.91:8796");
+        let h = reg.add("nas", "192.0.2.10:8796", "secret-token").unwrap().clone();
+        assert_eq!(h.endpoint, "http://192.0.2.10:8796");
         reg.save().unwrap();
         let loaded = Registry::load(&dir);
         assert_eq!(loaded.hosts.len(), 1);
         let got = &loaded.hosts[0];
         assert_eq!(got.name, "nas");
-        assert_eq!(got.endpoint, "http://10.0.0.91:8796");
+        assert_eq!(got.endpoint, "http://192.0.2.10:8796");
         assert_eq!(got.token, "secret-token");
         assert_eq!(got.enabled, true);
         assert_eq!(got.failures, 0);
@@ -364,10 +364,10 @@ mod tests {
             path: PathBuf::from("unused"),
             hosts: Vec::new(),
         };
-        reg.add("nas", "10.0.0.91:8796", "tok").unwrap();
+        reg.add("nas", "192.0.2.10:8796", "tok").unwrap();
         assert!(reg.get("nas").is_some());
-        assert!(reg.get("http://10.0.0.91:8796").is_some());
-        assert!(reg.get("10.0.0.91:8796").is_some());
+        assert!(reg.get("http://192.0.2.10:8796").is_some());
+        assert!(reg.get("192.0.2.10:8796").is_some());
         assert!(reg.get("nope").is_none());
     }
 }

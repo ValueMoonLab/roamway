@@ -45,7 +45,7 @@ impl Registry { load(dir) / save() / add(path, remote) -> Workspace / get(name_o
 
 ## 5. 验收（NAS）
 
-1. `roamway clone valuemoonlab/roamway --dir /home/GZX/ws --json` → 目录存在、`workspaces.json` 有记录
+1. `roamway clone valuemoonlab/roamway --dir /home/roamway/ws --json` → 目录存在、`workspaces.json` 有记录
 2. `roamway clone bad/does-not-exist` → 报错且不残留目录
 3. 在 roamway 仓库上起 3 个 `agent run --worktree` 并发写不同文件 → 三个 worktree 各自 1 个新文件，主仓库 `git status` 干净
 4. `agent archive` 后 worktree 目录与 `rw/<id>` 分支消失

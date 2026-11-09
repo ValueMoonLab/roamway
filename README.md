@@ -319,6 +319,19 @@ roamway run --host http://192.168.1.50:8796 --token T \
 
 哪台机器有数据、有 GPU、有专用凭据，就把 daemon 放哪台。公网暴露请放在 TLS 反代后面。
 
+## Web 控制面
+
+`roamway serve` 启动后，浏览器访问 `http://127.0.0.1:8796/ui/` 即可打开控制面；入口也可以由 `roamway ui [--print]` 打印。
+
+- 登录：页面输入 daemon token 后存入 `localStorage`，所有 API 请求带 `Authorization: Bearer`，401 自动回到登录页。
+- 页面：Agents 列表/详情与实时输出（SSE）、worktree diff、Hosts 管理与 probe、Schedules、Terminals、Usage、Settings（token / provider / 主题）。
+- 移动端：支持深色模式与 720px 断点，关键操作 44px 最小点击区。
+- 静态资源随二进制嵌入（`include_str!`），无需 Node 构建链；`GET /` 302 到 `/ui/`。
+
+```bash
+roamway serve --bind 127.0.0.1:8796 --token mysecret   # 启动后打开 http://127.0.0.1:8796/ui/
+```
+
 ## 安全
 
 - 默认只绑 `127.0.0.1`；`--bind 0.0.0.0` 是你主动开放给局域网。

@@ -14,6 +14,7 @@ mod plugins;
 mod providers;
 mod speech;
 mod usage;
+mod web;
 
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -27,17 +28,18 @@ use std::thread;
 use std::time::Duration;
 use types::*;
 
-const BOOLS: &[&str] = &["no-wait", "quiet", "json", "allow-overlap", "disabled", "help", "force", "probe", "all", "worktree", "keep-worktree", "run-now", "overlap", "enabled", "enter", "no-enter", "stdin"];
+const BOOLS: &[&str] = &["no-wait", "quiet", "json", "allow-overlap", "disabled", "help", "force", "probe", "all", "worktree", "keep-worktree", "run-now", "overlap", "enabled", "enter", "no-enter", "stdin", "no-browser"];
 
 fn usage() {
     println!(
         r#"roamway {} — 迷你多智能体编排器（国内模型 / 长跑友好）
 
   roamway serve  [--bind 127.0.0.1:8796] [--data DIR] [--token T] [--tz 8] [--max-concurrent 4] [--max-conn 64]
+  roamway ui [--print]
   roamway run    --agent codex [--model M] [--workspace DIR] [--title T] [--timeout 1800] [--no-wait] [--host H] "prompt"
   roamway clone  <owner/repo | git url> [--dir DIR] [--protocol https|ssh] [--json] [--host H]
   roamway agent run <prompt> [--title --workspace --model --kind --worktree --no-wait]
-  roamway agent ls|inspect|logs|wait|attach|archive [--keep-worktree]|reload|update|open|detach|import
+  roamway agent ls|inspect|logs|wait|attach|archive [--keep-worktree]|reload|update|open [--no-browser]|detach|import
   roamway attach|inspect|wait|archive|import <id>   # 顶层别名
   roamway ls     [--limit 20] [--host H|all] [--trigger ID]
   roamway status [ID] [--json] [--host H]
@@ -402,6 +404,7 @@ fn main() {
         "hooks" => cmd_hooks(&flags),
         "hub" => cmd_hub(&flags, &pos),
         "agent" => cmd_agent(&flags, &pos),
+        "ui" => cmd_ui(&flags, &pos),
         "attach" => cmd_agent_attach(&flags, &pos),
         "inspect" => cmd_agent_inspect(&flags, &pos),
         "wait" => cmd_agent_wait(&flags, &pos),
@@ -2368,7 +2371,46 @@ fn cmd_agent_open(flags: &HashMap<String, String>, pos: &[String]) {
     } else {
         local_base(flags)
     };
-    println!("{}/agents/{}", base.trim_end_matches('/'), id);
+    let url = format!("{}/ui/#/agents/{}", base.trim_end_matches('/'), id);
+    println!("{}", url);
+    if !flags.contains_key("no-browser") {
+        open_browser(&url);
+    }
+}
+
+fn open_browser(url: &str) {
+    #[cfg(target_os = "windows")]
+    {
+        if let Err(e) = Command::new("cmd").args(["/C", "start", "", url]).status() {
+            eprintln!("roamway: opening browser failed: {}", e);
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if let Err(e) = Command::new("open").arg(url).status() {
+            eprintln!("roamway: opening browser failed: {}", e);
+        }
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        if let Err(e) = Command::new("xdg-open").arg(url).status() {
+            eprintln!("roamway: opening browser failed: {}", e);
+        }
+    }
+}
+
+fn cmd_ui(flags: &HashMap<String, String>, _pos: &[String]) {
+    let base = local_base(flags);
+    let url = format!("{}/ui/", base.trim_end_matches('/'));
+    if flags.contains_key("print") {
+        println!("{}", url);
+        return;
+    }
+    println!("UI: {}", url);
+    match local_token(flags) {
+        Some(_) => println!("token required: yes (browser login will prompt)"),
+        None => println!("token required: no"),
+    }
 }
 
 fn cmd_agent_detach(flags: &HashMap<String, String>, pos: &[String]) {

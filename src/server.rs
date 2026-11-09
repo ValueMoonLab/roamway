@@ -3,9 +3,11 @@ use crate::auth;
 use crate::hosts;
 use crate::hub;
 use crate::jobs;
+use crate::providers;
 use crate::schedules;
 use crate::terminals;
 use crate::types::*;
+use crate::usage;
 use crate::workspaces;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -13,6 +15,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -296,6 +299,65 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
+#[derive(Debug)]
+enum UiResponse {
+    Redirect(String),
+    Asset(u16, &'static str, &'static str),
+    NotFound,
+}
+
+fn ui_response(method: &str, path: &str) -> Option<UiResponse> {
+    if method != "GET" {
+        return None;
+    }
+    if path == "/" {
+        return Some(UiResponse::Redirect("/ui/".to_string()));
+    }
+    if path == "/ui" || path == "/ui/" {
+        return Some(UiResponse::Asset(200, "text/html; charset=utf-8", crate::web::INDEX));
+    }
+    if let Some(name) = path.strip_prefix("/ui/") {
+        return match crate::web::asset(name) {
+            Some((ct, body)) => Some(UiResponse::Asset(200, ct, body)),
+            None => Some(UiResponse::NotFound),
+        };
+    }
+    None
+}
+
+fn respond_redirect<C: Conn>(s: &mut C, location: &str) -> std::io::Result<()> {
+    let head = format!(
+        "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n",
+        location
+    );
+    s.write_all(head.as_bytes())?;
+    s.flush()
+}
+
+fn respond_static<C: Conn>(
+    s: &mut C,
+    code: u16,
+    ct: &str,
+    body: &[u8],
+    extra: &[(&str, String)],
+) -> std::io::Result<()> {
+    let mut head = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-cache\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: {}\r\nConnection: close\r\n",
+        code,
+        reason(code),
+        ct,
+        body.len(),
+        crate::web::CSP
+    );
+    for (k, v) in extra {
+        head.push_str(&format!("{}: {}\r\n", k, v));
+    }
+    head.push_str("\r\n");
+    s.write_all(head.as_bytes())?;
+    s.write_all(body)?;
+    s.flush()
+}
+
 fn handle<C: Conn>(app: Arc<App>, mut s: C) -> std::io::Result<()> {
     let _ = s.set_read_timeout_opt(Some(Duration::from_secs(30)));
     let _ = s.set_write_timeout_opt(Some(Duration::from_secs(30)));
@@ -340,6 +402,21 @@ fn handle<C: Conn>(app: Arc<App>, mut s: C) -> std::io::Result<()> {
         .filter(|s| !s.is_empty())
         .collect();
 
+    // Static control-plane UI: `/` redirects to `/ui/`; `/ui/*` serves the
+    // embedded assets without authentication so a browser can load the shell
+    // before any API token is presented.
+    if let Some(resp) = ui_response(req.method.as_str(), &req.path) {
+        match resp {
+            UiResponse::Redirect(location) => return respond_redirect(&mut s, &location),
+            UiResponse::Asset(code, ct, body) => {
+                return respond_static(&mut s, code, ct, body.as_bytes(), &[]);
+            }
+            UiResponse::NotFound => {
+                return respond_static(&mut s, 404, "text/plain; charset=utf-8", b"not found", &[]);
+            }
+        }
+    }
+
     // SSE attach: only the events endpoint accepts a query token; everything
     // else must carry the token in the x-roamway-token header.
     let events_id = events_agent_id(&req);
@@ -349,6 +426,7 @@ fn handle<C: Conn>(app: Arc<App>, mut s: C) -> std::io::Result<()> {
             .get("token")
             .cloned()
             .or_else(|| req.headers.get("x-roamway-token").cloned())
+            .or_else(|| bearer_header(&req).map(|v| v.to_string()))
             .unwrap_or_default();
         match authenticate(&app, Some(&got)) {
             AuthOutcome::Reject => {
@@ -363,8 +441,12 @@ fn handle<C: Conn>(app: Arc<App>, mut s: C) -> std::io::Result<()> {
     }
 
     let public = !needs_auth(&req.path);
+    let mut identity: Option<(String, Vec<String>)> = None;
     if !public {
-        let presented = req.headers.get("x-roamway-token").map(|v| v.as_str());
+        let presented = req.headers
+            .get("x-roamway-token")
+            .map(|v| v.as_str())
+            .or_else(|| bearer_header(&req));
         match authenticate(&app, presented) {
             AuthOutcome::Reject => {
                 return respond_full(&mut s, 401, &json!({"error": "unauthorized"}), &cors_extra);
@@ -415,8 +497,17 @@ fn handle<C: Conn>(app: Arc<App>, mut s: C) -> std::io::Result<()> {
                         }
                     }
                 }
+                identity = Some((token_id, scopes));
             }
         }
+    }
+
+    if req.method == "GET" && req.path == "/v1/auth/whoami" {
+        let body = match &identity {
+            Some((token_id, scopes)) => json!({ "token_id": token_id, "scopes": scopes }),
+            None => json!({ "token_id": "anonymous", "scopes": [] }),
+        };
+        return respond_full(&mut s, 200, &body, &cors_extra);
     }
 
     let (code, body) = route(&app, &req);
@@ -480,6 +571,14 @@ fn events_agent_id(req: &Req) -> Option<String> {
     } else {
         None
     }
+}
+
+fn bearer_header(req: &Req) -> Option<&str> {
+    req.headers
+        .get("authorization")
+        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
 }
 
 fn agent_state(app: &Arc<App>, id: &str) -> String {
@@ -895,6 +994,9 @@ fn route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         ("POST", ["v1", "approvals", id, "approve"]) => approval_decide_route(app, req, id, "approved"),
         ("POST", ["v1", "approvals", id, "deny"]) => approval_decide_route(app, req, id, "denied"),
         ("GET", ["v1", "hosts"]) => list_hosts(app),
+        ("POST", ["v1", "hosts"]) => create_host_route(app, req),
+        ("DELETE", ["v1", "hosts", name]) => delete_host_route(app, name),
+        ("POST", ["v1", "hosts", name, "probe"]) => probe_host_route(app, name),
         ("GET", ["v1", "workspaces"]) => list_workspaces_route(app),
         ("POST", ["v1", "workspaces", "clone"]) => clone_workspace_route(app, req),
         ("DELETE", ["v1", "workspaces", name]) => remove_workspace_route(app, name),
@@ -955,6 +1057,11 @@ fn route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         ("POST", ["v1", "schedules", id, "resume"]) => resume_schedule(app, id),
         ("GET", ["v1", "schedules", id, "logs"]) => schedule_logs(app, req, id),
         ("GET", ["v1", "status"]) => status_route(app),
+        ("GET", ["v1", "usage"]) => usage_route(app),
+        ("GET", ["v1", "providers"]) => providers_route(app),
+        ("GET", ["v1", "tokens"]) => list_tokens_route(app),
+        ("POST", ["v1", "tokens"]) => create_token_route(app, req),
+        ("DELETE", ["v1", "tokens", id]) => revoke_token_route(app, id),
         ("GET", ["v1", "hooks"]) => hooks_route(app),
         ("GET", ["v1", "hub"]) => hub_overview_route(app),
         ("GET", ["v1", "hub", "triggers"]) => hub_triggers_route(app),
@@ -964,6 +1071,7 @@ fn route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         ("GET", ["v1", "agents"]) => list_agents_route(app, req),
         ("POST", ["v1", "agents"]) => create_agent_route(app, req),
         ("POST", ["v1", "agents", "import"]) => import_agent_route(app, req),
+        ("GET", ["v1", "agents", id, "diff"]) => agent_diff_route(app, id),
         ("GET", ["v1", "agents", id]) => get_agent_route(app, id),
         ("PATCH", ["v1", "agents", id]) => patch_agent_route(app, id, req),
         ("DELETE", ["v1", "agents", id]) => archive_agent_route(app, id, req),
@@ -1673,6 +1781,204 @@ fn list_hosts(app: &Arc<App>) -> (u16, Value) {
     (200, json!({ "hosts": hosts }))
 }
 
+fn host_json(h: &hosts::Host) -> Value {
+    json!({
+        "id": h.id,
+        "name": h.name,
+        "endpoint": h.endpoint,
+        "token": hosts::mask(&h.token),
+        "enabled": h.enabled,
+        "created_at": h.created_at,
+        "last_probe": h.last_probe.as_ref().map(|p| json!({
+            "at": p.at,
+            "ok": p.ok,
+            "latency_ms": p.latency_ms,
+            "version": p.version,
+            "error": p.error,
+        })),
+        "failures": h.failures,
+        "next_retry_at": h.next_retry_at,
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewHost {
+    name: String,
+    endpoint: String,
+    #[serde(default)]
+    token: String,
+}
+
+fn create_host_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
+    let spec: NewHost = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
+        Err(e) => return (400, json!({ "error": format!("bad json: {}", e) })),
+    };
+    let dir = {
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        st.dir.clone()
+    };
+    let mut reg = hosts::Registry::load(&dir);
+    let added = match reg.add(spec.name.trim(), spec.endpoint.trim(), spec.token.trim()) {
+        Ok(h) => h.clone(),
+        Err(e) => return (400, json!({ "error": e })),
+    };
+    if let Err(e) = reg.save() {
+        return (500, json!({ "error": format!("save failed: {}", e) }));
+    }
+    (201, json!({ "host": host_json(&added) }))
+}
+
+fn delete_host_route(app: &Arc<App>, name: &str) -> (u16, Value) {
+    let dir = {
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        st.dir.clone()
+    };
+    let mut reg = hosts::Registry::load(&dir);
+    if !reg.remove(name) {
+        return (404, json!({ "error": "no such host" }));
+    }
+    if let Err(e) = reg.save() {
+        return (500, json!({ "error": format!("save failed: {}", e) }));
+    }
+    (200, json!({ "ok": true, "removed": name }))
+}
+
+fn probe_host_route(app: &Arc<App>, name: &str) -> (u16, Value) {
+    let dir = {
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        st.dir.clone()
+    };
+    let mut reg = hosts::Registry::load(&dir);
+    let idx = match reg.hosts.iter().position(|h| h.name == name) {
+        Some(i) => i,
+        None => return (404, json!({ "error": "no such host" })),
+    };
+    let p = hosts::probe(&reg.hosts[idx]);
+    if p.error != "skipped" {
+        let host = &mut reg.hosts[idx];
+        host.last_probe = Some(p.clone());
+        if p.ok {
+            host.failures = 0;
+            host.next_retry_at = None;
+        } else {
+            host.failures += 1;
+            let next = crate::types::now() + hosts::backoff(host.failures);
+            host.next_retry_at = Some(next);
+        }
+        if let Err(e) = reg.save() {
+            return (500, json!({ "error": format!("save failed: {}", e) }));
+        }
+    }
+    let host = reg.hosts[idx].clone();
+    (200, json!({
+        "host": host_json(&host),
+        "ok": p.ok,
+        "latency_ms": p.latency_ms,
+        "version": p.version,
+        "error": p.error,
+    }))
+}
+
+fn usage_route(app: &Arc<App>) -> (u16, Value) {
+    let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+    let state = &st.state;
+    let mut report = usage::report_json(state);
+    let rows = usage::aggregate(state, 0, None);
+    let by_day: Vec<Value> = rows
+        .iter()
+        .map(|r| json!({
+            "day": r.day,
+            "provider": r.provider,
+            "model": r.model,
+            "runs": r.runs,
+            "in_tokens": r.in_tokens,
+            "out_tokens": r.out_tokens,
+            "total_tokens": r.total_tokens,
+        }))
+        .collect();
+    if let Some(obj) = report.as_object_mut() {
+        obj.insert("by_day".into(), json!(by_day));
+    }
+    (200, report)
+}
+
+fn providers_route(app: &Arc<App>) -> (u16, Value) {
+    let dir = {
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        st.dir.clone()
+    };
+    (200, json!({ "providers": providers::load(&dir) }))
+}
+
+fn list_tokens_route(app: &Arc<App>) -> (u16, Value) {
+    let st = app.tokens.lock().unwrap_or_else(|e| e.into_inner());
+    (200, json!({ "tokens": st.list() }))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NewToken {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    scopes: Vec<String>,
+    #[serde(default)]
+    ttl_secs: Option<i64>,
+}
+
+fn create_token_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
+    let spec: NewToken = match serde_json::from_slice(&req.body) {
+        Ok(v) => v,
+        Err(e) => return (400, json!({ "error": format!("bad json: {}", e) })),
+    };
+    let scopes = if spec.scopes.is_empty() {
+        auth::ALL_SCOPES.iter().map(|s| s.to_string()).collect()
+    } else {
+        spec.scopes
+    };
+    let mut st = app.tokens.lock().unwrap_or_else(|e| e.into_inner());
+    let (id, plain) = st.create(spec.name, scopes, spec.ttl_secs);
+    (201, json!({ "token": plain, "id": id }))
+}
+
+fn revoke_token_route(app: &Arc<App>, id: &str) -> (u16, Value) {
+    let mut st = app.tokens.lock().unwrap_or_else(|e| e.into_inner());
+    if st.revoke(id) {
+        (200, json!({ "ok": true, "revoked": id }))
+    } else {
+        (404, json!({ "error": "no such token" }))
+    }
+}
+
+fn agent_diff_route(app: &Arc<App>, id: &str) -> (u16, Value) {
+    let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+    let agent = match st.state.agents.iter().find(|a| a.id == id) {
+        Some(a) => a.clone(),
+        None => return (404, json!({ "error": "no such agent" })),
+    };
+    if !agent.worktree {
+        return (400, json!({ "error": "worktree not enabled" }));
+    }
+    let base = match agent.base_path.as_deref() {
+        Some(p) if !p.trim().is_empty() => p,
+        _ => return (400, json!({ "error": "worktree path unavailable" })),
+    };
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(base)
+        .arg("diff")
+        .arg("--")
+        .arg(&agent.workspace)
+        .output();
+    match out {
+        Ok(o) if o.status.success() => (200, json!({ "diff": String::from_utf8_lossy(&o.stdout).to_string() })),
+        Ok(o) => (400, json!({ "error": String::from_utf8_lossy(&o.stderr).trim().to_string() })),
+        Err(e) => (400, json!({ "error": format!("git diff failed: {}", e) })),
+    }
+}
+
 fn health(app: &Arc<App>) -> Value {
     let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
     let running = st
@@ -1893,6 +2199,7 @@ fn create_run(app: &Arc<App>, req: &Req) -> (u16, Value) {
             pid: None,
             attempts: 0,
             agent_id: None,
+
             trigger_id: None,
             usage: None,
         };
@@ -2268,6 +2575,120 @@ mod tests {
     }
 
     #[test]
+    fn whoami_still_requires_token() {
+        assert!(needs_auth("/v1/auth/whoami"));
+    }
+
+    #[test]
+    fn ui_response_routing() {
+        match ui_response("GET", "/") {
+            Some(UiResponse::Redirect(loc)) => assert_eq!(loc, "/ui/"),
+            other => panic!("expected redirect, got {:?}", other),
+        }
+        match ui_response("GET", "/ui") {
+            Some(UiResponse::Asset(code, ct, body)) => {
+                assert_eq!(code, 200);
+                assert_eq!(ct, "text/html; charset=utf-8");
+                assert_eq!(body, crate::web::INDEX);
+            }
+            other => panic!("expected index asset, got {:?}", other),
+        }
+        match ui_response("GET", "/ui/app.js") {
+            Some(UiResponse::Asset(code, ct, _)) => {
+                assert_eq!(code, 200);
+                assert_eq!(ct, "application/javascript; charset=utf-8");
+            }
+            other => panic!("expected js asset, got {:?}", other),
+        }
+        match ui_response("GET", "/ui/missing.js") {
+            Some(UiResponse::NotFound) => {}
+            other => panic!("expected not found, got {:?}", other),
+        }
+        assert!(ui_response("POST", "/ui/").is_none());
+        assert!(ui_response("GET", "/v1/agents").is_none());
+    }
+
+    #[test]
+    fn bearer_header_parses_authorization() {
+        let req = Req {
+            method: "GET".into(),
+            path: "/v1/agents".into(),
+            query: HashMap::new(),
+            headers: HashMap::from([("authorization".into(), "Bearer abc123".into())]),
+            body: vec![],
+        };
+        assert_eq!(bearer_header(&req), Some("abc123"));
+        let req = Req {
+            method: "GET".into(),
+            path: "/v1/agents".into(),
+            query: HashMap::new(),
+            headers: HashMap::from([("authorization".into(), "bearer  xyz  ".into())]),
+            body: vec![],
+        };
+        assert_eq!(bearer_header(&req), Some("xyz"));
+        let req = Req {
+            method: "GET".into(),
+            path: "/v1/agents".into(),
+            query: HashMap::new(),
+            headers: HashMap::from([("authorization".into(), "Basic abc".into())]),
+            body: vec![],
+        };
+        assert_eq!(bearer_header(&req), None);
+    }
+
+#[test]
+    fn token_create_list_revoke() {
+        let dir = std::env::temp_dir().join(format!("roamway-tokens-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let app = test_app(&dir, "shell", RunStatus::Done);
+        let req = Req {
+            method: "POST".into(),
+            path: "/v1/tokens".into(),
+            query: HashMap::new(),
+            headers: HashMap::new(),
+            body: br#"{"name":"ui","scopes":["read"]}"#.to_vec(),
+        };
+        let (code, body) = create_token_route(&app, &req);
+        assert_eq!(code, 201);
+        assert_eq!(body["token"].as_str().map(|s| s.len()), Some(64));
+        let id = body["id"].as_str().unwrap().to_string();
+        let (code, body) = list_tokens_route(&app);
+        assert_eq!(code, 200);
+        assert_eq!(body["tokens"].as_array().unwrap().len(), 1);
+        let (code, _) = revoke_token_route(&app, &id);
+        assert_eq!(code, 200);
+        let (code, _) = revoke_token_route(&app, &id);
+        assert_eq!(code, 404);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn host_create_list_delete() {
+        let dir = std::env::temp_dir().join(format!("roamway-hosts-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let app = test_app(&dir, "shell", RunStatus::Done);
+        let req = Req {
+            method: "POST".into(),
+            path: "/v1/hosts".into(),
+            query: HashMap::new(),
+            headers: HashMap::new(),
+            body: br#"{"name":"nas1","endpoint":"192.0.2.10:8796","token":"secret"}"#.to_vec(),
+        };
+        let (code, body) = create_host_route(&app, &req);
+        assert_eq!(code, 201);
+        assert_eq!(body["host"]["name"].as_str(), Some("nas1"));
+        assert_eq!(body["host"]["token"].as_str(), Some("****"));
+        let (code, body) = list_hosts(&app);
+        assert_eq!(code, 200);
+        assert_eq!(body["hosts"].as_array().unwrap().len(), 1);
+        let (code, _) = delete_host_route(&app, "nas1");
+        assert_eq!(code, 200);
+        let (code, _) = delete_host_route(&app, "nas1");
+        assert_eq!(code, 404);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn timeout_s_bounds() {
         assert!(!valid_timeout_s(0));
         assert!(valid_timeout_s(1));
@@ -2290,7 +2711,7 @@ mod tests {
         let short = tail_bytes(&s, 100);
         assert!(short.len() >= 100 && short.len() <= 102);
         assert!(short.chars().next().is_some());
-        // 不会 panic 且是合法 UTF-8
+        // 截断必须落在 UTF-8 边界，否则会 panic
         assert!(std::str::from_utf8(short.as_bytes()).is_ok());
     }
 
@@ -2353,6 +2774,7 @@ mod tests {
             pid: None,
             attempts: 0,
             agent_id: None,
+
             trigger_id: None,
             usage: None,
         };
