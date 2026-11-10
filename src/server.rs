@@ -328,6 +328,9 @@ fn ui_response(method: &str, path: &str) -> Option<UiResponse> {
     if path == "/ui" || path == "/ui/" {
         return Some(UiResponse::Asset(200, "text/html; charset=utf-8", crate::web::INDEX));
     }
+    if path == "/ui/board" || path == "/ui/board/" {
+        return Some(UiResponse::Asset(200, "text/html; charset=utf-8", crate::web::BOARD));
+    }
     if let Some(name) = path.strip_prefix("/ui/") {
         return match crate::web::asset(name) {
             Some((ct, body)) => Some(UiResponse::Asset(200, ct, body)),
@@ -3174,6 +3177,35 @@ mod tests {
         }
         assert!(ui_response("POST", "/ui/").is_none());
         assert!(ui_response("GET", "/v1/agents").is_none());
+    }
+
+    #[test]
+    fn ui_board_route_serves_board_html() {
+        match ui_response("GET", "/ui/board") {
+            Some(UiResponse::Asset(code, ct, body)) => {
+                assert_eq!(code, 200);
+                assert_eq!(ct, "text/html; charset=utf-8");
+                assert_eq!(body, crate::web::BOARD);
+            }
+            other => panic!("expected board asset, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ui_board_trailing_slash() {
+        match ui_response("GET", "/ui/board/") {
+            Some(UiResponse::Asset(code, ct, body)) => {
+                assert_eq!(code, 200);
+                assert_eq!(ct, "text/html; charset=utf-8");
+                assert_eq!(body, crate::web::BOARD);
+            }
+            other => panic!("expected board asset, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn ui_board_post_is_not_static() {
+        assert!(ui_response("POST", "/ui/board").is_none());
     }
 
     #[test]

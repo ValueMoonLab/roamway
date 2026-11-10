@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>roamway board</title>
+<link rel="stylesheet" href="/ui/style.css">
+<style>
+  body { min-width: 320px; }
+  #board-counts { grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); }
+  #board-counts .card { margin-bottom: 0; padding: 12px 14px; text-align: center; }
+  .running-row { background: var(--info); }
+  #board-metrics { max-height: 320px; overflow: auto; margin: 0; }
+  .board-dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-left: 8px; background: var(--warn); }
+</style>
+</head>
+<body>
+<main>
+  <div class="card">
+    <div class="spread">
+      <div>
+        <span class="mono" id="board-title">roamway -</span><span class="board-dot" id="board-dot" title="offline"></span>
+      </div>
+      <div class="muted" id="board-meta">-</div>
+    </div>
+  </div>
+  <div class="card" id="token-box" hidden>
+    <label for="board-token">Token</label>
+    <input id="board-token" type="password" autocomplete="current-password">
+    <div class="muted" id="board-token-hint">输入 daemon token 后回车，只发 GET 请求。</div>
+    <div class="row" style="margin-top:12px;">
+      <button type="button" id="board-save" class="primary">保存并刷新</button>
+    </div>
+  </div>
+  <div class="cards" id="board-counts"></div>
+  <div class="card">
+    <h2>最近 run</h2>
+    <div id="board-runs"></div>
+  </div>
+  <div class="card">
+    <h2>Jobs</h2>
+    <div id="board-jobs"></div>
+  </div>
+  <div class="card">
+    <h2>Metrics</h2>
+    <pre class="log-view" id="board-metrics">-</pre>
+  </div>
+</main>
+<script src="/ui/board.js"></script>
+</body>
+</html>

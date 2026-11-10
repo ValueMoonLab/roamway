@@ -1,10 +1,10 @@
-﻿/* roamway 控制面 — 原生 ES2017，无框架，无外部依赖 */
+/* roamway 控制面 — 原生 ES2017，无框架，无外部依赖 */
 (function () {
   'use strict';
 
   var TOKEN_KEY = 'roamway.token';
   var THEME_KEY = 'roamway.theme';
-  var state = { token: localStorage.getItem(TOKEN_KEY) || '' };
+  var state = { token: localStorage.getItem(TOKEN_KEY) || '', scopes: [], scopesLoaded: false };
   var es = null; // 当前 EventSource
 
   var $ = function (sel, root) { return (root || document).querySelector(sel); };
@@ -47,6 +47,10 @@
     return h;
   }
 
+  function canWrite(scopes) {
+    return (scopes || []).indexOf('admin') >= 0 || (scopes || []).indexOf('run') >= 0;
+  }
+
   function showLogin(message) {
     if (es) { try { es.close(); } catch (e) {} es = null; }
     clear(view());
@@ -62,6 +66,8 @@
       var v = input.value.trim();
       if (!v) { toast('请输入 token'); return; }
       state.token = v;
+      state.scopes = [];
+      state.scopesLoaded = false;
       localStorage.setItem(TOKEN_KEY, v);
       location.hash = '#/agents';
       render();
@@ -147,7 +153,7 @@
     head.appendChild(el('h1', null, 'Agents'));
     var headBtns = el('div', 'row');
     headBtns.appendChild(btn('刷新', function () { load(); }));
-    headBtns.appendChild(btn('新建 Agent', function () { location.hash = '#/agents/new'; }, 'primary'));
+    if (canWrite(state.scopes)) headBtns.appendChild(btn('新建 Agent', function () { location.hash = '#/agents/new'; }, 'primary'));
     head.appendChild(headBtns);
     root.appendChild(head);
 
@@ -255,9 +261,11 @@
     var head = el('div', 'spread');
     head.appendChild(el('h1', null, 'Agent ' + id));
     var actions = el('div', 'row');
-    actions.appendChild(btn('停止', function () { agentAction('stop', id); }, 'danger'));
-    actions.appendChild(btn('重跑', function () { rerunPrompt(id); }));
-    actions.appendChild(btn('归档', function () { archiveAgent(id); }));
+    if (canWrite(state.scopes)) {
+      actions.appendChild(btn('停止', function () { agentAction('stop', id); }, 'danger'));
+      actions.appendChild(btn('重跑', function () { rerunPrompt(id); }));
+      actions.appendChild(btn('归档', function () { archiveAgent(id); }));
+    }
     actions.appendChild(btn('复制 run_id', function () { copyRunId(id); }));
     actions.appendChild(btn('查看 diff', function () { location.hash = '#/agents/' + id + '/diff'; }));
     head.appendChild(actions);
@@ -433,7 +441,7 @@
     var root = el('div');
     var head = el('div', 'spread');
     head.appendChild(el('h1', null, 'Hosts'));
-    head.appendChild(btn('添加 Host', function () { showHostForm(root); }, 'primary'));
+    if (canWrite(state.scopes)) head.appendChild(btn('添加 Host', function () { showHostForm(root); }, 'primary'));
     root.appendChild(head);
     var list = el('div');
     root.appendChild(list);
@@ -445,7 +453,9 @@
         if (!hosts.length) { list.appendChild(el('p', 'muted', '暂无 host')); return; }
         var table = el('table');
         var thead = el('thead'); var tr = el('tr');
-        ['', '名称', 'Endpoint', '在线', 'Token', '操作'].forEach(function (t) { var th = el('th', null, t); tr.appendChild(th); });
+        var cols = ['', '名称', 'Endpoint', '在线', 'Token'];
+        if (canWrite(state.scopes)) cols.push('操作');
+        cols.forEach(function (t) { var th = el('th', null, t); tr.appendChild(th); });
         thead.appendChild(tr); table.appendChild(thead);
         var tbody = el('tbody');
         hosts.forEach(function (h) {
@@ -455,10 +465,13 @@
           var c2 = el('td', 'mono', h.endpoint);
           var c3 = el('td', null, h.last_probe && h.last_probe.ok ? ('ok ' + h.last_probe.latency_ms + 'ms') : (h.last_probe ? h.last_probe.error : '未知'));
           var c4 = el('td', 'mono', h.token || '[set]');
-          var c5 = el('td', 'row');
-          c5.appendChild(btn('probe', function () { probeHost(h.name, load); }));
-          c5.appendChild(btn('删除', function () { deleteHost(h.name, load); }, 'danger'));
-          r.appendChild(c0); r.appendChild(c1); r.appendChild(c2); r.appendChild(c3); r.appendChild(c4); r.appendChild(c5);
+          r.appendChild(c0); r.appendChild(c1); r.appendChild(c2); r.appendChild(c3); r.appendChild(c4);
+          if (canWrite(state.scopes)) {
+            var c5 = el('td', 'row');
+            c5.appendChild(btn('probe', function () { probeHost(h.name, load); }));
+            c5.appendChild(btn('删除', function () { deleteHost(h.name, load); }, 'danger'));
+            r.appendChild(c5);
+          }
           tbody.appendChild(r);
         });
         table.appendChild(tbody);
@@ -519,13 +532,15 @@
     card.appendChild(el('div', 'muted', '下次运行: ' + fmtTime(s.next_run_at)));
     card.appendChild(el('div', 'muted', '最近状态: ' + (s.last_status || '-') + '  失败 ' + s.consecutive_failures + ' 次'));
     var actions = el('div', 'row');
-    actions.appendChild(btn(s.paused ? '恢复' : '暂停', function () {
-      var method = s.paused ? 'resume' : 'pause';
-      api('POST', '/v1/schedules/' + s.id + '/' + method, {}).then(function () { render(); }).catch(function (e) { toast(e.message); });
-    }));
-    actions.appendChild(btn(s.enabled ? '禁用' : '启用', function () {
-      api('PATCH', '/v1/schedules/' + s.id, { enabled: !s.enabled }).then(function () { render(); }).catch(function (e) { toast(e.message); });
-    }));
+    if (canWrite(state.scopes)) {
+      actions.appendChild(btn(s.paused ? '恢复' : '暂停', function () {
+        var method = s.paused ? 'resume' : 'pause';
+        api('POST', '/v1/schedules/' + s.id + '/' + method, {}).then(function () { render(); }).catch(function (e) { toast(e.message); });
+      }));
+      actions.appendChild(btn(s.enabled ? '禁用' : '启用', function () {
+        api('PATCH', '/v1/schedules/' + s.id, { enabled: !s.enabled }).then(function () { render(); }).catch(function (e) { toast(e.message); });
+      }));
+    }
     actions.appendChild(btn('最近 5 次', function () { showScheduleRuns(s, card); }));
     card.appendChild(actions);
     return card;
@@ -551,7 +566,7 @@
     var root = el('div');
     var head = el('div', 'spread');
     head.appendChild(el('h1', null, 'Terminals'));
-    head.appendChild(btn('新建终端', function () { createTerminal(); }, 'primary'));
+    if (canWrite(state.scopes)) head.appendChild(btn('新建终端', function () { createTerminal(); }, 'primary'));
     root.appendChild(head);
     var list = el('div');
     var panel = el('div');
@@ -580,12 +595,14 @@
       clear(panel);
       var out = el('div', 'terminal-out');
       panel.appendChild(out);
-      var sendRow = el('div', 'row');
-      var keys = el('input'); keys.placeholder = '按键输入（如 ls -la）';
-      var enter = el('input'); enter.type = 'checkbox'; enter.id = 'term-enter'; enter.style.width = 'auto'; enter.style.minHeight = 'auto';
-      var send = btn('发送', function () { sendKeys(id, keys.value, enter.checked, sendRow); }, 'primary');
-      sendRow.appendChild(keys); sendRow.appendChild(el('label', null, '回车')); sendRow.appendChild(enter); sendRow.appendChild(send);
-      panel.appendChild(sendRow);
+      if (canWrite(state.scopes)) {
+        var sendRow = el('div', 'row');
+        var keys = el('input'); keys.placeholder = '按键输入（如 ls -la）';
+        var enter = el('input'); enter.type = 'checkbox'; enter.id = 'term-enter'; enter.style.width = 'auto'; enter.style.minHeight = 'auto';
+        var send = btn('发送', function () { sendKeys(id, keys.value, enter.checked, sendRow); }, 'primary');
+        sendRow.appendChild(keys); sendRow.appendChild(el('label', null, '回车')); sendRow.appendChild(enter); sendRow.appendChild(send);
+        panel.appendChild(sendRow);
+      }
       poll(id, out);
     }
 
@@ -674,34 +691,41 @@
       who.appendChild(el('div', 'muted', 'token_id: ' + (d.token_id || '-')));
     }).catch(function () {});
 
-    var tok = el('div', 'card');
-    root.appendChild(tok);
-    var name = el('input'); name.placeholder = 'token 名称（可选）';
-    var scope = el('select');
-    [['read', 'read'], ['run', 'run'], ['admin', 'admin']].forEach(function (s) { var o = el('option', null, s[0]); o.value = s[1]; scope.appendChild(o); });
-    var gen = btn('生成新 token', function () {
-      api('POST', '/v1/tokens', { name: name.value.trim(), scopes: [scope.value] }).then(function (d) {
-        var out = el('div', 'log-view');
-        out.textContent = 'token（仅显示一次）：' + (d.token || '');
-        tok.appendChild(out);
-      }).catch(function (e) { toast(e.message); });
-    }, 'primary');
-    tok.appendChild(el('h2', null, '生成 Token'));
-    tok.appendChild(field('名称', name));
-    tok.appendChild(field('Scope', scope));
-    tok.appendChild(gen);
-    var tokList = el('div');
-    tok.appendChild(tokList);
-    api('GET', '/v1/tokens').then(function (d) {
-      clear(tokList);
-      (d.tokens || []).forEach(function (t) {
-        var row = el('div', 'row');
-        row.appendChild(el('span', 'mono', t.id + ' ' + (t.name || '')));
-        row.appendChild(el('span', 'muted', (t.scopes || []).join(',')));
-        row.appendChild(btn('撤销', function () { api('DELETE', '/v1/tokens/' + t.id).then(function () { render(); }).catch(function (e) { toast(e.message); }); }, 'danger'));
-        tokList.appendChild(row);
-      });
-    }).catch(function () {});
+    if (canWrite(state.scopes)) {
+      var tok = el('div', 'card');
+      root.appendChild(tok);
+      var name = el('input'); name.placeholder = 'token 名称（可选）';
+      var scope = el('select');
+      [['read', 'read'], ['run', 'run'], ['admin', 'admin']].forEach(function (s) { var o = el('option', null, s[0]); o.value = s[1]; scope.appendChild(o); });
+      var gen = btn('生成新 token', function () {
+        api('POST', '/v1/tokens', { name: name.value.trim(), scopes: [scope.value] }).then(function (d) {
+          var out = el('div', 'log-view');
+          out.textContent = 'token（仅显示一次）：' + (d.token || '');
+          tok.appendChild(out);
+        }).catch(function (e) { toast(e.message); });
+      }, 'primary');
+      tok.appendChild(el('h2', null, '生成 Token'));
+      tok.appendChild(field('名称', name));
+      tok.appendChild(field('Scope', scope));
+      tok.appendChild(gen);
+      var tokList = el('div');
+      tok.appendChild(tokList);
+      api('GET', '/v1/tokens').then(function (d) {
+        clear(tokList);
+        (d.tokens || []).forEach(function (t) {
+          var row = el('div', 'row');
+          row.appendChild(el('span', 'mono', t.id + ' ' + (t.name || '')));
+          row.appendChild(el('span', 'muted', (t.scopes || []).join(',')));
+          row.appendChild(btn('撤销', function () { api('DELETE', '/v1/tokens/' + t.id).then(function () { render(); }).catch(function (e) { toast(e.message); }); }, 'danger'));
+          tokList.appendChild(row);
+        });
+      }).catch(function () {});
+    } else {
+      var ro = el('div', 'card');
+      ro.appendChild(el('h2', null, '生成 Token'));
+      ro.appendChild(el('div', 'muted', '只读：当前 token scope 为 read'));
+      root.appendChild(ro);
+    }
 
     var prov = el('div', 'card');
     root.appendChild(prov);
@@ -738,10 +762,22 @@
   /* ---------- 路由 ---------- */
   function render() {
     if (!state.token) { showLogin(); return; }
+    if (!state.scopesLoaded) {
+      api('GET', '/v1/auth/whoami').then(function (d) {
+        state.scopes = (d && d.scopes) || [];
+        state.scopesLoaded = true;
+        render();
+      }).catch(function () {
+        state.scopes = [];
+        state.scopesLoaded = true;
+        render();
+      });
+      return;
+    }
     renderNav();
     clear(view());
     var route = parseRoute();
-    if (route.page === 'agents' && route.id === 'new') view().appendChild(agentNewPage());
+    if (route.page === 'agents' && route.id === 'new') view().appendChild(canWrite(state.scopes) ? agentNewPage() : agentsPage());
     else if (route.page === 'agents' && route.sub === 'diff') view().appendChild(diffPage(route.id));
     else if (route.page === 'agents' && route.id) view().appendChild(agentDetail(route.id));
     else if (route.page === 'agents') view().appendChild(agentsPage());

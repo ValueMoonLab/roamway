@@ -54,6 +54,7 @@ roamway run --agent codex --workspace /path/to/repo "修好失败的测试并说
 
 ```bash
 roamway ls                   # 默认列 agent（ID/STATE/KIND/...）；--runs 看运行记录
+roamway ui --board           # 只读看板（read scope 即可，5 秒轮询）
 roamway status <run-id>
 ```
 

@@ -357,12 +357,13 @@ roamway run --host http://192.168.1.50:8796 --token T \
 
 ## Web 控制面
 
-`roamway serve` 启动后，浏览器访问 `http://127.0.0.1:8796/ui/` 即可打开控制面；入口也可以由 `roamway ui [--print]` 打印。
+`roamway serve` 启动后，浏览器访问 `http://127.0.0.1:8796/ui/` 即可打开控制面；入口也可以由 `roamway ui [--print]` 打印。只读看板 `/ui/board` 由 `roamway ui --print --board` 打印，`read` scope 即可，只发 GET。
 
 - 登录：页面输入 daemon token 后存入 `localStorage`，所有 API 请求带 `Authorization: Bearer`，401 自动回到登录页。
 - 页面：Agents 列表/详情与实时输出（SSE）、worktree diff、Hosts 管理与 probe、Schedules、Terminals、Usage、Settings（token / provider / 主题）。
 - 移动端：支持深色模式与 720px 断点，关键操作 44px 最小点击区。
 - 静态资源随二进制嵌入（`include_str!`）：`/ui/` 返回 `index.html`，`/ui/app.js` 与 `/ui/style.css` 同源内嵌，无需 Node 构建链；`GET /` 302 到 `/ui/`。
+- 只读看板：`/ui/board`（`roamway ui --board`），5 秒轮询、只发 GET；`read` scope 即可长期挂墙，控制面会按 scope 隐藏写按钮。
 - 截图：暂不随仓库提交二进制截图；界面以源码为准（`src/web/index.html`、`src/web/app.js`）。
 
 ```bash
@@ -466,7 +467,7 @@ docs/architecture.md  设计取舍
 - [x] 任务依赖（A 成功后再跑 B）
 - [x] 并发上限（全局 / 每 agent）
 - [x] `/metrics`（Prometheus 文本格式）
-- [ ] 只读 Web 面板
+- [x] 只读 Web 面板
 
 ## License
 

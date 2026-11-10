@@ -30,7 +30,7 @@ use std::time::Duration;
 use types::*;
 use crate::workspaces::WorktreeSpec;
 
-const BOOLS: &[&str] = &["no-wait", "quiet", "json", "allow-overlap", "disabled", "help", "force", "probe", "all", "worktree", "keep-worktree", "run-now", "overlap", "enabled", "enter", "no-enter", "stdin", "no-browser", "no-headers", "no-color", "runs", "background", "global", "resume", "continue", "version"];
+const BOOLS: &[&str] = &["print", "board", "no-wait", "quiet", "json", "allow-overlap", "disabled", "help", "force", "probe", "all", "worktree", "keep-worktree", "run-now", "overlap", "enabled", "enter", "no-enter", "stdin", "no-browser", "no-headers", "no-color", "runs", "background", "global", "resume", "continue", "version"];
 
 static FAIL_CODE: AtomicI32 = AtomicI32::new(0);
 
@@ -969,7 +969,7 @@ fn print_command_help(cmd: &str) -> bool {
         "hooks" => "roamway hooks [--json] [--host H]",
         "hub" => "roamway hub [init [--name N] [--force] | permissions | projects | deploy | logout | status | token rotate]",
         "agent" => "roamway agent run|ls|inspect|logs|wait|attach|archive|reload|update|open|detach|import ...",
-        "ui" => "roamway ui [--print]",
+        "ui" => "roamway ui [--print] [--board]",
         "attach" => "roamway attach <id>",
         "inspect" => "roamway inspect <id>",
         "wait" => "roamway wait <id> [--timeout 60]",
@@ -3794,9 +3794,32 @@ fn open_browser(url: &str) {
     }
 }
 
-fn cmd_ui(flags: &HashMap<String, String>, _pos: &[String]) {
+fn ui_target(flags: &HashMap<String, String>) -> &'static str {
+    if flags.contains_key("board") {
+        "/ui/board"
+    } else {
+        "/ui/"
+    }
+}
+
+fn cmd_ui(flags: &HashMap<String, String>, pos: &[String]) {
+    const UI_FLAGS: &[&str] = &[
+        "print", "board", "host", "data", "home", "token", "format", "json", "quiet",
+        "no-color", "no-headers", "bind",
+    ];
+    for key in flags.keys() {
+        if !UI_FLAGS.contains(&key.as_str()) {
+            usage_error(&format!("ui: unknown flag --{}", key));
+        }
+    }
+    if !pos.is_empty() {
+        usage_error("usage: roamway ui [--print] [--board]");
+    }
+    if FAIL_CODE.load(Ordering::SeqCst) != 0 {
+        return;
+    }
     let base = local_base(flags);
-    let url = format!("{}/ui/", base.trim_end_matches('/'));
+    let url = format!("{}{}", base.trim_end_matches('/'), ui_target(flags));
     if flags.contains_key("print") {
         println!("{}", url);
         return;
@@ -4943,6 +4966,14 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ui_target_switches_board_and_index() {
+        let mut flags: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        assert_eq!(ui_target(&flags), "/ui/");
+        flags.insert("board".to_string(), "true".to_string());
+        assert_eq!(ui_target(&flags), "/ui/board");
+    }
 
     #[test]
     fn serve_path_fallbacks_append_without_displacing_caller_entries() {
