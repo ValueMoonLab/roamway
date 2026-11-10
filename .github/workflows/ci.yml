@@ -28,3 +28,7 @@ jobs:
       - name: Smoke test (unix)
         if: runner.os != 'Windows'
         run: bash scripts/smoke.sh
+      - name: Smoke test (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/smoke.ps1

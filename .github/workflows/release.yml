@@ -1,0 +1,86 @@
+name: Release
+
+# 打 tag（v*）即出三平台预编译产物并挂到 GitHub Release。
+# 只用内置 secrets.GITHUB_TOKEN，不引入任何新 secret；产物名里带 tag 与 target triple，
+# 下载页一眼能对上平台（macos-latest 是 arm64 runner，故用 aarch64-apple-darwin）。
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            triple: x86_64-unknown-linux-gnu
+            kind: unix
+          - os: macos-latest
+            triple: aarch64-apple-darwin
+            kind: unix
+          - os: windows-latest
+            triple: x86_64-pc-windows-msvc
+            kind: windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          toolchain: stable
+      - run: cargo build --release
+      - name: Package (unix)
+        if: matrix.kind == 'unix'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          name="roamway-${tag}-${{ matrix.triple }}"
+          mkdir -p "dist/${name}"
+          cp target/release/roamway "dist/${name}/"
+          cp scripts/smoke.sh README.md "dist/${name}/"
+          chmod +x "dist/${name}/roamway"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+      - name: Package (windows)
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $name = "roamway-$tag-windows-x64"
+          New-Item -ItemType Directory -Force -Path "dist/$name" | Out-Null
+          Copy-Item target/release/roamway.exe "dist/$name/"
+          Copy-Item scripts/smoke.ps1 "dist/$name/"
+          Copy-Item README.md "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: roamway-${{ matrix.triple }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          # 摘要取 CHANGELOG 的第一个版本段（### 之前的所有 ## 内容）
+          awk '/^## /{n++} n==1' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then printf '%s\n' "$tag" > notes.md; fi
+          ls -l dist
+          gh release view "$tag" >/dev/null 2>&1 \
+            || gh release create "$tag" --title "$tag" --notes-file notes.md
+          gh release upload "$tag" dist/*.tar.gz dist/*.zip --clobber

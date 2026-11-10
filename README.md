@@ -96,6 +96,17 @@ export RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup
 export RUSTUP_UPDATE_ROOT=https://mirrors.tuna.tsinghua.edu.cn/rustup/rustup
 ```
 
+### 预编译产物
+
+每个 tag（`v*`）会自动构建三平台产物并挂到 GitHub Releases。Windows 用户下载
+`roamway-v*-windows-x64.zip`，解压即用：
+
+```powershell
+# 解压后
+.\roamway.exe --version
+pwsh scripts\smoke.ps1   # Windows 端到端冒烟
+```
+
 ### 系统要求
 
 Linux / macOS / Windows（Git Bash 或 PowerShell 均可）。Linux 2 核 2G 足够跑十几个并发 agent —— 真正的开销在模型侧，不在 daemon。
@@ -451,7 +462,7 @@ docs/architecture.md  设计取舍
 ## Roadmap
 
 - [x] 参数面对齐完成（P15+P16）
-- [ ] Windows 原生预编译产物
+- [x] Windows 原生预编译产物
 - [ ] 任务依赖（A 成功后再跑 B）
 - [x] 并发上限（全局 / 每 agent）
 - [x] `/metrics`（Prometheus 文本格式）
