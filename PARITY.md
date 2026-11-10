@@ -225,3 +225,26 @@ P24 关键不变量（P22 不变量继续有效，另加以下四条）：
 - `/metrics` 里的计数只能取自 `app.store.lock()` 那个代码块内的局部变量；不得在锁外补读。
 - `<data>/roamway.pid` 只允许 `backup::write_pid_file` 写、`backup::clear_pid_file` 删（后者必须校验 owner 是本进程）；其他路径不得直接读写成"重启保护"。
 - `daemon_alive` 只可**增加**证据，不可删除既有三条中的任何一条；每条证据都要能被 `restore` 的 exit 3 文案点名（`pid` / `heartbeat` / `port`）。
+
+## 十、P25–P26 交付事实（探活可分性 + 数据目录单写者）
+
+| 阶段 | 交付 | 证据（代码锚点） |
+|---|---|---|
+| P25 | liveness 与 readiness 分离，且都免鉴权 | `src/server.rs:2532 fn healthz`（纯活体：`ok/version/uptime_s`，恒 200）、`src/server.rs:2541 fn readyz`（`Fresh/Ok/Recovered` → 200 带 `store`，`Unrecoverable` → 503 `state_unreadable`，锁忙 → 503 `busy`）；路由 `src/server.rs:1397–1398`，免鉴权白名单 `src/server.rs:996` |
+| P25 | 版本定版 + usage 文本单一真源 | `Cargo.toml:3`（P25 定 1.2.0，P26 起 1.3.0）；`src/main.rs:40 USAGE_PRUNE`、`:42 USAGE_BACKUP`、`:43 USAGE_RESTORE`，引用点只在 `src/main.rs:114–116` 与 `:1002–1003`，不再有裸 usage 字符串 |
+| P26 | 数据目录单写者：同 `<data>` 的第二个 `serve` 退出码 3 | `src/backup.rs:301 fn writer_lock_path`、`:306 fn read_writer_lock`、`:318 fn writer_lock_owner`、`:322 fn try_acquire_writer_with`、`:370 fn acquire_writer`、`:375 fn force_acquire_writer`、`:396 fn release_writer`；接线 `src/main.rs:1250`（busy → exit 3）、`:1246`（`--force` 显式接管）、`:1341–1345`（正常退出与启动失败都释放）；文案 `src/backup.rs:403 fn writer_busy_message`、`:412 fn writer_takeover_message` |
+| P26 | `StoreHealth` 四值，`/readyz` 追加 `store` | `src/types.rs:236 pub enum StoreHealth { Fresh, Ok, Recovered, Unrecoverable }`（`as_str` 在 `:238`）、`src/types.rs:252 store_health` 字段 |
+| P26 | 坏文件隔离快照 + 降级期保住 known-good 备份 | `src/types.rs:403 fn quarantine_corrupt_state`（只留最近 5 份）、`:415 fn recover_from_backup`、`:435 fn preserve_known_good_backup`；`src/types.rs:269–270`（`loaded_ok` / `preserve_backup` 决定首笔 `save()` 是否轮换 `.bak`） |
+| P26 | `daemon status` 增 `store` 与 `writer` | `src/main.rs:4296 status["store"] = inspect_store_health(&data)`；`writer` 段同处；文本模式多一行 `store ... writer pid ... bind ...`，daemon 离线也做本地体检 |
+
+P25/P26 关键不变量（P22/P24 不变量继续有效，另加五条）：
+
+- `/healthz` 只回答"进程活着"，不得掺 store 或非关键依赖状态；只有 `/readyz` 允许 503，且 `busy` 不代表该重启。
+- `/readyz` 的 `store` 取值集合固定为 `fresh|ok|recovered|unrecoverable`（P26 定）；`recovered` 必须回 200，不得降级成失败。
+- writer lock 是 `<data>` 单写者的唯一判据；`acquire_writer` 失败一律 exit 3，不得重试、不得降级成多写者并发。`--force` 必须打印接管警告。
+- 降级启动期（`store_health != Ok`）首笔 `save()` 不得轮换 `.bak`，否则会拿坏状态覆盖最后一份已知良好备份。
+- `daemon status` 的 `store` / `writer` 只允许新增键；`store` 取值集合不得扩展。
+
+P27 待补的真洞（本表不视为已交付）：clippy 门禁仍是 `continue-on-error` 的假门禁（63 条 error 长期绿过 CI）；
+`daemon status` 在非默认 `--data` 目录上仍会回落到常量 `127.0.0.1:8796` 并报生产实例的 `uptime_s`；
+`effective_bind` 不看 writer lock；活体实例的 `store` 走离线体检而非 `/readyz`。修法与验收见 `P27_SPEC.md`。
