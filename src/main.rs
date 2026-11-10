@@ -50,7 +50,7 @@ fn usage() {
 核心：
   roamway serve  [--bind 127.0.0.1:8796] [--data DIR] [--token T] [--tz 8] [--max-concurrent 4] [--max-conn 64]
   roamway start                                  # = daemon start
-  roamway run    --agent codex [--model M] [--workspace DIR] [--title T] [--timeout 1800] [--no-wait] [--wait-timeout N] [--new-workspace local|worktree] [--worktree-mode branch-off|checkout-branch|checkout-pr] [--worktree-slug SLUG] [--new-branch B] [--base REF] [--branch B] [--cwd DIR] [--env K=V] [--label k=v] [--host H] "prompt"
+  roamway run    --agent codex [--model M] [--workspace DIR] [--title T] [--timeout 1800] [--no-wait] [--wait-timeout N] [--new-workspace local|worktree] [--worktree-mode branch-off|checkout-branch|checkout-pr] [--worktree-slug SLUG] [--new-branch B] [--base REF] [--branch B] [--cwd DIR] [--env K=V] [--label k=v] [--image PATH] [-i PATH] [--host H] "prompt"
   roamway send   <agent-id> <prompt...>          # 续跑 agent
   roamway delete <id> [--yes]                    # 运行中先 stop 再硬删
   roamway ls     [--limit 50] [-a|--all] [-g|--global] [--label k=v] [--kind K] [--host H|all] [--json|--format table|json|yaml] [-q] [--no-headers] ; --runs 看运行记录
@@ -91,14 +91,22 @@ fn usage() {
 
 通用参数：--host http://127.0.0.1:8796  --token T  --format table|json|yaml  --json  -q/--quiet
           --no-headers  --no-color  --home DIR（等价 --data DIR）
+          未知短标志 exit 2；prompt 里以 - 开头的词请放在 -- 之后
 环境变量：ROAMWAY_HOST / ROAMWAY_TOKEN / ROAMWAY_DEEPSEEK_KEY / ROAMWAY_QWEN_KEY
 agent 可选：codex | hermes | claude | shell | api:deepseek | api:qwen"#,
         env!("CARGO_PKG_VERSION")
     );
 }
-fn parse_flags(args: &[String]) -> (HashMap<String, String>, Vec<String>) {
+struct ParsedArgs {
+    flags: HashMap<String, String>,
+    pos: Vec<String>,
+    unknown: Vec<String>,
+}
+
+fn parse_args(args: &[String]) -> ParsedArgs {
     let mut flags = HashMap::new();
     let mut pos = Vec::new();
+    let mut unknown = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
@@ -143,7 +151,21 @@ fn parse_flags(args: &[String]) -> (HashMap<String, String>, Vec<String>) {
                     i += 1;
                     continue;
                 }
-                _ => {}
+                "i" => {
+                    if i + 1 < args.len() {
+                        push_flag(&mut flags, "image", args[i + 1].clone());
+                        i += 2;
+                    } else {
+                        usage_error("run --image: missing value");
+                        i += 1;
+                    }
+                    continue;
+                }
+                _ => {
+                    unknown.push(a.clone());
+                    i += 1;
+                    continue;
+                }
             }
         }
         if let Some(k) = a.strip_prefix("--") {
@@ -162,8 +184,17 @@ fn parse_flags(args: &[String]) -> (HashMap<String, String>, Vec<String>) {
             i += 1;
         }
     }
-    (flags, pos)
+    ParsedArgs { flags, pos, unknown }
 }
+
+// 只有单测用得到薄包装；dispatch 已改走 parse_args，非 test 构建下它是死代码，
+// 而 CI 带 RUSTFLAGS=-D warnings，dead_code 会直接把 Windows job 打红。
+#[allow(dead_code)]
+fn parse_flags(args: &[String]) -> (HashMap<String, String>, Vec<String>) {
+    let p = parse_args(args);
+    (p.flags, p.pos)
+}
+
 fn push_flag(flags: &mut HashMap<String, String>, key: &str, value: String) {
     match flags.get_mut(key) {
         Some(existing) => {
@@ -929,7 +960,7 @@ fn print_command_help(cmd: &str) -> bool {
         "usage" => "roamway usage [ls [--since 7d|24h|ISO] [--provider id]|inspect <run_id>] [--json]",
         "plugin" => "roamway plugin ls|init <name>|logs <name>|reload <name>|enable|disable <name> [--trust]|remove <name> [--keep-files]",
         "speech" => "roamway speech [transcribe <file>|say <text> [--out file]]",
-        "run" => "roamway run --agent codex [--model M] [--workspace DIR] [--title T] [--timeout 1800] [--no-wait] [--wait-timeout N] [--resume <agent-id> | --continue <agent-id>] [--new-workspace local|worktree] [--worktree-mode branch-off|checkout-branch|checkout-pr] [--pr-number N] [--worktree-slug SLUG] [--new-branch B] [--base REF] [--branch B] [--cwd DIR] [--env K=V] [--label k=v] [--host H] \"prompt\"",
+        "run" => "roamway run --agent codex [--model M] [--workspace DIR] [--title T] [--timeout 1800] [--no-wait] [--wait-timeout N] [--resume <agent-id> | --continue <agent-id>] [--new-workspace local|worktree] [--worktree-mode branch-off|checkout-branch|checkout-pr] [--pr-number N] [--worktree-slug SLUG] [--new-branch B] [--base REF] [--branch B] [--cwd DIR] [--env K=V] [--label k=v] [--image PATH] [-i PATH] [--host H] \"prompt\"",
         "send" => "roamway send <agent-id> <prompt...>",
         "delete" => "roamway delete <id> [--yes]",
         "ls" | "list" => "roamway ls [--limit 50] [-a|--all] [-g|--global] [--label k=v] [--kind K] [--host H|all] [-q] [--no-headers] [--json|--format table|json|yaml] ; --runs 看运行记录",
@@ -973,7 +1004,18 @@ fn print_command_help(cmd: &str) -> bool {
 }
 
 fn dispatch(argv: &[String]) -> i32 {
-    let (flags, pos) = parse_flags(argv);
+    FAIL_CODE.store(0, Ordering::SeqCst);
+    let parsed = parse_args(argv);
+    let (flags, pos) = (parsed.flags, parsed.pos);
+    if let Some(first) = parsed.unknown.first() {
+        eprintln!("unknown flag: {}", first);
+        eprintln!("pass it after '--' if it is part of the prompt");
+        eprintln!("run 'roamway help' for usage");
+        return 2;
+    }
+    if FAIL_CODE.load(Ordering::SeqCst) != 0 {
+        return FAIL_CODE.load(Ordering::SeqCst);
+    }
     if pos.is_empty() {
         if flags.contains_key("version") {
             println!("roamway {}", env!("CARGO_PKG_VERSION"));
@@ -4995,6 +5037,59 @@ mod tests {
     }
 
     #[test]
+    fn parse_args_unknown_short_flags_are_collected() {
+        let p = parse_args(&["-xvf".to_string()]);
+        assert_eq!(p.unknown, vec!["-xvf".to_string()]);
+        assert!(p.pos.is_empty());
+
+        let p = parse_args(&[
+            "run".to_string(),
+            "--agent".to_string(),
+            "shell".to_string(),
+            "-x".to_string(),
+            "echo".to_string(),
+        ]);
+        assert_eq!(p.unknown, vec!["-x".to_string()]);
+        assert_eq!(p.pos, vec!["run".to_string(), "echo".to_string()]);
+    }
+
+    #[test]
+    fn parse_args_supports_dash_i_as_image_alias() {
+        let p = parse_args(&[
+            "run".to_string(),
+            "-i".to_string(),
+            "/tmp/x.png".to_string(),
+            "echo".to_string(),
+        ]);
+        assert_eq!(p.flags.get("image").map(String::as_str), Some("/tmp/x.png"));
+        assert_eq!(p.pos, vec!["run".to_string(), "echo".to_string()]);
+        assert!(p.unknown.is_empty());
+    }
+
+    #[test]
+    fn parse_args_passes_everything_after_double_dash_through() {
+        let p = parse_args(&["run".to_string(), "--".to_string(), "-x".to_string(), "y".to_string()]);
+        assert_eq!(p.pos, vec!["run".to_string(), "-x".to_string(), "y".to_string()]);
+        assert!(p.unknown.is_empty());
+
+        let (flags, pos) = parse_flags(&[
+            "run".to_string(),
+            "--agent".to_string(),
+            "shell".to_string(),
+            "echo -n hi".to_string(),
+        ]);
+        assert_eq!(pos, vec!["run".to_string(), "echo -n hi".to_string()]);
+        assert!(!flags.contains_key("image"));
+    }
+
+    #[test]
+    fn parse_args_keeps_bare_dash_as_positional() {
+        let p = parse_args(&["-".to_string(), "-x".to_string()]);
+        assert_eq!(p.pos, vec!["-".to_string()]);
+        assert_eq!(p.unknown, vec!["-x".to_string()]);
+    }
+
+    #[test]
     fn json_flag_and_format_flag_match() {
         let mut f1: HashMap<String, String> = HashMap::new();
         f1.insert("json".to_string(), "true".to_string());
@@ -5013,6 +5108,18 @@ mod tests {
         assert!(y.contains("b:"));
         assert!(y.contains("- 1"));
         assert!(y.contains("- x"));
+    }
+
+    #[test]
+    fn dispatch_returns_2_for_unknown_short_flag() {
+        assert_eq!(dispatch(&["-x".to_string()]), 2);
+        assert_eq!(dispatch(&["run".to_string(), "-x".to_string(), "echo".to_string()]), 2);
+    }
+
+    #[test]
+    fn dispatch_returns_2_for_dash_i_without_value() {
+        assert_eq!(dispatch(&["-i".to_string()]), 2);
+        assert_eq!(dispatch(&["run".to_string(), "-i".to_string()]), 2);
     }
 
     #[test]

@@ -142,6 +142,8 @@ roamway <cmd> --help      # 同上
 
 全局参数：`--host http://127.0.0.1:8796`、`--token T`、`-o/--format table|json|yaml`、`--json`、`-q/--quiet`、`--no-headers`、`--no-color`、`--home DIR`（等价 `--data DIR`）；环境变量 `ROAMWAY_HOST` / `ROAMWAY_TOKEN` 仍可用。
 
+`run` 传图可用 `--image PATH` 或短别名 `-i PATH`。未知短标志（例如 `-x`）在解析期报错并 exit 2；prompt 里以 `-` 开头的词请放在 `--` 之后。
+
 ## agent 类型
 
 | agent | 实际执行 | 前置条件 |
@@ -172,7 +174,7 @@ ROAMWAY_CODEX_ARGS="--dangerously-bypass-approvals-and-sandbox" roamway serve ..
 | `--thinking` | `none` `low` `medium` `high` | `-c model_reasoning_effort=<level>` |
 | `--mode` | `read-only` `workspace-write` `danger-full-access` | `-s <mode>`（不给则仍是 `workspace-write`） |
 | `--provider` | `ollama` / `lmstudio` / `oss` / 其它 id | `--oss --local-provider <P>` / `--oss` / `-c model_provider=<P>` |
-| `--image <FILE>` | 可重复，每个都是存在的文件 | 每张一个 `-i <FILE>` |
+| `--image <FILE>` / `-i <FILE>` | 可重复，每个都是存在的文件 | 每张一个 `-i <FILE>` |
 | `--output-schema <FILE>` | 存在的 JSON 对象文件（须含 `type`） | `--output-schema <FILE>` |
 
 ```bash
@@ -184,6 +186,7 @@ roamway run --agent codex --thinking high --mode read-only \
 
 - `--thinking` / `--mode` 只接受枚举：`run --thinking must be one of none|low|medium|high`、`run --mode must be one of read-only|workspace-write|danger-full-access`
 - `--image` 必须是存在的文件：`run --image: no such file: <p>`
+- `-i PATH` ≡ `--image PATH`：文件校验与错误文案完全一致
 - `--output-schema` 必须是存在的文件且内容是带 `type` 的 JSON 对象：`run --output-schema: not a JSON object with type: <p>`
 - `--provider` 限 `[A-Za-z0-9_.-]{1,40}`
 - 未知 key：`unknown run option: <k>`
