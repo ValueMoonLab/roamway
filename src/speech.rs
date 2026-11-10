@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::io::Read;
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct SpeechConfig {
@@ -33,8 +33,7 @@ pub fn load(dir: &Path) -> SpeechConfig {
 pub fn save(dir: &Path, cfg: &SpeechConfig) -> std::io::Result<()> {
     let _ = fs::create_dir_all(dir);
     let tmp = dir.join("speech.json.tmp");
-    let data = serde_json::to_vec_pretty(cfg)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let data = serde_json::to_vec_pretty(cfg).map_err(std::io::Error::other)?;
     fs::write(&tmp, data)?;
     fs::rename(&tmp, dir.join("speech.json"))?;
     Ok(())
@@ -78,7 +77,9 @@ fn run_command(args: &[String]) -> Result<String, String> {
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
-    let mut child = cmd.spawn().map_err(|e| format!("spawn {}: {}", args[0], e))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("spawn {}: {}", args[0], e))?;
     let mut stdout = String::new();
     let mut stderr = String::new();
     if let Some(mut out) = child.stdout.take() {
@@ -143,7 +144,11 @@ pub fn status_lines(dir: &Path) -> Vec<String> {
         out.push(format!(
             "stt: {} [{}]",
             cfg.stt.join(" "),
-            if binary_available(&cfg.stt) { "available" } else { "missing binary" }
+            if binary_available(&cfg.stt) {
+                "available"
+            } else {
+                "missing binary"
+            }
         ));
     }
     if cfg.tts.is_empty() {
@@ -152,7 +157,11 @@ pub fn status_lines(dir: &Path) -> Vec<String> {
         out.push(format!(
             "tts: {} [{}]",
             cfg.tts.join(" "),
-            if binary_available(&cfg.tts) { "available" } else { "missing binary" }
+            if binary_available(&cfg.tts) {
+                "available"
+            } else {
+                "missing binary"
+            }
         ));
     }
     out

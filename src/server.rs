@@ -195,8 +195,9 @@ fn read_req<C: Conn>(s: &mut C) -> std::io::Result<ReadOutcome> {
         s.set_read_timeout_opt(Some(remaining))?;
         let n = match s.read(&mut tmp) {
             Ok(n) => n,
-            Err(e) if e.kind() == std::io::ErrorKind::TimedOut
-                || e.kind() == std::io::ErrorKind::WouldBlock =>
+            Err(e)
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
             {
                 if Instant::now() >= deadline {
                     return Ok(ReadOutcome::HeaderTimeout);
@@ -326,10 +327,18 @@ fn ui_response(method: &str, path: &str) -> Option<UiResponse> {
         return Some(UiResponse::Redirect("/ui/".to_string()));
     }
     if path == "/ui" || path == "/ui/" {
-        return Some(UiResponse::Asset(200, "text/html; charset=utf-8", crate::web::INDEX));
+        return Some(UiResponse::Asset(
+            200,
+            "text/html; charset=utf-8",
+            crate::web::INDEX,
+        ));
     }
     if path == "/ui/board" || path == "/ui/board/" {
-        return Some(UiResponse::Asset(200, "text/html; charset=utf-8", crate::web::BOARD));
+        return Some(UiResponse::Asset(
+            200,
+            "text/html; charset=utf-8",
+            crate::web::BOARD,
+        ));
     }
     if let Some(name) = path.strip_prefix("/ui/") {
         return match crate::web::asset(name) {
@@ -524,7 +533,11 @@ fn metrics_text(app: &Arc<App>) -> String {
     let (sched_total, sched_active, sched_failures) = {
         let sc = app.schedules.lock().unwrap_or_else(|e| e.into_inner());
         let total = sc.schedules.len() as u64;
-        let active = sc.schedules.iter().filter(|s| s.enabled && !s.paused).count() as u64;
+        let active = sc
+            .schedules
+            .iter()
+            .filter(|s| s.enabled && !s.paused)
+            .count() as u64;
         let failures: u64 = sc
             .schedules
             .iter()
@@ -570,7 +583,9 @@ fn metrics_text(app: &Arc<App>) -> String {
     out.push_str("# TYPE roamway_logs_count gauge\n");
     out.push_str(&format!("roamway_logs_count {}\n", logs_count));
 
-    out.push_str("# HELP roamway_data_bytes Total bytes of top-level files plus logs/*.log under <data>.\n");
+    out.push_str(
+        "# HELP roamway_data_bytes Total bytes of top-level files plus logs/*.log under <data>.\n",
+    );
     out.push_str("# TYPE roamway_data_bytes gauge\n");
     out.push_str(&format!("roamway_data_bytes {}\n", data_bytes));
 
@@ -621,7 +636,10 @@ fn metrics_text(app: &Arc<App>) -> String {
 
     out.push_str("# HELP roamway_schedule_failures_total Sum of consecutive_failures across schedules (in-memory daemon state; resets on restart).\n");
     out.push_str("# TYPE roamway_schedule_failures_total counter\n");
-    out.push_str(&format!("roamway_schedule_failures_total {}\n", sched_failures));
+    out.push_str(&format!(
+        "roamway_schedule_failures_total {}\n",
+        sched_failures
+    ));
 
     out.push_str("# HELP roamway_terminals Terminal sessions held in memory.\n");
     out.push_str("# TYPE roamway_terminals gauge\n");
@@ -668,7 +686,13 @@ fn handle<C: Conn>(app: Arc<App>, mut s: C) -> std::io::Result<()> {
 
     let host = req.headers.get("host").map(|v| v.as_str());
     if !auth::host_allowed(&app.allow_hosts, &app.bind_host, host) {
-        return fail_json(&app, &mut s, 421, &json!({"error": "misdirected request"}), &[]);
+        return fail_json(
+            &app,
+            &mut s,
+            421,
+            &json!({"error": "misdirected request"}),
+            &[],
+        );
     }
 
     let origin = req.headers.get("origin").map(|v| v.as_str());
@@ -682,8 +706,14 @@ fn handle<C: Conn>(app: Arc<App>, mut s: C) -> std::io::Result<()> {
     if req.method == "OPTIONS" {
         let mut extras = cors_extra;
         if !extras.is_empty() {
-            extras.push(("Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS".to_string()));
-            extras.push(("Access-Control-Allow-Headers", "content-type, x-roamway-token, x-approval".to_string()));
+            extras.push((
+                "Access-Control-Allow-Methods",
+                "GET, POST, PATCH, DELETE, OPTIONS".to_string(),
+            ));
+            extras.push((
+                "Access-Control-Allow-Headers",
+                "content-type, x-roamway-token, x-approval".to_string(),
+            ));
             extras.push(("Access-Control-Max-Age", "86400".to_string()));
         }
         return respond_preflight(&mut s, &extras);
@@ -740,7 +770,8 @@ fn handle<C: Conn>(app: Arc<App>, mut s: C) -> std::io::Result<()> {
     if !public {
         // 普通路径只认 header；`/metrics` 额外接受 `?token=`（Prometheus 的
         // params 抓取习惯，与 SSE 事件端点保持一致），其余路径行为不变。
-        let presented = req.headers
+        let presented = req
+            .headers
             .get("x-roamway-token")
             .map(|v| v.as_str())
             .or_else(|| bearer_header(&req))
@@ -753,7 +784,13 @@ fn handle<C: Conn>(app: Arc<App>, mut s: C) -> std::io::Result<()> {
             });
         match authenticate(&app, presented) {
             AuthOutcome::Reject => {
-                return fail_json(&app, &mut s, 401, &json!({"error": "unauthorized"}), &cors_extra);
+                return fail_json(
+                    &app,
+                    &mut s,
+                    401,
+                    &json!({"error": "unauthorized"}),
+                    &cors_extra,
+                );
             }
             AuthOutcome::Open => {}
             AuthOutcome::Identity { token_id, scopes } => {
@@ -767,7 +804,8 @@ fn handle<C: Conn>(app: Arc<App>, mut s: C) -> std::io::Result<()> {
                         &cors_extra,
                     );
                 }
-                let is_approval_meta = segs.first() == Some(&"v1") && segs.get(1) == Some(&"approvals");
+                let is_approval_meta =
+                    segs.first() == Some(&"v1") && segs.get(1) == Some(&"approvals");
                 let requires_approval = auth::is_write_method(req.method.as_str())
                     && !is_approval_meta
                     && app.require_approval.iter().any(|s| s == need);
@@ -777,7 +815,12 @@ fn handle<C: Conn>(app: Arc<App>, mut s: C) -> std::io::Result<()> {
                         Some(aprid) => {
                             let check = {
                                 let st = app.approvals.lock().unwrap_or_else(|e| e.into_inner());
-                                st.verify_replay(aprid, req.method.as_str(), req.path.as_str(), &req.body)
+                                st.verify_replay(
+                                    aprid,
+                                    req.method.as_str(),
+                                    req.path.as_str(),
+                                    &req.body,
+                                )
                             };
                             if let Err(e) = check {
                                 return fail_json(
@@ -791,8 +834,14 @@ fn handle<C: Conn>(app: Arc<App>, mut s: C) -> std::io::Result<()> {
                         }
                         None => {
                             let rec = {
-                                let mut st = app.approvals.lock().unwrap_or_else(|e| e.into_inner());
-                                st.create(req.method.as_str(), req.path.as_str(), &req.body, &token_id)
+                                let mut st =
+                                    app.approvals.lock().unwrap_or_else(|e| e.into_inner());
+                                st.create(
+                                    req.method.as_str(),
+                                    req.path.as_str(),
+                                    &req.body,
+                                    &token_id,
+                                )
                             };
                             return respond_full(
                                 &mut s,
@@ -812,7 +861,13 @@ fn handle<C: Conn>(app: Arc<App>, mut s: C) -> std::io::Result<()> {
     // 非 GET 一律 405，避免把 POST 当查询用。
     if req.path == "/metrics" {
         if req.method != "GET" {
-            return fail_json(&app, &mut s, 405, &json!({"error": "method not allowed"}), &cors_extra);
+            return fail_json(
+                &app,
+                &mut s,
+                405,
+                &json!({"error": "method not allowed"}),
+                &cors_extra,
+            );
         }
         let body = metrics_text(&app);
         return respond_static(
@@ -840,7 +895,10 @@ fn handle<C: Conn>(app: Arc<App>, mut s: C) -> std::io::Result<()> {
 enum AuthOutcome {
     Open,
     Reject,
-    Identity { token_id: String, scopes: Vec<String> },
+    Identity {
+        token_id: String,
+        scopes: Vec<String>,
+    },
 }
 
 fn legacy_token_on_disk(app: &App) -> Option<String> {
@@ -864,18 +922,19 @@ fn authenticate(app: &Arc<App>, presented: Option<&str>) -> AuthOutcome {
         Some(flag_token) => legacy_token_on_disk(app).unwrap_or_else(|| flag_token.to_string()),
         None => String::new(),
     };
-    if !legacy_token.is_empty() {
-        if auth::ct_eq_str(&legacy_token, got) {
-            return AuthOutcome::Identity {
-                token_id: "legacy".to_string(),
-                scopes: auth::ALL_SCOPES.iter().map(|s| s.to_string()).collect(),
-            };
-        }
+    if !legacy_token.is_empty() && auth::ct_eq_str(&legacy_token, got) {
+        return AuthOutcome::Identity {
+            token_id: "legacy".to_string(),
+            scopes: auth::ALL_SCOPES.iter().map(|s| s.to_string()).collect(),
+        };
     }
     if !got.is_empty() {
         let mut st = app.tokens.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(rec) = st.resolve(got) {
-            return AuthOutcome::Identity { token_id: rec.id, scopes: rec.scopes };
+            return AuthOutcome::Identity {
+                token_id: rec.id,
+                scopes: rec.scopes,
+            };
         }
     }
     AuthOutcome::Reject
@@ -899,7 +958,10 @@ fn events_agent_id(req: &Req) -> Option<String> {
 fn bearer_header(req: &Req) -> Option<&str> {
     req.headers
         .get("authorization")
-        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
+        .and_then(|v| {
+            v.strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("bearer "))
+        })
         .map(|v| v.trim())
         .filter(|v| !v.is_empty())
 }
@@ -921,7 +983,10 @@ fn emit_sse<C: Conn>(s: &mut C, payload: &str) -> bool {
 
 fn stream_agent_events<C: Conn>(app: &Arc<App>, s: &mut C, id: &str) {
     let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream; charset=utf-8\r\nCache-Control: no-cache\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n\r\n";
-    if s.write_all(head.as_bytes()).and_then(|_| s.flush()).is_err() {
+    if s.write_all(head.as_bytes())
+        .and_then(|_| s.flush())
+        .is_err()
+    {
         return;
     }
     let log_path = {
@@ -943,10 +1008,13 @@ fn stream_agent_events<C: Conn>(app: &Arc<App>, s: &mut C, id: &str) {
     let mut last_len: u64 = 0;
     loop {
         let state = agent_state(app, id);
-        if state != last_state {
-            if emit_sse(s, &serde_json::to_string(&json!({"type":"state","state": state})).unwrap_or_default()) {
-                last_state = state.clone();
-            }
+        if state != last_state
+            && emit_sse(
+                s,
+                &serde_json::to_string(&json!({"type":"state","state": state})).unwrap_or_default(),
+            )
+        {
+            last_state = state.clone();
         }
         if let Ok(meta) = std::fs::metadata(&log_path) {
             let len = meta.len();
@@ -977,7 +1045,10 @@ fn stream_agent_events<C: Conn>(app: &Arc<App>, s: &mut C, id: &str) {
             }
         }
         if state != "running" && state != "queued" {
-            let _ = emit_sse(s, &serde_json::to_string(&json!({"type":"state","state": state})).unwrap_or_default());
+            let _ = emit_sse(
+                s,
+                &serde_json::to_string(&json!({"type":"state","state": state})).unwrap_or_default(),
+            );
             return;
         }
         let elapsed = started.elapsed().as_secs();
@@ -1015,7 +1086,12 @@ fn respond<C: Conn>(s: &mut C, code: u16, v: &Value) -> std::io::Result<()> {
     respond_full(s, code, v, &[])
 }
 
-fn respond_full<C: Conn>(s: &mut C, code: u16, v: &Value, extra: &[(&str, String)]) -> std::io::Result<()> {
+fn respond_full<C: Conn>(
+    s: &mut C,
+    code: u16,
+    v: &Value,
+    extra: &[(&str, String)],
+) -> std::io::Result<()> {
     let body = serde_json::to_vec_pretty(v).unwrap_or_else(|_| b"{}".to_vec());
     let mut head = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: application/json; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\nX-Frame-Options: DENY\r\nReferrer-Policy: no-referrer\r\nConnection: close\r\n",
@@ -1333,11 +1409,14 @@ fn login_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         auth::ALL_SCOPES.iter().map(|s| s.to_string()).collect(),
         Some(auth::LOGIN_TTL_SECS),
     );
-    (200, json!({
-        "token": plain,
-        "token_id": id,
-        "expires_at": crate::types::iso(crate::types::now() + auth::LOGIN_TTL_SECS),
-    }))
+    (
+        200,
+        json!({
+            "token": plain,
+            "token_id": id,
+            "expires_at": crate::types::iso(crate::types::now() + auth::LOGIN_TTL_SECS),
+        }),
+    )
 }
 
 fn pair_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
@@ -1402,7 +1481,9 @@ fn route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         ("POST", ["v1", "auth", "login"]) => login_route(app, req),
         ("POST", ["v1", "auth", "pair"]) => pair_route(app, req),
         ("GET", ["v1", "approvals"]) => approvals_route(app, req),
-        ("POST", ["v1", "approvals", id, "approve"]) => approval_decide_route(app, req, id, "approved"),
+        ("POST", ["v1", "approvals", id, "approve"]) => {
+            approval_decide_route(app, req, id, "approved")
+        }
         ("POST", ["v1", "approvals", id, "deny"]) => approval_decide_route(app, req, id, "denied"),
         ("GET", ["v1", "hosts"]) => list_hosts(app),
         ("POST", ["v1", "hosts"]) => create_host_route(app, req),
@@ -1483,8 +1564,12 @@ fn route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         ("GET", ["v1", "hooks"]) => hooks_route(app),
         ("GET", ["v1", "hub"]) => hub_overview_route(app),
         ("GET", ["v1", "hub", "triggers"]) => hub_triggers_route(app),
-        ("POST", ["v1", "hub", "triggers", id, "enable"]) => hub_trigger_enabled_route(app, id, true),
-        ("POST", ["v1", "hub", "triggers", id, "disable"]) => hub_trigger_enabled_route(app, id, false),
+        ("POST", ["v1", "hub", "triggers", id, "enable"]) => {
+            hub_trigger_enabled_route(app, id, true)
+        }
+        ("POST", ["v1", "hub", "triggers", id, "disable"]) => {
+            hub_trigger_enabled_route(app, id, false)
+        }
         ("POST", ["v1", "hub", "hooks", trigger_id]) => hub_hook_route(app, req, trigger_id),
         ("GET", ["v1", "agents"]) => list_agents_route(app, req),
         ("POST", ["v1", "agents"]) => create_agent_route(app, req),
@@ -1497,7 +1582,9 @@ fn route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         ("POST", ["v1", "agents", id, "reload"]) => reload_agent_route(app, id),
         ("POST", ["v1", "agents", id, "run"]) => continue_agent_route(app, id, req),
         ("POST", ["v1", "agents", id, "detach"]) => detach_agent_route(app, id),
-        ("GET", ["v1", "agents", _id, "events"]) => (405, json!({"error": "events must be streamed"})),
+        ("GET", ["v1", "agents", _id, "events"]) => {
+            (405, json!({"error": "events must be streamed"}))
+        }
         _ => (404, json!({"error": "not found", "path": req.path})),
     }
 }
@@ -1505,11 +1592,8 @@ fn route(app: &Arc<App>, req: &Req) -> (u16, Value) {
 fn list_schedules(app: &Arc<App>, req: &Req) -> (u16, Value) {
     let all = query_true(req, "all");
     let ss = app.schedules.lock().unwrap_or_else(|e| e.into_inner());
-    let schedules: Vec<&schedules::Schedule> = ss
-        .schedules
-        .iter()
-        .filter(|s| all || s.enabled)
-        .collect();
+    let schedules: Vec<&schedules::Schedule> =
+        ss.schedules.iter().filter(|s| all || s.enabled).collect();
     (200, json!({ "schedules": schedules }))
 }
 
@@ -1521,7 +1605,8 @@ fn validate_schedule_input(
 ) -> Result<(String, u64, String), String> {
     let cron = cron.map(|s| s.trim().to_string()).unwrap_or_default();
     let every_secs = match every {
-        Some(e) => schedules::parse_every(e).ok_or_else(|| "every must be like 30s|5m|2h|1d".to_string())?,
+        Some(e) => schedules::parse_every(e)
+            .ok_or_else(|| "every must be like 30s|5m|2h|1d".to_string())?,
         None => 0,
     };
     if every_secs > 0 && !cron.is_empty() {
@@ -1534,10 +1619,10 @@ fn validate_schedule_input(
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| schedules::offset_to_tz(app.tz_offset_hours));
-    let offset = crate::cron::timezone_offset_secs(&tz)
-        .map_err(|e| format!("timezone '{}': {}", tz, e))?;
+    let offset =
+        crate::cron::timezone_offset_secs(&tz).map_err(|e| format!("timezone '{}': {}", tz, e))?;
     if every_secs == 0 {
-        let expr = crate::cron::parse_cron(&cron).map_err(|e| e)?;
+        let expr = crate::cron::parse_cron(&cron)?;
         if expr.next_after(now(), offset).is_none() {
             return Err("cron never matches within 366 days".into());
         }
@@ -1561,11 +1646,15 @@ fn create_schedule(app: &Arc<App>, req: &Req) -> (u16, Value) {
     if !is_known_agent(&agent) {
         return (400, json!({ "error": "unknown agent" }));
     }
-    let (cron, every_secs, tz) =
-        match validate_schedule_input(app, spec.cron.as_deref(), spec.every.as_deref(), spec.timezone.as_deref()) {
-            Ok(v) => v,
-            Err(e) => return (400, json!({ "error": e })),
-        };
+    let (cron, every_secs, tz) = match validate_schedule_input(
+        app,
+        spec.cron.as_deref(),
+        spec.every.as_deref(),
+        spec.timezone.as_deref(),
+    ) {
+        Ok(v) => v,
+        Err(e) => return (400, json!({ "error": e })),
+    };
     let workspace = match spec.workspace.clone().filter(|w| !w.trim().is_empty()) {
         Some(w) => {
             let resolved = resolve_workspace_input(app, &w);
@@ -1638,7 +1727,7 @@ fn get_schedule(app: &Arc<App>, id: &str) -> (u16, Value) {
             .iter()
             .filter(|r| r.job_id.as_deref() == Some(s.id.as_str()))
             .collect();
-        runs.sort_by(|x, y| y.created_at.cmp(&x.created_at));
+        runs.sort_by_key(|x| std::cmp::Reverse(x.created_at));
         let runs: Vec<Value> = runs.into_iter().take(5).map(agent_run_summary).collect();
         (s.clone(), runs)
     };
@@ -1661,7 +1750,11 @@ fn patch_schedule(app: &Arc<App>, id: &str, req: &Req) -> (u16, Value) {
         if n.is_empty() {
             return (400, json!({ "error": "name must not be empty" }));
         }
-        if ss.schedules.iter().any(|x| x.id != target_id && x.name == n) {
+        if ss
+            .schedules
+            .iter()
+            .any(|x| x.id != target_id && x.name == n)
+        {
             return (409, json!({ "error": "schedule name already exists" }));
         }
     }
@@ -1725,7 +1818,9 @@ fn patch_schedule(app: &Arc<App>, id: &str, req: &Req) -> (u16, Value) {
         } else {
             None
         };
-        let current_tz = tz.map(|x| x.trim().to_string()).or_else(|| Some(s.timezone.clone()));
+        let current_tz = tz
+            .map(|x| x.trim().to_string())
+            .or_else(|| Some(s.timezone.clone()));
         let (new_cron, new_every, new_tz) = match validate_schedule_input(
             app,
             current_cron.as_deref(),
@@ -1798,7 +1893,7 @@ fn schedule_logs(app: &Arc<App>, req: &Req, id: &str) -> (u16, Value) {
             .cloned()
             .collect()
     };
-    runs.sort_by(|x, y| y.created_at.cmp(&x.created_at));
+    runs.sort_by_key(|x| std::cmp::Reverse(x.created_at));
     runs.truncate(tail);
     let mut logs = String::new();
     for r in runs.iter().rev() {
@@ -1814,18 +1909,35 @@ fn schedule_logs(app: &Arc<App>, req: &Req, id: &str) -> (u16, Value) {
         }
     }
     let runs: Vec<Value> = runs.iter().map(agent_run_summary).collect();
-    (200, json!({ "schedule": schedule, "tail": tail, "runs": runs, "logs": logs }))
+    (
+        200,
+        json!({ "schedule": schedule, "tail": tail, "runs": runs, "logs": logs }),
+    )
 }
 
 fn status_route(app: &Arc<App>) -> (u16, Value) {
     let (running, queued) = {
         let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
-        let running = st.state.runs.iter().filter(|r| r.status == RunStatus::Running).count();
-        let queued = st.state.runs.iter().filter(|r| r.status == RunStatus::Queued).count();
+        let running = st
+            .state
+            .runs
+            .iter()
+            .filter(|r| r.status == RunStatus::Running)
+            .count();
+        let queued = st
+            .state
+            .runs
+            .iter()
+            .filter(|r| r.status == RunStatus::Queued)
+            .count();
         (running, queued)
     };
     let ss = app.schedules.lock().unwrap_or_else(|e| e.into_inner());
-    let enabled: Vec<&schedules::Schedule> = ss.schedules.iter().filter(|s| s.enabled && !s.paused).collect();
+    let enabled: Vec<&schedules::Schedule> = ss
+        .schedules
+        .iter()
+        .filter(|s| s.enabled && !s.paused)
+        .collect();
     let next_run_at = enabled.iter().filter_map(|s| s.next_run_at).min();
     let last_failure = ss
         .schedules
@@ -1838,28 +1950,34 @@ fn status_route(app: &Arc<App>) -> (u16, Value) {
             }
         })
         .max();
-    (200, json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "uptime": now() - app.started,
-        "running": running,
-        "queued": queued,
-        "max_concurrent": app.max_concurrent,
-        "schedules": ss.schedules.len(),
-        "enabled_schedules": enabled.len(),
-        "next_run_at": next_run_at,
-        "last_failure": last_failure,
-    }))
+    (
+        200,
+        json!({
+            "version": env!("CARGO_PKG_VERSION"),
+            "uptime": now() - app.started,
+            "running": running,
+            "queued": queued,
+            "max_concurrent": app.max_concurrent,
+            "schedules": ss.schedules.len(),
+            "enabled_schedules": enabled.len(),
+            "next_run_at": next_run_at,
+            "last_failure": last_failure,
+        }),
+    )
 }
 
 fn hooks_route(app: &Arc<App>) -> (u16, Value) {
     let ss = app.schedules.lock().unwrap_or_else(|e| e.into_inner());
-    (200, json!({
-        "config": {
-            "schedule_trigger": ["run"],
-            "agent_lifecycle": ["queued", "running", "done", "failed", "timeout"]
-        },
-        "records": ss.hooks,
-    }))
+    (
+        200,
+        json!({
+            "config": {
+                "schedule_trigger": ["run"],
+                "agent_lifecycle": ["queued", "running", "done", "failed", "timeout"]
+            },
+            "records": ss.hooks,
+        }),
+    )
 }
 fn hub_data_dir(app: &Arc<App>) -> std::path::PathBuf {
     let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
@@ -1877,17 +1995,20 @@ fn hub_overview_route(app: &Arc<App>) -> (u16, Value) {
         let rt = app.hub_rt.lock().unwrap_or_else(|e| e.into_inner());
         rt.recent()
     };
-    (200, json!({
-        "hub_id": hub.hub_id,
-        "name": hub.name,
-        "created_at": hub.created_at,
-        "projects": hub.projects.len(),
-        "permissions": hub.permissions.len(),
-        "triggers": hub.triggers.len(),
-        "triggers_enabled": enabled,
-        "triggers_disabled": hub.triggers.len() - enabled,
-        "recent": recent,
-    }))
+    (
+        200,
+        json!({
+            "hub_id": hub.hub_id,
+            "name": hub.name,
+            "created_at": hub.created_at,
+            "projects": hub.projects.len(),
+            "permissions": hub.permissions.len(),
+            "triggers": hub.triggers.len(),
+            "triggers_enabled": enabled,
+            "triggers_disabled": hub.triggers.len() - enabled,
+            "recent": recent,
+        }),
+    )
 }
 
 fn hub_triggers_route(app: &Arc<App>) -> (u16, Value) {
@@ -1968,8 +2089,18 @@ fn hub_hook_route(app: &Arc<App>, req: &Req, trigger_id: &str) -> (u16, Value) {
 
     let busy = {
         let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
-        let running = st.state.runs.iter().filter(|r| r.status == RunStatus::Running).count();
-        let queued = st.state.runs.iter().filter(|r| r.status == RunStatus::Queued).count();
+        let running = st
+            .state
+            .runs
+            .iter()
+            .filter(|r| r.status == RunStatus::Running)
+            .count();
+        let queued = st
+            .state
+            .runs
+            .iter()
+            .filter(|r| r.status == RunStatus::Queued)
+            .count();
         running + queued >= app.max_concurrent
     };
     if busy {
@@ -1979,7 +2110,24 @@ fn hub_hook_route(app: &Arc<App>, req: &Req, trigger_id: &str) -> (u16, Value) {
     }
 
     let spec = trigger.agent_spec.clone();
-    match agents::create_agent_and_run(app, &spec.provider, None, Some(spec.cwd.clone()), None, &spec.prompt, 1800, false, None, None, BTreeMap::new(), Vec::new(), None, BTreeMap::new(), Vec::new(), workspaces::WorktreeSpec::default()) {
+    match agents::create_agent_and_run(
+        app,
+        &spec.provider,
+        None,
+        Some(spec.cwd.clone()),
+        None,
+        &spec.prompt,
+        1800,
+        false,
+        None,
+        None,
+        BTreeMap::new(),
+        Vec::new(),
+        None,
+        BTreeMap::new(),
+        Vec::new(),
+        workspaces::WorktreeSpec::default(),
+    ) {
         Ok((_agent, run)) => {
             agents::tag_run_trigger(app, &run.id, trigger_id);
             let mut rt = app.hub_rt.lock().unwrap_or_else(|e| e.into_inner());
@@ -2044,9 +2192,12 @@ fn get_agent_route(app: &Arc<App>, id: &str) -> (u16, Value) {
                 .iter()
                 .filter(|r| r.agent_id.as_deref() == Some(a.id.as_str()))
                 .collect();
-            runs.sort_by(|x, y| y.created_at.cmp(&x.created_at));
+            runs.sort_by_key(|x| std::cmp::Reverse(x.created_at));
             let runs: Vec<Value> = runs.into_iter().map(agent_run_summary).collect();
-            (200, json!({ "agent": a, "runs": runs, "resumable": agents::is_resumable_kind(&a.kind) }))
+            (
+                200,
+                json!({ "agent": a, "runs": runs, "resumable": agents::is_resumable_kind(&a.kind) }),
+            )
         }
         None => (404, json!({ "error": "no such agent" })),
     }
@@ -2057,16 +2208,19 @@ fn agent_session_route(app: &Arc<App>, id: &str) -> (u16, Value) {
     match st.state.agents.iter().find(|a| a.id == id) {
         Some(a) => {
             let has_session = !a.session_id.trim().is_empty();
-            (200, json!({
-                "agent_id": a.id,
-                "kind": a.kind,
-                "resumable": agents::is_resumable_kind(&a.kind),
-                "has_session": has_session,
-                "session_id": a.session_id,
-                "state": a.state,
-                "last_error": a.last_error,
-                "last_run_id": a.last_run_id,
-            }))
+            (
+                200,
+                json!({
+                    "agent_id": a.id,
+                    "kind": a.kind,
+                    "resumable": agents::is_resumable_kind(&a.kind),
+                    "has_session": has_session,
+                    "session_id": a.session_id,
+                    "state": a.state,
+                    "last_error": a.last_error,
+                    "last_run_id": a.last_run_id,
+                }),
+            )
         }
         None => (404, json!({"error": "no such agent"})),
     }
@@ -2138,11 +2292,20 @@ fn create_agent_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         Err(e) => return (400, json!({ "error": e })),
     };
     if worktree_spec.slug.is_some() && !use_worktree {
-        return (400, json!({ "error": "run --worktree-slug requires --new-workspace worktree" }));
+        return (
+            400,
+            json!({ "error": "run --worktree-slug requires --new-workspace worktree" }),
+        );
     }
-    let worktree_mode_for_base = spec.worktree_mode.clone().unwrap_or_else(|| "branch-off".into());
+    let worktree_mode_for_base = spec
+        .worktree_mode
+        .clone()
+        .unwrap_or_else(|| "branch-off".into());
     if worktree_spec.base.is_some() && worktree_mode_for_base != "branch-off" {
-        return (400, json!({ "error": "run --base: only valid with branch-off" }));
+        return (
+            400,
+            json!({ "error": "run --base: only valid with branch-off" }),
+        );
     }
     match agents::create_agent_and_run(
         app,
@@ -2202,7 +2365,10 @@ fn patch_agent_route(app: &Arc<App>, id: &str, req: &Req) -> (u16, Value) {
 fn archive_agent_route(app: &Arc<App>, id: &str, req: &Req) -> (u16, Value) {
     let keep_worktree = query_true(req, "keep-worktree");
     match agents::archive_agent(app, id, keep_worktree) {
-        Ok(()) => (200, json!({ "ok": true, "archived": id, "keep_worktree": keep_worktree })),
+        Ok(()) => (
+            200,
+            json!({ "ok": true, "archived": id, "keep_worktree": keep_worktree }),
+        ),
         Err(e) => (404, json!({ "error": e })),
     }
 }
@@ -2420,13 +2586,16 @@ fn probe_host_route(app: &Arc<App>, name: &str) -> (u16, Value) {
         }
     }
     let host = reg.hosts[idx].clone();
-    (200, json!({
-        "host": host_json(&host),
-        "ok": p.ok,
-        "latency_ms": p.latency_ms,
-        "version": p.version,
-        "error": p.error,
-    }))
+    (
+        200,
+        json!({
+            "host": host_json(&host),
+            "ok": p.ok,
+            "latency_ms": p.latency_ms,
+            "version": p.version,
+            "error": p.error,
+        }),
+    )
 }
 
 fn usage_route(app: &Arc<App>) -> (u16, Value) {
@@ -2436,15 +2605,17 @@ fn usage_route(app: &Arc<App>) -> (u16, Value) {
     let rows = usage::aggregate(state, 0, None);
     let by_day: Vec<Value> = rows
         .iter()
-        .map(|r| json!({
-            "day": r.day,
-            "provider": r.provider,
-            "model": r.model,
-            "runs": r.runs,
-            "in_tokens": r.in_tokens,
-            "out_tokens": r.out_tokens,
-            "total_tokens": r.total_tokens,
-        }))
+        .map(|r| {
+            json!({
+                "day": r.day,
+                "provider": r.provider,
+                "model": r.model,
+                "runs": r.runs,
+                "in_tokens": r.in_tokens,
+                "out_tokens": r.out_tokens,
+                "total_tokens": r.total_tokens,
+            })
+        })
         .collect();
     if let Some(obj) = report.as_object_mut() {
         obj.insert("by_day".into(), json!(by_day));
@@ -2521,8 +2692,14 @@ fn agent_diff_route(app: &Arc<App>, id: &str) -> (u16, Value) {
         .arg(&agent.workspace)
         .output();
     match out {
-        Ok(o) if o.status.success() => (200, json!({ "diff": String::from_utf8_lossy(&o.stdout).to_string() })),
-        Ok(o) => (400, json!({ "error": String::from_utf8_lossy(&o.stderr).trim().to_string() })),
+        Ok(o) if o.status.success() => (
+            200,
+            json!({ "diff": String::from_utf8_lossy(&o.stdout).to_string() }),
+        ),
+        Ok(o) => (
+            400,
+            json!({ "error": String::from_utf8_lossy(&o.stderr).trim().to_string() }),
+        ),
         Err(e) => (400, json!({ "error": format!("git diff failed: {}", e) })),
     }
 }
@@ -2551,11 +2728,14 @@ fn readyz(app: &Arc<App>) -> (u16, Value) {
                 body["store"] = json!(guard.store_health.as_str());
                 (200, body)
             }
-            StoreHealth::Unrecoverable => (503, json!({
-                "ok": false,
-                "reason": "state_unreadable",
-                "store": "unrecoverable",
-            })),
+            StoreHealth::Unrecoverable => (
+                503,
+                json!({
+                    "ok": false,
+                    "reason": "state_unreadable",
+                    "store": "unrecoverable",
+                }),
+            ),
         },
         Err(_) => (503, json!({"ok": false, "reason": "busy"})),
     }
@@ -2659,7 +2839,10 @@ fn list_runs(app: &Arc<App>, req: &Req) -> (u16, Value) {
         .iter()
         .filter(|r| r.status == RunStatus::Queued)
         .count();
-    (200, json!({"runs": page, "running": running, "queued": queued}))
+    (
+        200,
+        json!({"runs": page, "running": running, "queued": queued}),
+    )
 }
 
 fn valid_timeout_s(t: u64) -> bool {
@@ -2718,7 +2901,10 @@ fn create_workspace_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
     match reg.add_named(&spec.name, Path::new(&spec.path), &remote) {
         Ok(ws) => match reg.save() {
             Ok(()) => (200, json!({ "workspace": ws })),
-            Err(e) => (500, json!({ "error": format!("save workspaces.json failed: {}", e) })),
+            Err(e) => (
+                500,
+                json!({ "error": format!("save workspaces.json failed: {}", e) }),
+            ),
         },
         Err(e) => (400, json!({ "error": e })),
     }
@@ -2752,7 +2938,10 @@ fn remove_workspace_route(app: &Arc<App>, name: &str) -> (u16, Value) {
     if reg.remove(name) {
         match reg.save() {
             Ok(()) => (200, json!({ "ok": true, "removed": name })),
-            Err(e) => (500, json!({ "error": format!("save workspaces.json failed: {}", e) })),
+            Err(e) => (
+                500,
+                json!({ "error": format!("save workspaces.json failed: {}", e) }),
+            ),
         }
     } else {
         (404, json!({ "error": "no such workspace" }))
@@ -2822,7 +3011,7 @@ fn create_run(app: &Arc<App>, req: &Req) -> (u16, Value) {
         let id = st.next_id("run");
         let r = Run {
             id: id.clone(),
-            title: spec.title.unwrap_or_else(|| String::new()),
+            title: spec.title.unwrap_or_default(),
             agent: spec.agent,
             model: spec.model,
             workspace,
@@ -3017,7 +3206,11 @@ fn delete_run(app: &Arc<App>, id: &str) -> (u16, Value) {
 
 /// 依赖校验（服务端权威）：空串/不存在、自引用、成环。返回规范化后的依赖列表。
 /// 错误文案与 CLI 侧严格一致，便于脚本 grep。
-fn validate_job_deps(existing: &[Job], new_id: &str, deps: &[String]) -> Result<Vec<String>, String> {
+fn validate_job_deps(
+    existing: &[Job],
+    new_id: &str,
+    deps: &[String],
+) -> Result<Vec<String>, String> {
     let mut out: Vec<String> = Vec::new();
     for d in deps {
         if d.is_empty() {
@@ -3096,7 +3289,10 @@ fn create_job(app: &Arc<App>, req: &Req) -> (u16, Value) {
         return (400, json!({"error": "prompt is required"}));
     }
     if spec.every_secs.is_none() && spec.daily.is_none() {
-        return (400, json!({"error": "one of every_secs / daily is required"}));
+        return (
+            400,
+            json!({"error": "one of every_secs / daily is required"}),
+        );
     }
     if let Some(d) = spec.daily.as_deref() {
         if parse_hhmm(d).is_none() {
@@ -3135,7 +3331,7 @@ fn create_job(app: &Arc<App>, req: &Req) -> (u16, Value) {
     };
     let j = Job {
         id: id.clone(),
-        title: spec.title.unwrap_or_else(|| String::new()),
+        title: spec.title.unwrap_or_default(),
         agent: spec.agent,
         model: spec.model,
         workspace,
@@ -3487,7 +3683,10 @@ mod tests {
         assert_eq!(body["resumable"].as_bool(), Some(true));
         assert_eq!(body["has_session"].as_bool(), Some(true));
         assert_eq!(body["session_id"].as_str(), Some("sid_1"));
-        assert!(body.get("agent").is_none(), "session 路径不能被 get_agent_route 吞掉");
+        assert!(
+            body.get("agent").is_none(),
+            "session 路径不能被 get_agent_route 吞掉"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -3510,7 +3709,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-#[test]
+    #[test]
     fn token_create_list_revoke() {
         let dir = std::env::temp_dir().join(format!("roamway-tokens-{}", now()));
         let _ = std::fs::create_dir_all(&dir);
@@ -3598,9 +3797,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(ok.timeout_s, Some(99));
-        let ok2 = serde_json::from_slice::<NewRun>(br#"{"agent":"shell","prompt":"p","timeout_s":7}"#).unwrap();
+        let ok2 =
+            serde_json::from_slice::<NewRun>(br#"{"agent":"shell","prompt":"p","timeout_s":7}"#)
+                .unwrap();
         assert_eq!(ok2.timeout_s, Some(7));
-        assert!(serde_json::from_slice::<NewRun>(br#"{"agent":"shell","prompt":"p","timeout":7}"#).is_err());
+        assert!(
+            serde_json::from_slice::<NewRun>(br#"{"agent":"shell","prompt":"p","timeout":7}"#)
+                .is_err()
+        );
         assert!(serde_json::from_slice::<NewRun>(br#"{"agent":"shell"}"#).is_err());
     }
 
@@ -3768,7 +3972,12 @@ mod tests {
         };
         let store = Store {
             dir: dir.to_path_buf(),
-            state: State { runs: vec![run], jobs: vec![], agents: vec![], seq: 1 },
+            state: State {
+                runs: vec![run],
+                jobs: vec![],
+                agents: vec![],
+                seq: 1,
+            },
             loaded_ok: true,
             store_health: StoreHealth::Ok,
             preserve_backup: false,
@@ -4090,7 +4299,10 @@ mod tests {
             );
         }
         assert!(!body.contains("NaN"), "must not emit NaN");
-        assert!(!body.contains("+Inf") && !body.contains("-Inf"), "must not emit Inf");
+        assert!(
+            !body.contains("+Inf") && !body.contains("-Inf"),
+            "must not emit Inf"
+        );
         assert!(body.contains("roamway_runs{status=\"done\"} 0"));
         assert!(body.contains("roamway_agents 0"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -4175,13 +4387,21 @@ mod tests {
         let body = metrics_text(&app);
         assert!(body.contains("roamway_data_bytes 22\n"), "{}", body);
         assert!(body.contains("roamway_state_writes_total 0\n"), "{}", body);
-        assert!(body.contains("roamway_state_writes_skipped_total 0\n"), "{}", body);
+        assert!(
+            body.contains("roamway_state_writes_skipped_total 0\n"),
+            "{}",
+            body
+        );
 
         app.save();
         app.save();
         let body = metrics_text(&app);
         assert!(body.contains("roamway_state_writes_total 1\n"), "{}", body);
-        assert!(body.contains("roamway_state_writes_skipped_total 1\n"), "{}", body);
+        assert!(
+            body.contains("roamway_state_writes_skipped_total 1\n"),
+            "{}",
+            body
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4198,7 +4418,11 @@ mod tests {
         }
         let body = metrics_text(&app);
         assert!(body.contains("roamway_state_writes_total 1\n"), "{}", body);
-        assert!(body.contains("roamway_state_writes_skipped_total 1\n"), "{}", body);
+        assert!(
+            body.contains("roamway_state_writes_skipped_total 1\n"),
+            "{}",
+            body
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -4301,7 +4525,11 @@ mod tests {
                 tok
             ),
         );
-        assert!(ok.starts_with("HTTP/1.1 200"), "{}", ok.lines().next().unwrap_or(""));
+        assert!(
+            ok.starts_with("HTTP/1.1 200"),
+            "{}",
+            ok.lines().next().unwrap_or("")
+        );
         assert!(ok.contains("text/plain; version=0.0.4"), "{}", ok);
         assert!(ok.contains("roamway_build_info"));
 
@@ -4436,7 +4664,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("roamway-readyz-unreadable-{}", now()));
         let _ = std::fs::create_dir_all(&dir);
         let app = test_app_with_max(&dir, "shell", RunStatus::Done, 1);
-        app.store.lock().unwrap_or_else(|e| e.into_inner()).store_health = StoreHealth::Unrecoverable;
+        app.store
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .store_health = StoreHealth::Unrecoverable;
         let (code, body) = readyz(&app);
         assert_eq!(code, 503);
         assert_eq!(body["ok"], json!(false));
@@ -4510,8 +4741,10 @@ mod tests {
         let existing = vec![mk_job("job_000001", &["job_000002"])];
         assert_eq!(
             validate_job_deps(&existing, "job_000002", &["job_000001".to_string()]),
-            Err("jobs-add --after: dependency cycle: job_000002 -> job_000001 -> job_000002"
-                .to_string())
+            Err(
+                "jobs-add --after: dependency cycle: job_000002 -> job_000001 -> job_000002"
+                    .to_string()
+            )
         );
     }
 
@@ -4535,7 +4768,11 @@ mod tests {
         let got = validate_job_deps(
             &existing,
             "job_000003",
-            &["job_000001".to_string(), "job_000002".to_string(), "job_000001".to_string()],
+            &[
+                "job_000001".to_string(),
+                "job_000002".to_string(),
+                "job_000001".to_string(),
+            ],
         );
         assert_eq!(
             got,

@@ -71,11 +71,19 @@ fn parse_field(field: &str, min: u32, max: u32) -> Result<Vec<bool>, String> {
         let (a, b) = if base == "*" {
             (min, max)
         } else if let Some((l, r)) = base.split_once('-') {
-            let a: u32 = l.trim().parse().map_err(|_| format!("bad value in '{}'", item))?;
-            let b: u32 = r.trim().parse().map_err(|_| format!("bad value in '{}'", item))?;
+            let a: u32 = l
+                .trim()
+                .parse()
+                .map_err(|_| format!("bad value in '{}'", item))?;
+            let b: u32 = r
+                .trim()
+                .parse()
+                .map_err(|_| format!("bad value in '{}'", item))?;
             (a, b)
         } else {
-            let n: u32 = base.parse().map_err(|_| format!("bad value in '{}'", item))?;
+            let n: u32 = base
+                .parse()
+                .map_err(|_| format!("bad value in '{}'", item))?;
             (n, n)
         };
         if a < min || b > max || a > b {
@@ -96,18 +104,18 @@ fn parse_field(field: &str, min: u32, max: u32) -> Result<Vec<bool>, String> {
 
 impl CronExpr {
     fn matches(&self, minute: u32, hour: u32, day: u32, month: u32, weekday: u32) -> bool {
-        if self.minute.get(minute as usize).copied().unwrap_or(false) == false {
+        if !self.minute.get(minute as usize).copied().unwrap_or(false) {
             return false;
         }
-        if self.hour.get(hour as usize).copied().unwrap_or(false) == false {
+        if !self.hour.get(hour as usize).copied().unwrap_or(false) {
             return false;
         }
-        if self.month.get(month as usize).copied().unwrap_or(false) == false {
+        if !self.month.get(month as usize).copied().unwrap_or(false) {
             return false;
         }
         let dom = self.day_star || self.day.get(day as usize).copied().unwrap_or(false);
         let dow = self.weekday_star || self.weekday.get(weekday as usize).copied().unwrap_or(false);
-        let day_ok = if self.day_star && self.weekday_star {
+        if self.day_star && self.weekday_star {
             true
         } else if self.day_star {
             dow
@@ -115,8 +123,7 @@ impl CronExpr {
             dom
         } else {
             dom || dow
-        };
-        day_ok
+        }
     }
 
     /// 从 `now` 之后逐分钟找下一次命中（固定时区偏移），最多向前搜 366 天。

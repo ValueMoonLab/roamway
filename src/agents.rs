@@ -61,7 +61,7 @@ pub fn gen_agent_id() -> String {
 pub fn gen_session_id() -> String {
     let t = now() as u64;
     let n = AGENT_SEQ.fetch_add(1, Ordering::SeqCst);
-    let v = (t.rotate_left(17) ^ n.wrapping_mul(0x9e37_79b9)) & 0xffff_ffff_ffff_ffff;
+    let v = t.rotate_left(17) ^ n.wrapping_mul(0x9e37_79b9);
     format!("claude_{:016x}", v)
 }
 
@@ -84,7 +84,11 @@ pub fn should_resume(kind: &str, session_id: &str) -> bool {
 }
 
 pub fn cap_history(agent: &mut Agent) {
-    let max = if agent.kind.starts_with("api:") { 40 } else { 20 };
+    let max = if agent.kind.starts_with("api:") {
+        40
+    } else {
+        20
+    };
     if agent.history.len() > max {
         let drop = agent.history.len() - max;
         agent.history.drain(..drop);
@@ -92,9 +96,10 @@ pub fn cap_history(agent: &mut Agent) {
 }
 
 pub fn push_msg(agent: &mut Agent, role: &str, content: &str) {
-    agent
-        .history
-        .push(Msg { role: role.to_string(), content: content.to_string() });
+    agent.history.push(Msg {
+        role: role.to_string(),
+        content: content.to_string(),
+    });
     cap_history(agent);
 }
 
@@ -155,7 +160,7 @@ pub fn filter_agents<'a>(
         })
         .filter(|a| kind.map(|k| a.kind == k).unwrap_or(true))
         .collect();
-    out.sort_by(|x, y| y.created_at.cmp(&x.created_at));
+    out.sort_by_key(|x| std::cmp::Reverse(x.created_at));
     if let Some(n) = limit {
         out.truncate(n);
     }
@@ -166,7 +171,9 @@ fn canonicalize_dir(path: &str) -> Option<String> {
     if !Path::new(path).is_dir() {
         return None;
     }
-    fs::canonicalize(path).ok().map(|p| p.to_string_lossy().to_string())
+    fs::canonicalize(path)
+        .ok()
+        .map(|p| p.to_string_lossy().to_string())
 }
 
 fn default_workspace(workspace: Option<String>) -> Result<String, String> {
@@ -178,6 +185,8 @@ fn default_workspace(workspace: Option<String>) -> Result<String, String> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+// 注册式 API 参数与协议字段一一对应，拆签名/引 builder 会无谓改动大量调用点
 fn push_run_locked(
     st: &mut Store,
     agent: &mut Agent,
@@ -235,6 +244,8 @@ fn push_run_locked(
     Ok(run)
 }
 
+#[allow(clippy::too_many_arguments)]
+// 注册式 API 参数与协议字段一一对应，拆签名/引 builder 会无谓改动大量调用点
 pub fn create_agent_and_run(
     app: &Arc<App>,
     kind: &str,
@@ -273,59 +284,60 @@ pub fn create_agent_and_run(
         id
     };
     let mut stored_worktree_mode = worktree_mode.clone();
-    let (agent_workspace, worktree, branch, base_path, worktree_info) = if worktree_mode.as_deref() == Some("checkout-pr") {
-        let pr = pr_number
-            .as_deref()
-            .ok_or_else(|| "checkout-pr requires --pr-number".to_string())?;
-        crate::workspaces::gh_pr_checkout(&ws, pr)?;
-        (ws, false, None, None, None)
-    } else if use_worktree {
-        let root = crate::workspaces::git_repo_root(&ws)?;
-        crate::workspaces::validate_worktree_spec(&spec)?;
-        crate::workspaces::validate_worktree_git(&root, &spec)?;
-        let path = crate::workspaces::worktree_path_named(&data_dir, &id, spec.slug.as_deref());
-        let info = if spec.existing {
-            let branch = spec
-                .branch
-                .clone()
-                .ok_or_else(|| "run --branch: branch is required".to_string())?;
-            crate::workspaces::worktree_add_existing(&root, &path, &branch)?;
-            stored_worktree_mode = Some("checkout-branch".to_string());
-            crate::workspaces::WorktreeInfo {
-                path: path.to_string_lossy().to_string(),
-                branch: branch.clone(),
-                base: None,
-            }
-        } else if worktree_mode.as_deref() == Some("checkout-branch") {
-            let branch = crate::workspaces::git_current_branch(&root)?;
-            crate::workspaces::worktree_add_existing(&root, &path, &branch)?;
-            crate::workspaces::WorktreeInfo {
-                path: path.to_string_lossy().to_string(),
-                branch: branch.clone(),
-                base: None,
-            }
+    let (agent_workspace, worktree, branch, base_path, worktree_info) =
+        if worktree_mode.as_deref() == Some("checkout-pr") {
+            let pr = pr_number
+                .as_deref()
+                .ok_or_else(|| "checkout-pr requires --pr-number".to_string())?;
+            crate::workspaces::gh_pr_checkout(&ws, pr)?;
+            (ws, false, None, None, None)
+        } else if use_worktree {
+            let root = crate::workspaces::git_repo_root(&ws)?;
+            crate::workspaces::validate_worktree_spec(&spec)?;
+            crate::workspaces::validate_worktree_git(&root, &spec)?;
+            let path = crate::workspaces::worktree_path_named(&data_dir, &id, spec.slug.as_deref());
+            let info = if spec.existing {
+                let branch = spec
+                    .branch
+                    .clone()
+                    .ok_or_else(|| "run --branch: branch is required".to_string())?;
+                crate::workspaces::worktree_add_existing(&root, &path, &branch)?;
+                stored_worktree_mode = Some("checkout-branch".to_string());
+                crate::workspaces::WorktreeInfo {
+                    path: path.to_string_lossy().to_string(),
+                    branch: branch.clone(),
+                    base: None,
+                }
+            } else if worktree_mode.as_deref() == Some("checkout-branch") {
+                let branch = crate::workspaces::git_current_branch(&root)?;
+                crate::workspaces::worktree_add_existing(&root, &path, &branch)?;
+                crate::workspaces::WorktreeInfo {
+                    path: path.to_string_lossy().to_string(),
+                    branch: branch.clone(),
+                    base: None,
+                }
+            } else {
+                let branch = spec
+                    .branch
+                    .clone()
+                    .unwrap_or_else(|| crate::workspaces::worktree_branch(&id));
+                crate::workspaces::worktree_add_from(&root, &path, &branch, spec.base.as_deref())?;
+                crate::workspaces::WorktreeInfo {
+                    path: path.to_string_lossy().to_string(),
+                    branch: branch.clone(),
+                    base: spec.base.clone(),
+                }
+            };
+            (
+                info.path.clone(),
+                true,
+                Some(info.branch.clone()),
+                Some(root),
+                Some(info),
+            )
         } else {
-            let branch = spec
-                .branch
-                .clone()
-                .unwrap_or_else(|| crate::workspaces::worktree_branch(&id));
-            crate::workspaces::worktree_add_from(&root, &path, &branch, spec.base.as_deref())?;
-            crate::workspaces::WorktreeInfo {
-                path: path.to_string_lossy().to_string(),
-                branch: branch.clone(),
-                base: spec.base.clone(),
-            }
+            (ws, false, None, None, None)
         };
-        (
-            info.path.clone(),
-            true,
-            Some(info.branch.clone()),
-            Some(root),
-            Some(info),
-        )
-    } else {
-        (ws, false, None, None, None)
-    };
     let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
     let mut agent = Agent {
         id: id.clone(),

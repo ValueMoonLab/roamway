@@ -1,5 +1,5 @@
-use serde::{Deserialize, Serialize};
 use crate::auth;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
@@ -36,7 +36,7 @@ pub fn iso(ts: i64) -> String {
 pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = (z - era * 146097) as i64;
+    let doe = z - era * 146097;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let y = yoe + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
@@ -58,7 +58,14 @@ pub fn parse_hhmm(s: &str) -> Option<(i64, i64)> {
 }
 
 /// 允许通过 HTTP 提交的 agent 白名单，其余一律拒绝（防止任意命令执行）
-pub const KNOWN_AGENTS: &[&str] = &["shell", "codex", "hermes", "claude", "api:deepseek", "api:qwen"];
+pub const KNOWN_AGENTS: &[&str] = &[
+    "shell",
+    "codex",
+    "hermes",
+    "claude",
+    "api:deepseek",
+    "api:qwen",
+];
 
 pub fn is_known_agent(agent: &str) -> bool {
     KNOWN_AGENTS.contains(&agent.trim())
@@ -233,7 +240,12 @@ pub struct State {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StoreHealth { Fresh, Ok, Recovered, Unrecoverable }
+pub enum StoreHealth {
+    Fresh,
+    Ok,
+    Recovered,
+    Unrecoverable,
+}
 
 impl StoreHealth {
     pub fn as_str(self) -> &'static str {
@@ -586,7 +598,14 @@ mod tests {
 
     #[test]
     fn agent_whitelist() {
-        for a in ["shell", "codex", "hermes", "claude", "api:deepseek", "api:qwen"] {
+        for a in [
+            "shell",
+            "codex",
+            "hermes",
+            "claude",
+            "api:deepseek",
+            "api:qwen",
+        ] {
             assert!(is_known_agent(a));
         }
         assert!(!is_known_agent("rm -rf /"));
@@ -618,10 +637,11 @@ mod tests {
         let (state, health) = load_state(&p, &bak);
         assert_eq!(health, StoreHealth::Unrecoverable);
         assert!(state.runs.is_empty());
-        let corrupt_exists = fs::read_dir(&dir)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .any(|e| e.file_name().to_string_lossy().starts_with("state.json.corrupt-"));
+        let corrupt_exists = fs::read_dir(&dir).unwrap().filter_map(|e| e.ok()).any(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with("state.json.corrupt-")
+        });
         assert!(corrupt_exists);
         let _ = fs::remove_dir_all(&dir);
     }
@@ -701,8 +721,14 @@ mod tests {
         assert!(store.save());
         assert_eq!(store.writes_total, 1);
         let reloaded = Store::load(&dir);
-        assert_eq!(reloaded.writes_total, 0, "写计数只在内存态，重新 load 后应归零");
-        assert_eq!(reloaded.writes_skipped, 0, "跳过计数同样应在重新 load 后归零");
+        assert_eq!(
+            reloaded.writes_total, 0,
+            "写计数只在内存态，重新 load 后应归零"
+        );
+        assert_eq!(
+            reloaded.writes_skipped, 0,
+            "跳过计数同样应在重新 load 后归零"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -767,7 +793,10 @@ mod tests {
     fn store_health_ok_on_good_state() {
         let dir = std::env::temp_dir().join(format!("roamway-health-ok-{}", now()));
         let _ = fs::create_dir_all(&dir);
-        let state = State { seq: 7, ..Default::default() };
+        let state = State {
+            seq: 7,
+            ..Default::default()
+        };
         fs::write(dir.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
         let store = Store::load(&dir);
         assert_eq!(store.store_health, StoreHealth::Ok);
@@ -781,8 +810,15 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("roamway-health-recovered-{}", now()));
         let _ = fs::create_dir_all(&dir);
         fs::write(dir.join("state.json"), b"{ bad json").unwrap();
-        let good = State { seq: 9, ..Default::default() };
-        fs::write(dir.join("state.json.bak"), serde_json::to_vec(&good).unwrap()).unwrap();
+        let good = State {
+            seq: 9,
+            ..Default::default()
+        };
+        fs::write(
+            dir.join("state.json.bak"),
+            serde_json::to_vec(&good).unwrap(),
+        )
+        .unwrap();
         let store = Store::load(&dir);
         assert_eq!(store.store_health, StoreHealth::Recovered);
         assert!(store.loaded_ok);
@@ -811,7 +847,10 @@ mod tests {
         fs::write(dir.join("state.json.bak"), b"known-good-original").unwrap();
         let mut store = Store {
             dir: dir.clone(),
-            state: State { seq: 7, ..Default::default() },
+            state: State {
+                seq: 7,
+                ..Default::default()
+            },
             loaded_ok: true,
             store_health: StoreHealth::Recovered,
             preserve_backup: true,
@@ -821,7 +860,10 @@ mod tests {
         };
         assert!(store.save());
         assert!(dir.join("state.json").exists());
-        assert_eq!(fs::read(dir.join("state.json.bak")).unwrap(), b"known-good-original");
+        assert_eq!(
+            fs::read(dir.join("state.json.bak")).unwrap(),
+            b"known-good-original"
+        );
         assert!(!store.preserve_backup);
         store.state.seq += 1;
         assert!(store.save());
@@ -845,13 +887,16 @@ mod tests {
             .filter(|n| n.starts_with("state.json.corrupt-"))
             .collect();
         names.sort();
-        assert_eq!(names, vec![
-            "state.json.corrupt-3",
-            "state.json.corrupt-4",
-            "state.json.corrupt-5",
-            "state.json.corrupt-6",
-            "state.json.corrupt-7",
-        ]);
+        assert_eq!(
+            names,
+            vec![
+                "state.json.corrupt-3",
+                "state.json.corrupt-4",
+                "state.json.corrupt-5",
+                "state.json.corrupt-6",
+                "state.json.corrupt-7",
+            ]
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -450,7 +450,15 @@ mod tests {
         let picked = queued_to_start(&state, 2);
         assert_eq!(picked, vec!["b".to_string()]);
         let picked = queued_to_start(&state, 5);
-        assert_eq!(picked, vec!["b".to_string(), "c".to_string(), "d".to_string(), "e".to_string()]);
+        assert_eq!(
+            picked,
+            vec![
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+                "e".to_string()
+            ]
+        );
     }
 
     fn mk_run(id: &str, status: RunStatus, created_at: i64) -> Run {
@@ -580,7 +588,11 @@ mod tests {
         let (due, changed) = plan_and_apply(&mut state, 1000);
         assert!(due.is_empty(), "dep 无 run 时不能触发");
         assert!(changed);
-        assert_eq!(state.jobs[0].next_at, 1000 + 3600, "next_at 照常推进，不做 5s 空转");
+        assert_eq!(
+            state.jobs[0].next_at,
+            1000 + 3600,
+            "next_at 照常推进，不做 5s 空转"
+        );
         assert_eq!(
             state.jobs[0].last_skip.as_deref(),
             Some("waiting for job_A (no runs)")
@@ -599,7 +611,10 @@ mod tests {
         };
         let (due, _) = plan_and_apply(&mut state, 1000);
         assert_eq!(due, vec!["job_B".to_string()]);
-        assert!(state.jobs[0].last_skip.is_none(), "满足后必须清空 last_skip");
+        assert!(
+            state.jobs[0].last_skip.is_none(),
+            "满足后必须清空 last_skip"
+        );
         assert_eq!(state.jobs[0].next_at, 1000 + 3600);
     }
 

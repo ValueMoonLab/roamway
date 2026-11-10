@@ -179,10 +179,9 @@ pub fn trigger_valid(t: &HubTrigger) -> bool {
 
 pub fn deploy(dir: &Path, org_path: &Path) -> Result<(usize, usize, usize), String> {
     let mut hub = load(dir).ok_or("hub not initialized (run 'roamway hub init')")?;
-    let raw = std::fs::read(org_path)
-        .map_err(|e| format!("read {}: {}", org_path.display(), e))?;
-    let org: OrgFile = serde_json::from_slice(&raw)
-        .map_err(|e| format!("parse {}: {}", org_path.display(), e))?;
+    let raw = std::fs::read(org_path).map_err(|e| format!("read {}: {}", org_path.display(), e))?;
+    let org: OrgFile =
+        serde_json::from_slice(&raw).map_err(|e| format!("parse {}: {}", org_path.display(), e))?;
     let mut imported = 0usize;
     let mut updated = 0usize;
     let mut skipped = 0usize;
@@ -225,7 +224,9 @@ pub fn logout(dir: &Path, keep_data: bool) {
 /// 校验 `X-Hub-Signature-256: sha256=<hex>`，HMAC-SHA256 常量时间比较。
 pub fn verify_signature(secret: &[u8], body: &[u8], header: &str) -> Result<(), &'static str> {
     let value = header.trim();
-    let hex = value.strip_prefix("sha256=").ok_or("missing sha256= prefix")?;
+    let hex = value
+        .strip_prefix("sha256=")
+        .ok_or("missing sha256= prefix")?;
     let provided = crate::auth::hex_decode(hex).ok_or("bad signature hex")?;
     if provided.len() != 32 {
         return Err("bad signature length");
@@ -409,7 +410,10 @@ mod tests {
         assert_eq!(skipped, 1);
         let reloaded = load(&dir).unwrap();
         assert_eq!(reloaded.triggers.len(), 3);
-        assert!(reloaded.triggers.iter().all(|t| !t.id.is_empty() && !t.secret_env.is_empty()));
+        assert!(reloaded
+            .triggers
+            .iter()
+            .all(|t| !t.id.is_empty() && !t.secret_env.is_empty()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

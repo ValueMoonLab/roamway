@@ -123,9 +123,7 @@ pub fn aggregate(state: &State, since: i64, provider_filter: Option<&str>) -> Ve
         row.total_tokens += u.total_tokens;
     }
     let mut rows: Vec<AggRow> = groups.into_values().collect();
-    rows.sort_by(|a, b| {
-        (&a.day, &a.provider, &a.model).cmp(&(&b.day, &b.provider, &b.model))
-    });
+    rows.sort_by(|a, b| (&a.day, &a.provider, &a.model).cmp(&(&b.day, &b.provider, &b.model)));
     rows
 }
 
@@ -257,7 +255,14 @@ pub fn report_json(state: &State) -> Value {
 mod tests {
     use super::*;
 
-    fn mk_run(id: &str, day: i64, prompt: u64, completion: u64, provider: &str, model: &str) -> Run {
+    fn mk_run(
+        id: &str,
+        day: i64,
+        prompt: u64,
+        completion: u64,
+        provider: &str,
+        model: &str,
+    ) -> Run {
         Run {
             id: id.into(),
             title: String::new(),
@@ -307,10 +312,23 @@ mod tests {
     fn aggregate_groups_by_day_provider_model() {
         let base = parse_iso_to_ts("2026-11-09T00:00:00Z").unwrap();
         let mut state = State::default();
-        state.runs.push(mk_run("a", base, 10, 20, "api:deepseek", "deepseek-chat"));
-        state.runs.push(mk_run("b", base + 10, 5, 5, "api:deepseek", "deepseek-chat"));
-        state.runs.push(mk_run("c", base, 100, 200, "api:qwen", "qwen-plus"));
-        state.runs.push(mk_run("d", base, 1, 2, "api:qwen", "qwen-plus"));
+        state
+            .runs
+            .push(mk_run("a", base, 10, 20, "api:deepseek", "deepseek-chat"));
+        state.runs.push(mk_run(
+            "b",
+            base + 10,
+            5,
+            5,
+            "api:deepseek",
+            "deepseek-chat",
+        ));
+        state
+            .runs
+            .push(mk_run("c", base, 100, 200, "api:qwen", "qwen-plus"));
+        state
+            .runs
+            .push(mk_run("d", base, 1, 2, "api:qwen", "qwen-plus"));
         let rows = aggregate(&state, 0, None);
         assert_eq!(rows.len(), 2);
         let ds = rows.iter().find(|r| r.provider == "api:deepseek").unwrap();
@@ -332,7 +350,12 @@ mod tests {
         let base = parse_iso_to_ts("2026-11-09T00:00:00Z").unwrap();
         let mut run = mk_run("run_000001", base, 7, 8, "api:deepseek", "deepseek-chat");
         run.attempts = 1;
-        let state = State { runs: vec![run], jobs: vec![], agents: vec![], seq: 1 };
+        let state = State {
+            runs: vec![run],
+            jobs: vec![],
+            agents: vec![],
+            seq: 1,
+        };
         let lines = inspect_lines(&state, "run_000001").unwrap();
         let joined = lines.join("\n");
         assert!(joined.contains("tokens: in=7 out=8 total=15"));

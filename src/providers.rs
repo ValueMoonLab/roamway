@@ -167,16 +167,18 @@ pub fn fetch_models(base_url: &str) -> Result<Vec<String>, String> {
     let url = models_url(base_url);
     match ureq::get(&url).timeout(Duration::from_secs(10)).call() {
         Ok(resp) => {
-            let v: serde_json::Value = resp
-                .into_json()
-                .map_err(|e| format!("bad json: {}", e))?;
+            let v: serde_json::Value = resp.into_json().map_err(|e| format!("bad json: {}", e))?;
             let data = v
                 .get("data")
                 .and_then(|d| d.as_array())
                 .ok_or_else(|| "no data array in response".to_string())?;
             let models: Vec<String> = data
                 .iter()
-                .filter_map(|m| m.get("id").and_then(|id| id.as_str()).map(|s| s.to_string()))
+                .filter_map(|m| {
+                    m.get("id")
+                        .and_then(|id| id.as_str())
+                        .map(|s| s.to_string())
+                })
                 .collect();
             if models.is_empty() {
                 Err("empty model list".into())
@@ -317,7 +319,10 @@ mod tests {
     fn diagnostic_lines_agent_reports_binary() {
         let dir = std::env::temp_dir().join(format!("roamway-prov-diag-{}", crate::types::now()));
         let _ = fs::create_dir_all(&dir);
-        let p = builtins().into_iter().find(|p| p.id == "agent:codex").unwrap();
+        let p = builtins()
+            .into_iter()
+            .find(|p| p.id == "agent:codex")
+            .unwrap();
         let lines = diagnostic_lines(&dir, &p);
         assert!(lines.iter().any(|l| l.starts_with("binary: codex")));
         assert!(lines.iter().any(|l| l.starts_with("id: agent:codex")));
@@ -326,7 +331,8 @@ mod tests {
 
     #[test]
     fn load_tolerates_corrupt_file() {
-        let dir = std::env::temp_dir().join(format!("roamway-prov-corrupt-{}", crate::types::now()));
+        let dir =
+            std::env::temp_dir().join(format!("roamway-prov-corrupt-{}", crate::types::now()));
         let _ = fs::create_dir_all(&dir);
         fs::write(dir.join("providers.json"), "{ bad json").unwrap();
         let providers = load(&dir);

@@ -32,10 +32,22 @@ mod tests {
 
     #[test]
     fn asset_routes_content_types() {
-        assert_eq!(asset("").map(|(ct, _)| ct), Some("text/html; charset=utf-8"));
-        assert_eq!(asset("index.html").map(|(ct, _)| ct), Some("text/html; charset=utf-8"));
-        assert_eq!(asset("app.js").map(|(ct, _)| ct), Some("application/javascript; charset=utf-8"));
-        assert_eq!(asset("style.css").map(|(ct, _)| ct), Some("text/css; charset=utf-8"));
+        assert_eq!(
+            asset("").map(|(ct, _)| ct),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(
+            asset("index.html").map(|(ct, _)| ct),
+            Some("text/html; charset=utf-8")
+        );
+        assert_eq!(
+            asset("app.js").map(|(ct, _)| ct),
+            Some("application/javascript; charset=utf-8")
+        );
+        assert_eq!(
+            asset("style.css").map(|(ct, _)| ct),
+            Some("text/css; charset=utf-8")
+        );
         assert!(asset("missing.js").is_none());
     }
 

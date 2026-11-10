@@ -344,9 +344,11 @@ pub fn migrate_jobs(jobs: Vec<Job>, now_ts: i64) -> Vec<Schedule> {
         let next_run_at = if every_secs > 0 {
             Some(now_ts + every_secs as i64)
         } else {
-            timezone_offset_secs(&tz)
-                .ok()
-                .and_then(|off| parse_cron(&cron).ok().and_then(|c| c.next_after(now_ts, off)))
+            timezone_offset_secs(&tz).ok().and_then(|off| {
+                parse_cron(&cron)
+                    .ok()
+                    .and_then(|c| c.next_after(now_ts, off))
+            })
         };
         let mut name = if j.title.trim().is_empty() {
             j.id.clone()
@@ -460,12 +462,11 @@ fn tick(app: &Arc<App>) {
 pub fn create_run_for_schedule(app: &Arc<App>, schedule_id: &str) {
     let schedule = {
         let ss = app.schedules.lock().unwrap_or_else(|e| e.into_inner());
-        ss.schedules
-            .iter()
-            .find(|s| s.id == schedule_id)
-            .cloned()
+        ss.schedules.iter().find(|s| s.id == schedule_id).cloned()
     };
-    let Some(s) = schedule else { return; };
+    let Some(s) = schedule else {
+        return;
+    };
     let run_id = {
         let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
         let id = st.next_id("run");
@@ -774,4 +775,3 @@ mod tests {
         assert_eq!(offset_to_tz(0), "+00:00");
     }
 }
-

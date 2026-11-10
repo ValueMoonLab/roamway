@@ -1,5 +1,24 @@
 # Changelog
 
+## 1.4.0
+
+clippy / fmt 门禁转正与 `daemon status` 说真话（P27）：`cargo clippy --all-targets -- -D warnings`
+零 error 零 warning，CI 里 fmt / clippy 的 `continue-on-error` 全部移除；`daemon status` 的
+`effective_bind` / `uptime_s` / `store` 只来自该 `--data` 实例，`store` 取 `/readyz` 活体真值。
+
+### Changed
+
+- `.github/workflows/ci.yml`：`cargo fmt --check` 与 `cargo clippy --all-targets -- -D warnings`
+  均为硬门禁（删除两处 `continue-on-error: true`）。
+- `daemon status`（非远程）：bind 单一真源（writer lock → config → 默认 `127.0.0.1:8796`）、
+  pid 活体校验、`uptime_s` 只来自该实例、`store` 改从 `/readyz` 判定。
+
+### Added
+
+- `daemon status --json` 新增 `bind_source` / `stale_pid` / `ready` / `ready_reason` /
+  `store_source` / `store_error`；文本输出追加 bind 来源与 `ready <yes|no>`。
+- 新增 8 条 status 判定测试（注入 `alive` 纯函数，不真起进程）。
+
 ## 1.3.0
 
 数据目录单写者与 store 健康可观测（P26）：同一个 `<data>` 只允许一个写者，降级启动对外可见，

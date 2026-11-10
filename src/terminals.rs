@@ -185,8 +185,7 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
 }
 
 fn write_json<T: Serialize>(path: &Path, v: &T) -> std::io::Result<()> {
-    let s = serde_json::to_string_pretty(v)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let s = serde_json::to_string_pretty(v).map_err(std::io::Error::other)?;
     let tmp = path.with_extension("json.tmp");
     let mut f = fs::File::create(&tmp)?;
     f.write_all(s.as_bytes())?;
@@ -241,7 +240,11 @@ impl Ring {
         if n == 0 || n >= self.data.len() {
             return self.data.iter().copied().collect();
         }
-        self.data.iter().skip(self.data.len() - n).copied().collect()
+        self.data
+            .iter()
+            .skip(self.data.len() - n)
+            .copied()
+            .collect()
     }
 }
 
@@ -573,7 +576,11 @@ pub fn script_rm(app: &Arc<App>, name: &str) -> Result<usize, String> {
     let Some(id) = id else {
         return Err(format!("no such script: {}", name));
     };
-    if store.script(name).map(|s| s.state == "running").unwrap_or(false) {
+    if store
+        .script(name)
+        .map(|s| s.state == "running")
+        .unwrap_or(false)
+    {
         return Err(format!("script {} is running; stop it first", name));
     }
     store.scripts.retain(|s| s.id != id);
@@ -732,6 +739,14 @@ pub fn start_reaper(app: Arc<App>) {
     });
 }
 
+fn payload(keys: &str, enter: bool) -> Vec<u8> {
+    let mut p = keys.as_bytes().to_vec();
+    if enter && !p.ends_with(b"\n") {
+        p.push(b'\n');
+    }
+    p
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -749,7 +764,7 @@ mod tests {
         let mut r = Ring::new(8);
         r.push(b"abcdefgh"); // dropped=0, total=8
         r.push(b"ij"); // dropped=2, total=10
-        // since=2 表示从最初的第 2 个字节开始，但该字节已被丢弃 -> 从缓冲起点
+                       // since=2 表示从最初的第 2 个字节开始，但该字节已被丢弃 -> 从缓冲起点
         assert_eq!(r.slice_from(2), b"cdefghij".to_vec());
         assert_eq!(r.slice_from(9), b"j".to_vec());
         assert_eq!(r.slice_from(10), b"".to_vec());
@@ -831,7 +846,11 @@ mod tests {
         assert_eq!(st.terminals[0].pid, None);
         // 进程组必须被收掉：wait 能返回且不是正常退出（被信号杀掉）
         let status = child.wait().unwrap();
-        assert!(!status.success(), "orphan child survived restart: {:?}", status);
+        assert!(
+            !status.success(),
+            "orphan child survived restart: {:?}",
+            status
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -888,12 +907,4 @@ mod tests {
         assert_eq!(live.state, "exited");
         let _ = fs::remove_dir_all(&dir);
     }
-}
-
-fn payload(keys: &str, enter: bool) -> Vec<u8> {
-    let mut p = keys.as_bytes().to_vec();
-    if enter && !p.ends_with(b"\n") {
-        p.push(b'\n');
-    }
-    p
 }

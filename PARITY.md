@@ -245,6 +245,31 @@ P25/P26 关键不变量（P22/P24 不变量继续有效，另加五条）：
 - 降级启动期（`store_health != Ok`）首笔 `save()` 不得轮换 `.bak`，否则会拿坏状态覆盖最后一份已知良好备份。
 - `daemon status` 的 `store` / `writer` 只允许新增键；`store` 取值集合不得扩展。
 
-P27 待补的真洞（本表不视为已交付）：clippy 门禁仍是 `continue-on-error` 的假门禁（63 条 error 长期绿过 CI）；
-`daemon status` 在非默认 `--data` 目录上仍会回落到常量 `127.0.0.1:8796` 并报生产实例的 `uptime_s`；
-`effective_bind` 不看 writer lock；活体实例的 `store` 走离线体检而非 `/readyz`。修法与验收见 `P27_SPEC.md`。
+P27 已交付（clippy 门禁转正 + `daemon status` 说真话）：
+
+- clippy 清零：`cargo clippy --all-targets -- -D warnings` 零 error 零 warning；`.github/workflows/ci.yml`
+  的 fmt / clippy 两处 `continue-on-error` 已删，clippy 步骤补 `--all-targets`；`#[allow]` 全仓库仅
+  `src/agents.rs:188` / `:247`（`too_many_arguments`，注册式 API 参数与协议字段一一对应）与
+  `src/speech.rs:32`（`dead_code`，P10 web 控制面板保留的 config writer）。
+- `daemon status` 的 bind 单一真源：`src/main.rs:4686 fn status_target`（writer bind 优先 → config →
+  默认 `127.0.0.1:8796`），文本输出 `config <file>  effective_bind <b> (<source>)`。
+- 活体校验：`src/main.rs:4686` 配合 `src/backup.rs:448/453/478 pub fn process_alive` 三平台实现；pid 已死
+  `ok=false`、`uptime_s=0`、`pid=null`、`stale_pid=N`，error 含 `stale pid file (pid N not running)`，
+  且绝不再连任何端口。
+- `store` 取活体真值：`src/main.rs:4750 struct ReadyVerdict`、`:4759 fn readyz_verdict`、
+  `:4829 fn cmd_daemon_status`（`GET /readyz` 200 → `store_source=live`；503 `state_unreadable` →
+  `unrecoverable`；busy / 401 → 保留离线体检值并 `store_source=offline`）。新键：
+  `bind_source` / `stale_pid` / `ready` / `ready_reason` / `store_source` / `store_error`。
+- 测试注入 `alive` 纯函数：`src/main.rs:6101`（`status_target_prefers_live_writer_bind_and_source`）、
+  `:6115`（config 源）、`:6128`（pid 已死离线化）、`:6150` / `:6165`（writer 覆盖陈旧 pid 文件）、
+  `:6180` / `:6191`（readyz 判定）、`:6201`（离线 store 与 `inspect_store_health` 一致）。
+
+P27 关键不变量（在 P22/P24/P25/P26 不变量上追加）：
+
+- `daemon status` 只允许新增 `bind_source` / `stale_pid` / `ready` / `ready_reason` /
+  `store_source` / `store_error` 六个键；既有键语义不得改，`store` 取值集合仍为
+  `fresh|ok|recovered|unrecoverable`。
+- pid 文件已死时 status 必须 `ok=false`、`uptime_s=0`、`pid=null`、`stale_pid=N`，并且不得向
+  任何端口发起连接（不得回落常量 `127.0.0.1:8796` 拿生产实例的数）。
+- `#[allow]` 全仓库上限 3 条且每条带一行理由注释；禁止 `#![allow(...)]`、`-A warnings` 或 CI
+  `continue-on-error`。

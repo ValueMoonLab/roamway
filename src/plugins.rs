@@ -1,4 +1,4 @@
-use crate::types::{now, iso, App};
+use crate::types::{iso, now, App};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::fs;
@@ -94,8 +94,7 @@ impl Registry {
         }
         let tmp = self.path.with_file_name("plugins.json.tmp");
         let wrapped = json!({ "plugins": self.plugins.clone() });
-        let data = serde_json::to_vec_pretty(&wrapped)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let data = serde_json::to_vec_pretty(&wrapped).map_err(std::io::Error::other)?;
         let mut f = fs::File::create(&tmp)?;
         f.write_all(&data)?;
         f.sync_all()?;
@@ -139,9 +138,7 @@ fn parse_registry(raw: &str) -> Result<Vec<Plugin>, String> {
         .or_else(|| v.as_array().cloned())
         .unwrap_or_default();
     arr.into_iter()
-        .map(|item| {
-            serde_json::from_value::<Plugin>(item).map_err(|e| e.to_string())
-        })
+        .map(|item| serde_json::from_value::<Plugin>(item).map_err(|e| e.to_string()))
         .collect()
 }
 
@@ -197,11 +194,17 @@ for line in sys.stdin:
 
 pub fn enable(dir: &Path, name: &str, trust: bool) -> Result<(), String> {
     let mut reg = Registry::load(dir);
-    let plugin = reg
-        .get_mut(name)
-        .ok_or_else(|| format!("plugin '{}' not found; run `roamway plugin init {}` first", name, name))?;
+    let plugin = reg.get_mut(name).ok_or_else(|| {
+        format!(
+            "plugin '{}' not found; run `roamway plugin init {}` first",
+            name, name
+        )
+    })?;
     if !plugin.trusted && !trust {
-        return Err(format!("plugin '{}' is not trusted; re-run with --trust", name));
+        return Err(format!(
+            "plugin '{}' is not trusted; re-run with --trust",
+            name
+        ));
     }
     if trust {
         plugin.trusted = true;
@@ -316,7 +319,8 @@ pub fn run_one(dir: &Path, plugin: &Plugin, hook: &str, payload: &Value) -> Resu
             .unwrap_or("")
             .to_string())
     } else {
-        Err(v.get("message")
+        Err(v
+            .get("message")
             .and_then(|m| m.as_str())
             .unwrap_or("ok=false")
             .to_string())
@@ -430,7 +434,11 @@ mod tests {
         let _ = fs::create_dir_all(&dir);
         let pd = plugin_dir(&dir, "demo");
         let _ = fs::create_dir_all(&pd);
-        fs::write(pd.join("run.sh"), "read line\necho '{\"ok\":true,\"message\":\"ran\"}'\n").unwrap();
+        fs::write(
+            pd.join("run.sh"),
+            "read line\necho '{\"ok\":true,\"message\":\"ran\"}'\n",
+        )
+        .unwrap();
         let mut reg = Registry::load(&dir);
         reg.upsert(Plugin {
             name: "demo".into(),

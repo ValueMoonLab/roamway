@@ -77,10 +77,22 @@ fn execute(app: Arc<App>, id: String) {
 
     {
         if let Err(e) = File::create(&log_path) {
-            finalize(&app, &id, RunStatus::Failed, None, Some(format!("log: {}", e)), None);
+            finalize(
+                &app,
+                &id,
+                RunStatus::Failed,
+                None,
+                Some(format!("log: {}", e)),
+                None,
+            );
             return;
         }
-        let option_keys = run.options.keys().map(String::as_str).collect::<Vec<_>>().join(",");
+        let option_keys = run
+            .options
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(",");
         let header = format!(
             "# {} run={} agent={} model={:?} dir={}\n[runopts] agent={} keys={} images={}\n",
             iso(now()),
@@ -93,7 +105,14 @@ fn execute(app: Arc<App>, id: String) {
             run.images.len()
         );
         if let Err(e) = append_capped(&log_path, header.as_bytes(), app.max_log_bytes) {
-            finalize(&app, &id, RunStatus::Failed, None, Some(format!("log: {}", e)), None);
+            finalize(
+                &app,
+                &id,
+                RunStatus::Failed,
+                None,
+                Some(format!("log: {}", e)),
+                None,
+            );
             return;
         }
     }
@@ -121,7 +140,8 @@ fn execute(app: Arc<App>, id: String) {
     }
 
     let outcome = if run.agent.starts_with("api:") {
-        let (status, code, err, text, usage) = run_api(&run, &log_path, &cancel, &history, app.max_log_bytes);
+        let (status, code, err, text, usage) =
+            run_api(&run, &log_path, &cancel, &history, app.max_log_bytes);
         (status, code, err, text, usage)
     } else {
         let session_for_run = if matches!(agent_kind.as_str(), "codex" | "claude") {
@@ -133,7 +153,8 @@ fn execute(app: Arc<App>, id: String) {
         } else {
             None
         };
-        let (status, code, err) = run_cli(&app, &run, &log_path, &cancel, session_for_run, claude_flag);
+        let (status, code, err) =
+            run_cli(&app, &run, &log_path, &cancel, session_for_run, claude_flag);
         (status, code, err, String::new(), None)
     };
     let (status, code, err, assistant, mut usage) = outcome;
@@ -141,7 +162,12 @@ fn execute(app: Arc<App>, id: String) {
         usage = Some(RunUsage::Note("unavailable".into()));
     }
 
-    let end = format!("\n# end {} status={:?} exit={:?}\n", iso(now()), status, code);
+    let end = format!(
+        "\n# end {} status={:?} exit={:?}\n",
+        iso(now()),
+        status,
+        code
+    );
     let _ = append_capped(&log_path, end.as_bytes(), app.max_log_bytes);
 
     if status == RunStatus::Done && agent_kind == "codex" {
@@ -189,7 +215,13 @@ fn execute(app: Arc<App>, id: String) {
     }
 }
 
-fn update_agent_run_status(app: &Arc<App>, agent_id: &Option<String>, run_id: &str, status: &RunStatus, err: Option<&str>) {
+fn update_agent_run_status(
+    app: &Arc<App>,
+    agent_id: &Option<String>,
+    run_id: &str,
+    status: &RunStatus,
+    err: Option<&str>,
+) {
     let aid = match agent_id.as_deref() {
         Some(a) => a,
         None => return,
@@ -307,7 +339,11 @@ fn first_option_key(opts: &BTreeMap<String, String>) -> Option<&str> {
     opts.keys().next().map(String::as_str)
 }
 
-fn reject_any_option(kind: &str, opts: &BTreeMap<String, String>, images: &[String]) -> Result<(), String> {
+fn reject_any_option(
+    kind: &str,
+    opts: &BTreeMap<String, String>,
+    images: &[String],
+) -> Result<(), String> {
     if let Some(key) = first_option_key(opts) {
         return Err(format!("run --{}: not supported for agent {}", key, kind));
     }
@@ -464,7 +500,9 @@ fn build_command_with_session(
                 run.options.get("mode").map(String::as_str),
             )?;
             let mut a: Vec<String> = vec!["-p".into()];
-            if let (Some(flag), Some(sid)) = (claude_resume_flag, session_id.filter(|s| !s.is_empty())) {
+            if let (Some(flag), Some(sid)) =
+                (claude_resume_flag, session_id.filter(|s| !s.is_empty()))
+            {
                 a.push(flag.to_string());
                 a.push(sid.to_string());
             }
@@ -601,7 +639,10 @@ pub fn append_capped(path: &Path, chunk: &[u8], limit: usize) -> std::io::Result
         f.write_all(chunk)?;
         return Ok(());
     }
-    let marker = format!("\n[roamway: log truncated; max_log_bytes={} reached]\n", limit);
+    let marker = format!(
+        "\n[roamway: log truncated; max_log_bytes={} reached]\n",
+        limit
+    );
     let len = f.metadata()?.len();
     if len >= marker.len() as u64 && log_ends_with_marker(path, marker.as_bytes())? {
         return Ok(());
@@ -756,7 +797,13 @@ fn run_api(
     _cancel: &Arc<AtomicBool>,
     history: &[agents::Msg],
     max_log_bytes: usize,
-) -> (RunStatus, Option<i32>, Option<String>, String, Option<RunUsage>) {
+) -> (
+    RunStatus,
+    Option<i32>,
+    Option<String>,
+    String,
+    Option<RunUsage>,
+) {
     let (default_url, key_env, url_env, default_model) = match run.agent.as_str() {
         "api:deepseek" => (
             "https://api.deepseek.com/chat/completions",
@@ -805,7 +852,10 @@ fn run_api(
         .iter()
         .map(|m| json!({ "role": m.role, "content": m.content }))
         .collect();
-    if !history.iter().any(|m| m.role == "user" && m.content == run.prompt) {
+    if !history
+        .iter()
+        .any(|m| m.role == "user" && m.content == run.prompt)
+    {
         messages.push(json!({ "role": "user", "content": run.prompt }));
     }
     let body = json!({
@@ -845,11 +895,21 @@ fn run_api(
                 }));
                 (RunStatus::Done, Some(0), None, text, usage)
             }
-            Err(e) => (RunStatus::Failed, None, Some(e.to_string()), String::new(), None),
+            Err(e) => (
+                RunStatus::Failed,
+                None,
+                Some(e.to_string()),
+                String::new(),
+                None,
+            ),
         },
         Err(ureq::Error::Status(code, r)) => {
             let body = r.into_string().unwrap_or_default();
-            let _ = append_capped(log_path, format!("HTTP {}: {}\n", code, body).as_bytes(), max_log_bytes);
+            let _ = append_capped(
+                log_path,
+                format!("HTTP {}: {}\n", code, body).as_bytes(),
+                max_log_bytes,
+            );
             (
                 RunStatus::Failed,
                 Some(code as i32),
@@ -859,12 +919,29 @@ fn run_api(
             )
         }
         Err(e) => {
-            let _ = append_capped(log_path, format!("request error: {}\n", e).as_bytes(), max_log_bytes);
-            (RunStatus::Failed, None, Some(e.to_string()), String::new(), None)
+            let _ = append_capped(
+                log_path,
+                format!("request error: {}\n", e).as_bytes(),
+                max_log_bytes,
+            );
+            (
+                RunStatus::Failed,
+                None,
+                Some(e.to_string()),
+                String::new(),
+                None,
+            )
         }
     }
 }
-fn finalize(app: &Arc<App>, id: &str, status: RunStatus, code: Option<i32>, err: Option<String>, usage: Option<RunUsage>) {
+fn finalize(
+    app: &Arc<App>,
+    id: &str,
+    status: RunStatus,
+    code: Option<i32>,
+    err: Option<String>,
+    usage: Option<RunUsage>,
+) {
     let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
     let idx = match st.state.runs.iter().position(|r| r.id == id) {
         Some(i) => i,
@@ -921,7 +998,6 @@ fn finalize(app: &Arc<App>, id: &str, status: RunStatus, code: Option<i32>, err:
     }
     remove_cancel(app, id);
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1037,9 +1113,18 @@ mod tests {
     #[test]
     fn provider_args_empty_is_identity() {
         let empty = BTreeMap::new();
-        assert_eq!(provider_args("codex", &empty, &[], None).unwrap(), Vec::<String>::new());
-        assert_eq!(provider_args("claude", &empty, &[], None).unwrap(), Vec::<String>::new());
-        assert_eq!(provider_args("shell", &empty, &[], None).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            provider_args("codex", &empty, &[], None).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            provider_args("claude", &empty, &[], None).unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            provider_args("shell", &empty, &[], None).unwrap(),
+            Vec::<String>::new()
+        );
     }
 
     #[test]
@@ -1076,7 +1161,10 @@ mod tests {
         ));
         let _ = std::fs::remove_file(&path);
         let limit = 24usize;
-        let marker = format!("\n[roamway: log truncated; max_log_bytes={} reached]\n", limit);
+        let marker = format!(
+            "\n[roamway: log truncated; max_log_bytes={} reached]\n",
+            limit
+        );
         // 先写一个小于 limit 的 chunk，后续两次追加会触发封顶与"标记只写一次"。
         assert!(append_capped(&path, b"hello \xe4\xbd\xa0", limit).is_ok());
         assert!(append_capped(&path, "世界一二三四五六七八九".as_bytes(), limit).is_ok());
@@ -1084,9 +1172,19 @@ mod tests {
         let data = std::fs::read(&path).unwrap();
         let _ = std::fs::remove_file(&path);
         let text = String::from_utf8_lossy(&data);
-        assert!(text.ends_with(marker.as_str()), "log must end with truncate marker");
-        assert_eq!(text.matches(marker.trim()).count(), 1, "marker must appear exactly once");
-        assert!(data.len() <= limit + marker.len(), "log must stay within limit + marker");
+        assert!(
+            text.ends_with(marker.as_str()),
+            "log must end with truncate marker"
+        );
+        assert_eq!(
+            text.matches(marker.trim()).count(),
+            1,
+            "marker must appear exactly once"
+        );
+        assert!(
+            data.len() <= limit + marker.len(),
+            "log must stay within limit + marker"
+        );
     }
 
     #[test]

@@ -180,7 +180,8 @@ pub fn load(dir: &Path) -> Result<Config, String> {
             return Err(format!("config.json contains unknown key '{}'", key));
         }
     }
-    serde_json::from_value::<Config>(value).map_err(|e| format!("config.json: invalid value: {}", e))
+    serde_json::from_value::<Config>(value)
+        .map_err(|e| format!("config.json: invalid value: {}", e))
 }
 
 /// 原子写入 `<dir>/config.json`：tmp + fsync + rename；unix 上 0600。
@@ -246,10 +247,7 @@ fn parse_usize_positive(key: &str, value: &str) -> Result<usize, String> {
 }
 
 fn parse_i64(key: &str, value: &str) -> Result<i64, String> {
-    value
-        .trim()
-        .parse()
-        .map_err(|_| invalid(key, value.trim()))
+    value.trim().parse().map_err(|_| invalid(key, value.trim()))
 }
 
 fn parse_bool(key: &str, value: &str) -> Result<bool, String> {
@@ -307,24 +305,30 @@ pub fn apply_set(cfg: &mut Config, key: &str, value: &str) -> Result<(), String>
         "allow_hosts" => cfg.allow_hosts = Some(split_list(value)),
         "allow_origins" => cfg.allow_origins = Some(split_list(value)),
         "require_approval" => cfg.require_approval = Some(parse_bool(key, value)?),
-        "keep_runs" => cfg.keep_runs = Some(
-            value
-                .trim()
-                .parse::<usize>()
-                .map_err(|_| invalid(key, value.trim()))?,
-        ),
-        "keep_days" => cfg.keep_days = Some(
-            value
-                .trim()
-                .parse::<u64>()
-                .map_err(|_| invalid(key, value.trim()))?,
-        ),
-        "max_log_bytes" => cfg.max_log_bytes = Some(
-            value
-                .trim()
-                .parse::<usize>()
-                .map_err(|_| invalid(key, value.trim()))?,
-        ),
+        "keep_runs" => {
+            cfg.keep_runs = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| invalid(key, value.trim()))?,
+            )
+        }
+        "keep_days" => {
+            cfg.keep_days = Some(
+                value
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| invalid(key, value.trim()))?,
+            )
+        }
+        "max_log_bytes" => {
+            cfg.max_log_bytes = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| invalid(key, value.trim()))?,
+            )
+        }
         _ => return Err(format!("unknown config key '{}'", key)),
     }
     Ok(())
@@ -661,14 +665,14 @@ pub fn retention_plan(runs: &[Run], keep_runs: usize, keep_days: u64, now: i64) 
 }
 
 /// 兼容旧签名：只按条数修剪。运行期 jobs::prune 与 prune_stats 都改走 retention_plan / _full。
-#[allow(dead_code)] // 既有调用方与测试的兼容入口，运行期不再使用
+#[cfg(test)]
 pub fn trim_runs_plan(runs: &[Run], keep_runs: usize) -> Vec<String> {
     retention_plan(runs, keep_runs, 0, 0)
 }
 
 /// 修剪历史 run：keep_runs=0 不修剪；只删 terminal（done/failed/...）记录，
 /// 绝不误删 running/queued。把总数压到 keep_runs 以内时，优先删除最旧的 terminal。
-#[allow(dead_code)] // 兼容入口，运行期走 jobs::prune
+#[cfg(test)]
 pub fn trim_runs(runs: &mut Vec<Run>, keep_runs: usize) -> bool {
     let removed = trim_runs_plan(runs, keep_runs);
     if removed.is_empty() {
@@ -738,16 +742,20 @@ mod tests {
             ("ROAMWAY_MAX_CONCURRENT", "9"),
             ("ROAMWAY_BIND", "127.0.0.1:8798"),
         ]);
-        let mut file = Config::default();
-        file.max_concurrent = Some(5);
+        let file = Config {
+            max_concurrent: Some(5),
+            ..Config::default()
+        };
         let c = resolve_config(&flags, &env, &file).unwrap();
         assert_eq!(c.max_concurrent, 9);
         assert_eq!(c.source_of("max_concurrent"), "env");
 
         let flags = HashMap::new();
         let env = HashMap::new();
-        let mut file = Config::default();
-        file.tz_offset_hours = Some(7);
+        let file = Config {
+            tz_offset_hours: Some(7),
+            ..Config::default()
+        };
         let c = resolve_config(&flags, &env, &file).unwrap();
         assert_eq!(c.tz_offset_hours, 7);
         assert_eq!(c.source_of("tz_offset_hours"), "file");
@@ -763,7 +771,10 @@ mod tests {
     fn resolve_env_comma_array_and_invalid_values() {
         let env = env_map(&[("ROAMWAY_ALLOW_HOSTS", "a.example, b.example")]);
         let c = resolve_config(&HashMap::new(), &env, &Config::default()).unwrap();
-        assert_eq!(c.allow_hosts, vec!["a.example".to_string(), "b.example".to_string()]);
+        assert_eq!(
+            c.allow_hosts,
+            vec!["a.example".to_string(), "b.example".to_string()]
+        );
         assert_eq!(c.source_of("allow_hosts"), "env");
 
         let flags = HashMap::from([("max-concurrent".to_string(), "0".to_string())]);
@@ -779,16 +790,18 @@ mod tests {
     #[test]
     fn config_roundtrip_and_no_token_leak() {
         let dir = std::env::temp_dir().join(format!("roamway-cfg-{}", crate::types::now()));
-        let mut cfg = Config::default();
-        cfg.bind = Some("127.0.0.1:8899".to_string());
-        cfg.max_concurrent = Some(8);
-        cfg.max_conn = Some(32);
-        cfg.tz_offset_hours = Some(9);
-        cfg.allow_hosts = Some(vec!["a".to_string(), "b".to_string()]);
-        cfg.allow_origins = Some(vec!["https://x".to_string()]);
-        cfg.require_approval = Some(true);
-        cfg.token_env = Some("ROAMWAY_TOKEN".to_string());
-        cfg.keep_runs = Some(12);
+        let cfg = Config {
+            bind: Some("127.0.0.1:8899".to_string()),
+            max_concurrent: Some(8),
+            max_conn: Some(32),
+            tz_offset_hours: Some(9),
+            allow_hosts: Some(vec!["a".to_string(), "b".to_string()]),
+            allow_origins: Some(vec!["https://x".to_string()]),
+            require_approval: Some(true),
+            token_env: Some("ROAMWAY_TOKEN".to_string()),
+            keep_runs: Some(12),
+            ..Config::default()
+        };
         save(&cfg, &dir).unwrap();
         let loaded = load(&dir).unwrap();
         assert_eq!(loaded.bind, cfg.bind);
@@ -848,7 +861,10 @@ mod tests {
         apply_set(&mut cfg, "tz_offset_hours", "9").unwrap();
         assert_eq!(cfg.tz_offset_hours, Some(9));
         apply_set(&mut cfg, "allow_hosts", "a,b").unwrap();
-        assert_eq!(cfg.allow_hosts, Some(vec!["a".to_string(), "b".to_string()]));
+        assert_eq!(
+            cfg.allow_hosts,
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
         apply_set(&mut cfg, "require_approval", "true").unwrap();
         assert_eq!(cfg.require_approval, Some(true));
         apply_set(&mut cfg, "bind", "127.0.0.1:8899").unwrap();
@@ -937,7 +953,10 @@ mod tests {
             run("d", RunStatus::Done, 4_000_000),
         ];
         let plan = retention_plan_full(&runs, 1, 100, 10_000_000);
-        assert_eq!(plan.remove, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(
+            plan.remove,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
         assert_eq!(plan.age_removed, 1);
     }
 

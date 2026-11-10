@@ -1,11 +1,11 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::hash::{BuildHasher, Hash, Hasher};
 
 /// 描述一次 worktree 创建请求，对应 `--worktree-slug/--new-branch/--base/--branch`。
 /// `branch` 兼作分支名；`existing=true` 表示检出已有分支（对应 `--branch`）。
@@ -98,8 +98,7 @@ impl Registry {
             fs::create_dir_all(parent)?;
         }
         let tmp = self.path.with_file_name("workspaces.json.tmp");
-        let data = serde_json::to_vec_pretty(&self.workspaces)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let data = serde_json::to_vec_pretty(&self.workspaces).map_err(std::io::Error::other)?;
         let mut f = fs::File::create(&tmp)?;
         f.write_all(&data)?;
         f.sync_all()?;
@@ -122,7 +121,12 @@ impl Registry {
         self.add_named(&name, path, remote)
     }
 
-    pub fn add_named(&mut self, name: &str, path: &Path, remote: &str) -> Result<Workspace, String> {
+    pub fn add_named(
+        &mut self,
+        name: &str,
+        path: &Path,
+        remote: &str,
+    ) -> Result<Workspace, String> {
         let abs = fs::canonicalize(path).map_err(|e| format!("workspace not found: {}", e))?;
         let abs_path = abs.to_string_lossy().to_string();
         if name.trim().is_empty() {
@@ -155,7 +159,7 @@ impl Registry {
             w.path == name_or_path
                 || canon
                     .as_ref()
-                    .map(|c| c.to_string_lossy().to_string() == w.path)
+                    .map(|c| c.to_string_lossy() == w.path)
                     .unwrap_or(false)
         })
     }
@@ -540,7 +544,6 @@ pub fn worktree_remove(repo_root: &str, path: &Path, branch: &str) -> Result<(),
     Ok(())
 }
 
-
 pub fn worktree_add_existing(repo_root: &str, path: &Path, branch: &str) -> Result<(), String> {
     let out = Command::new("git")
         .arg("-C")
@@ -686,10 +689,7 @@ mod tests {
         let mut reg = Registry::load(&dir);
         let ws = reg.add(&sub, "git@github.com:o/r.git").unwrap();
         assert_eq!(reg.get("repo").map(|w| w.id.clone()), Some(ws.id.clone()));
-        assert_eq!(
-            reg.get(&ws.path).map(|w| w.id.clone()),
-            Some(ws.id.clone())
-        );
+        assert_eq!(reg.get(&ws.path).map(|w| w.id.clone()), Some(ws.id.clone()));
         assert!(reg.get("missing").is_none());
         assert!(reg.remove("repo"));
         assert!(reg.get("repo").is_none());
@@ -724,7 +724,8 @@ mod tests {
         assert!(!spec.existing);
 
         // 第 2 组：new-branch + base
-        let spec = spec_from_parts(None, Some("feat/p16".into()), Some("base1".into()), None).unwrap();
+        let spec =
+            spec_from_parts(None, Some("feat/p16".into()), Some("base1".into()), None).unwrap();
         assert_eq!(spec.branch.as_deref(), Some("feat/p16"));
         assert_eq!(spec.base.as_deref(), Some("base1"));
         assert!(!spec.existing);
@@ -735,8 +736,13 @@ mod tests {
         assert!(spec.existing);
 
         // 第 4 组：冲突与非法值
-        let conflict = spec_from_parts(None, Some("feat".into()), Some("base1".into()), Some("main".into()))
-            .unwrap_err();
+        let conflict = spec_from_parts(
+            None,
+            Some("feat".into()),
+            Some("base1".into()),
+            Some("main".into()),
+        )
+        .unwrap_err();
         assert!(conflict.contains("conflicts"), "{}", conflict);
         let bad_slug = spec_from_parts(Some("Bad_Slug".into()), None, None, None).unwrap_err();
         assert!(bad_slug.contains("expected [a-z0-9-]"), "{}", bad_slug);
@@ -747,9 +753,15 @@ mod tests {
     #[test]
     fn worktree_add_from_argv_includes_base() {
         let argv = worktree_add_argv(Path::new("/tmp/wt"), "feat/p16", Some("base1"));
-        assert_eq!(argv, vec!["worktree", "add", "/tmp/wt", "-b", "feat/p16", "base1"]);
+        assert_eq!(
+            argv,
+            vec!["worktree", "add", "/tmp/wt", "-b", "feat/p16", "base1"]
+        );
         let no_base = worktree_add_argv(Path::new("/tmp/wt"), "feat/p16", None);
-        assert_eq!(no_base, vec!["worktree", "add", "/tmp/wt", "-b", "feat/p16"]);
+        assert_eq!(
+            no_base,
+            vec!["worktree", "add", "/tmp/wt", "-b", "feat/p16"]
+        );
     }
 
     #[test]
@@ -757,7 +769,10 @@ mod tests {
         let dir = temp_dir("wt-named");
         let with_slug = worktree_path_named(&dir, "ag_1234", Some("p16-a"));
         assert!(with_slug.starts_with(worktrees_dir(&dir)));
-        assert_eq!(with_slug.file_name().and_then(|n| n.to_str()), Some("p16-a"));
+        assert_eq!(
+            with_slug.file_name().and_then(|n| n.to_str()),
+            Some("p16-a")
+        );
         let fallback = worktree_path_named(&dir, "ag_1234", None);
         assert_eq!(fallback, worktree_path(&dir, "ag_1234"));
         let _ = fs::remove_dir_all(&dir);

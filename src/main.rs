@@ -6,32 +6,63 @@ mod cron;
 mod hosts;
 mod hub;
 mod jobs;
+mod plugins;
+mod providers;
 mod runner;
 mod schedules;
 mod server;
+mod speech;
 mod terminals;
 mod types;
-mod workspaces;
-mod plugins;
-mod providers;
-mod speech;
 mod usage;
 mod web;
+mod workspaces;
 
+use crate::workspaces::WorktreeSpec;
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, Write};
-use std::path::PathBuf;
 use std::net::{TcpStream, ToSocketAddrs};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, AtomicI32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use types::*;
-use crate::workspaces::WorktreeSpec;
 
-const BOOLS: &[&str] = &["print", "board", "no-wait", "quiet", "json", "allow-overlap", "disabled", "help", "force", "probe", "all", "worktree", "keep-worktree", "run-now", "overlap", "enabled", "enter", "no-enter", "stdin", "no-browser", "no-headers", "no-color", "runs", "background", "global", "resume", "continue", "version", "dry-run", "yes"];
+const BOOLS: &[&str] = &[
+    "print",
+    "board",
+    "no-wait",
+    "quiet",
+    "json",
+    "allow-overlap",
+    "disabled",
+    "help",
+    "force",
+    "probe",
+    "all",
+    "worktree",
+    "keep-worktree",
+    "run-now",
+    "overlap",
+    "enabled",
+    "enter",
+    "no-enter",
+    "stdin",
+    "no-browser",
+    "no-headers",
+    "no-color",
+    "runs",
+    "background",
+    "global",
+    "resume",
+    "continue",
+    "version",
+    "dry-run",
+    "yes",
+];
 
 static FAIL_CODE: AtomicI32 = AtomicI32::new(0);
 
@@ -203,12 +234,16 @@ fn parse_args(args: &[String]) -> ParsedArgs {
             i += 1;
         }
     }
-    ParsedArgs { flags, pos, unknown }
+    ParsedArgs {
+        flags,
+        pos,
+        unknown,
+    }
 }
 
 // 只有单测用得到薄包装；dispatch 已改走 parse_args，非 test 构建下它是死代码，
 // 而 CI 带 RUSTFLAGS=-D warnings，dead_code 会直接把 Windows job 打红。
-#[allow(dead_code)]
+#[cfg(test)]
 fn parse_flags(args: &[String]) -> (HashMap<String, String>, Vec<String>) {
     let p = parse_args(args);
     (p.flags, p.pos)
@@ -229,16 +264,22 @@ fn push_flag(flags: &mut HashMap<String, String>, key: &str, value: String) {
 fn flag_many(flags: &HashMap<String, String>, key: &str) -> Vec<String> {
     flags
         .get(key)
-        .map(|v| v.split('\u{1f}').filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
+        .map(|v| {
+            v.split('\u{1f}')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        })
         .unwrap_or_default()
 }
-
 
 fn percent_encode(input: &str) -> String {
     let mut out = String::new();
     for b in input.bytes() {
         match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(b as char),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
             _ => out.push_str(&format!("%{:02X}", b)),
         }
     }
@@ -312,7 +353,9 @@ fn validate_output_schema(path: &str) -> Result<(), String> {
 }
 
 /// run options 的值校验（CLI 与 HTTP 共用），返回规范化后的有序拷贝
-pub fn validate_run_options(raw: &BTreeMap<String, String>) -> Result<BTreeMap<String, String>, String> {
+pub fn validate_run_options(
+    raw: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, String>, String> {
     let mut out = BTreeMap::new();
     for (k, v) in raw {
         match k.as_str() {
@@ -322,9 +365,13 @@ pub fn validate_run_options(raw: &BTreeMap<String, String>) -> Result<BTreeMap<S
                 }
             }
             "mode" => {
-                if !matches!(v.as_str(), "read-only" | "workspace-write" | "danger-full-access") {
+                if !matches!(
+                    v.as_str(),
+                    "read-only" | "workspace-write" | "danger-full-access"
+                ) {
                     return Err(
-                        "run --mode must be one of read-only|workspace-write|danger-full-access".to_string(),
+                        "run --mode must be one of read-only|workspace-write|danger-full-access"
+                            .to_string(),
                     );
                 }
             }
@@ -386,13 +433,19 @@ fn run_plan(flags: &HashMap<String, String>) -> Result<RunPlan, String> {
     {
         return Err("checkout-pr requires --pr-number".to_string());
     }
-    let mut worktree = matches!(worktree_mode.as_deref(), Some("branch-off") | Some("checkout-branch"));
+    let mut worktree = matches!(
+        worktree_mode.as_deref(),
+        Some("branch-off") | Some("checkout-branch")
+    );
     if let Some(v) = flags.get("new-workspace") {
         match v.as_str() {
             "worktree" => worktree = true,
             "local" => worktree = false,
             other => {
-                return Err(format!("run --new-workspace: expected local or worktree, got {}", other))
+                return Err(format!(
+                    "run --new-workspace: expected local or worktree, got {}",
+                    other
+                ))
             }
         }
     }
@@ -414,12 +467,19 @@ fn run_plan(flags: &HashMap<String, String>) -> Result<RunPlan, String> {
     let mut options = BTreeMap::new();
     for key in ["thinking", "mode", "provider", "output-schema"] {
         if let Some(v) = flags.get(key) {
-            let k = if key == "output-schema" { "output_schema" } else { key };
+            let k = if key == "output-schema" {
+                "output_schema"
+            } else {
+                key
+            };
             options.insert(k.to_string(), v.clone());
         }
     }
     let options = validate_run_options(&options)?;
-    let kind = flags.get("agent").cloned().unwrap_or_else(|| "codex".into());
+    let kind = flags
+        .get("agent")
+        .cloned()
+        .unwrap_or_else(|| "codex".into());
     crate::runner::provider_args(
         &kind,
         &options,
@@ -441,22 +501,25 @@ fn run_plan(flags: &HashMap<String, String>) -> Result<RunPlan, String> {
         cwd: flags.get("cwd").cloned().filter(|c| !c.is_empty()),
         options,
         images,
-        wait_timeout: flags.get("wait-timeout").and_then(|v| v.parse::<u64>().ok()),
+        wait_timeout: flags
+            .get("wait-timeout")
+            .and_then(|v| v.parse::<u64>().ok()),
     })
 }
 
 /// 构造 `POST /v1/agents` 的 body，避免字段所有权被 json! 移动
 fn run_body(plan: &RunPlan, prompt: &str) -> Value {
-    let worktree_value = if plan.spec.slug.is_some() || plan.spec.branch.is_some() || plan.spec.base.is_some() {
-        json!({
-            "slug": plan.spec.slug.clone(),
-            "branch": if plan.spec.existing { plan.spec.branch.clone() } else { None },
-            "new_branch": if plan.spec.existing { None } else { plan.spec.branch.clone() },
-            "base": plan.spec.base.clone(),
-        })
-    } else {
-        json!(plan.worktree)
-    };
+    let worktree_value =
+        if plan.spec.slug.is_some() || plan.spec.branch.is_some() || plan.spec.base.is_some() {
+            json!({
+                "slug": plan.spec.slug.clone(),
+                "branch": if plan.spec.existing { plan.spec.branch.clone() } else { None },
+                "new_branch": if plan.spec.existing { None } else { plan.spec.branch.clone() },
+                "base": plan.spec.base.clone(),
+            })
+        } else {
+            json!(plan.worktree)
+        };
     json!({
         "kind": plan.kind.clone(),
         "model": plan.model.clone(),
@@ -565,14 +628,44 @@ fn yaml_plain(s: &str) -> bool {
     !s.is_empty()
         && !matches!(
             s,
-            "null" | "Null" | "NULL" | "true" | "True" | "TRUE" | "false" | "False" | "FALSE" | "~" | "yes" | "no" | "on" | "off"
+            "null"
+                | "Null"
+                | "NULL"
+                | "true"
+                | "True"
+                | "TRUE"
+                | "false"
+                | "False"
+                | "FALSE"
+                | "~"
+                | "yes"
+                | "no"
+                | "on"
+                | "off"
         )
         && !s.trim().is_empty()
         && s == s.trim()
         && !s.contains(|ch: char| {
             matches!(
                 ch,
-                ':' | '#' | '{' | '}' | '[' | ']' | ',' | '&' | '*' | '!' | '|' | '>' | '\'' | '"' | '%' | '@' | '`' | '\n' | '\r'
+                ':' | '#'
+                    | '{'
+                    | '}'
+                    | '['
+                    | ']'
+                    | ','
+                    | '&'
+                    | '*'
+                    | '!'
+                    | '|'
+                    | '>'
+                    | '\''
+                    | '"'
+                    | '%'
+                    | '@'
+                    | '`'
+                    | '\n'
+                    | '\r'
             ) || ch.is_ascii_control()
         })
         && s.parse::<f64>().is_err()
@@ -751,6 +844,32 @@ impl Client {
             }
         }
     }
+
+    /// 同 req，但不把失败写进 FAIL_CODE，并把 HTTP 状态码交给调用方判定。
+    fn req_status(&self, path: &str) -> (u16, Result<Value, String>) {
+        let url = format!("{}{}", self.base.trim_end_matches('/'), path);
+        let mut r = ureq::get(&url).timeout(Duration::from_secs(60));
+        if let Some(t) = &self.token {
+            r = r.set("x-roamway-token", t);
+        }
+        match r.call() {
+            Ok(resp) => {
+                let code = resp.status();
+                (
+                    code,
+                    resp.into_json::<Value>()
+                        .map_err(|e| format!("bad response: {}", e)),
+                )
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                let text = resp.into_string().unwrap_or_default();
+                let parsed = serde_json::from_str::<Value>(&text)
+                    .map_err(|e| format!("bad response: {}", e));
+                (code, parsed)
+            }
+            Err(e) => (0, Err(e.to_string())),
+        }
+    }
 }
 
 fn local_base(flags: &HashMap<String, String>) -> String {
@@ -835,7 +954,12 @@ fn dispatch_json(host: &hosts::Host, method: &str, path: &str) -> Result<Value, 
     })
 }
 
-fn request(flags: &HashMap<String, String>, method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
+fn request(
+    flags: &HashMap<String, String>,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Value, String> {
     if let Some(h) = resolve_host(flags) {
         let body_str = match body {
             Some(v) => Some(serde_json::to_string(&v).map_err(|e| e.to_string())?),
@@ -1054,7 +1178,7 @@ fn dispatch(argv: &[String]) -> i32 {
     }
 
     let mut flags = flags;
-    if flags.get("home").is_some() && flags.get("data").is_none() {
+    if flags.contains_key("home") && !flags.contains_key("data") {
         let home = flags.get("home").cloned().unwrap();
         flags.insert("data".to_string(), home);
     }
@@ -1236,7 +1360,9 @@ fn cmd_serve(flags: &HashMap<String, String>) {
     let unix_socket = cfg.unix_socket.clone().map(PathBuf::from);
     let tls_cert = cfg.tls_cert.clone().map(PathBuf::from);
     let tls_key = cfg.tls_key.clone().map(PathBuf::from);
-    let bind_host = bind_parts(&bind).map(|(h, _)| h).unwrap_or_else(|| bind.clone());
+    let bind_host = bind_parts(&bind)
+        .map(|(h, _)| h)
+        .unwrap_or_else(|| bind.clone());
 
     std::fs::create_dir_all(&data).ok();
     if flags.contains_key("force") {
@@ -1248,7 +1374,10 @@ fn cmd_serve(flags: &HashMap<String, String>) {
             std::process::exit(1);
         }
     } else if let Err((owner_pid, owner_bind)) = backup::acquire_writer(&data, &bind) {
-        eprintln!("{}", backup::writer_busy_message(&data, owner_pid, &owner_bind));
+        eprintln!(
+            "{}",
+            backup::writer_busy_message(&data, owner_pid, &owner_bind)
+        );
         std::process::exit(3);
     }
 
@@ -1331,7 +1460,13 @@ fn cmd_serve(flags: &HashMap<String, String>) {
         "roamway {} | data={} | auth={} | tz=+{} | max-concurrent={} | max-conn={}",
         env!("CARGO_PKG_VERSION"),
         data.display(),
-        if token.is_some() { "token" } else if has_saved_tokens { "tokens" } else { "off" },
+        if token.is_some() {
+            "token"
+        } else if has_saved_tokens {
+            "tokens"
+        } else {
+            "off"
+        },
         tz,
         max_concurrent,
         max_conn
@@ -1361,7 +1496,10 @@ fn wait_run(
     loop {
         if let Some(n) = wait_timeout {
             if started.elapsed().as_secs() > n {
-                eprintln!("wait timeout after {}s; run {} still {}", n, id, last_status);
+                eprintln!(
+                    "wait timeout after {}s; run {} still {}",
+                    n, id, last_status
+                );
                 fail(1);
                 return;
             }
@@ -1371,7 +1509,10 @@ fn wait_run(
             Ok(v) => {
                 let st = v["run"]["status"].as_str().unwrap_or("?").to_string();
                 last_status = st.clone();
-                if matches!(st.as_str(), "done" | "failed" | "timeout" | "killed" | "interrupted") {
+                if matches!(
+                    st.as_str(),
+                    "done" | "failed" | "timeout" | "killed" | "interrupted"
+                ) {
                     if format_is_json(flags) {
                         print_formatted(flags, &v["run"]);
                         return;
@@ -1443,7 +1584,12 @@ fn cmd_run_resume(flags: &HashMap<String, String>, pos: &[String]) {
         "prompt": prompt,
         "timeout_s": flags.get("timeout").and_then(|v| v.parse::<u64>().ok()),
     });
-    match request(flags, "POST", &format!("/v1/agents/{}/run", agent_id), Some(body)) {
+    match request(
+        flags,
+        "POST",
+        &format!("/v1/agents/{}/run", agent_id),
+        Some(body),
+    ) {
         Ok(v) => {
             let id = v["run"]["id"].as_str().unwrap_or("").to_string();
             if flags.contains_key("no-wait") {
@@ -1454,7 +1600,9 @@ fn cmd_run_resume(flags: &HashMap<String, String>, pos: &[String]) {
                 |rid: &str| request(flags, "GET", &format!("/v1/runs/{}", rid), None);
             let mut fetch_log =
                 |rid: &str| request(flags, "GET", &format!("/v1/runs/{}/log?tail=40", rid), None);
-            let wait_timeout = flags.get("wait-timeout").and_then(|v| v.parse::<u64>().ok());
+            let wait_timeout = flags
+                .get("wait-timeout")
+                .and_then(|v| v.parse::<u64>().ok());
             wait_run(flags, &id, wait_timeout, &mut fetch_status, &mut fetch_log);
         }
         Err(e) => eprintln!("resume failed: {}", e),
@@ -1482,7 +1630,7 @@ fn cmd_run(flags: &HashMap<String, String>, pos: &[String]) {
         }
     };
     if let Some(h) = resolve_host(flags) {
-        cmd_run_remote(&h, flags, &pos, &plan);
+        cmd_run_remote(&h, flags, pos, &plan);
         return;
     }
     let c = local_client(flags);
@@ -1506,7 +1654,13 @@ fn cmd_run(flags: &HashMap<String, String>, pos: &[String]) {
     }
     let mut fetch_status = |rid: &str| c.req("GET", &format!("/v1/runs/{}", rid), None);
     let mut fetch_log = |rid: &str| c.req("GET", &format!("/v1/runs/{}/log?tail=40", rid), None);
-    wait_run(flags, &id, plan.wait_timeout, &mut fetch_status, &mut fetch_log);
+    wait_run(
+        flags,
+        &id,
+        plan.wait_timeout,
+        &mut fetch_status,
+        &mut fetch_log,
+    );
 }
 
 fn trunc(s: &str, n: usize) -> String {
@@ -1533,8 +1687,8 @@ fn print_agents(flags: &HashMap<String, String>, v: &Value) {
     }
     if !flags.contains_key("no-headers") {
         println!(
-            "{:<12} {:<10} {:<14} {:<16} {:<22} {}",
-            "ID", "STATE", "KIND", "MODEL", "TITLE", "UPDATED"
+            "{:<12} {:<10} {:<14} {:<16} {:<22} UPDATED",
+            "ID", "STATE", "KIND", "MODEL", "TITLE"
         );
     }
     for a in agents {
@@ -1607,8 +1761,8 @@ fn cmd_ls_agents_global(flags: &HashMap<String, String>, plan: &LsPlan) {
                     if !(200..300).contains(&code) {
                         return Err(format!("{}: HTTP {}: {}", h.name, code, text));
                     }
-                    let v: Value =
-                        serde_json::from_str(&text).map_err(|e| format!("{}: bad response: {}", h.name, e))?;
+                    let v: Value = serde_json::from_str(&text)
+                        .map_err(|e| format!("{}: bad response: {}", h.name, e))?;
                     Ok(v["agents"]
                         .as_array()
                         .cloned()
@@ -1644,8 +1798,8 @@ fn cmd_ls_agents_global(flags: &HashMap<String, String>, plan: &LsPlan) {
         }
     } else {
         println!(
-            "{:<10} {:<12} {:<10} {:<14} {:<16} {:<22} {}",
-            "HOST", "ID", "STATE", "KIND", "MODEL", "TITLE", "UPDATED"
+            "{:<10} {:<12} {:<10} {:<14} {:<16} {:<22} UPDATED",
+            "HOST", "ID", "STATE", "KIND", "MODEL", "TITLE"
         );
         for a in &all {
             println!(
@@ -1693,7 +1847,10 @@ fn cmd_ls_runs(flags: &HashMap<String, String>) {
         .get("limit")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(20);
-    let trigger = flags.get("trigger").cloned().filter(|t| !t.is_empty() && t != "true");
+    let trigger = flags
+        .get("trigger")
+        .cloned()
+        .filter(|t| !t.is_empty() && t != "true");
     let mut url = format!("/v1/runs?limit={}", limit);
     if let Some(t) = trigger {
         url.push_str(&format!("&trigger={}", t));
@@ -1714,8 +1871,8 @@ fn cmd_ls_runs(flags: &HashMap<String, String>) {
             }
             if !flags.contains_key("no-headers") {
                 println!(
-                    "{:<12} {:<12} {:<8} {:<20} {:<26} {}",
-                    "ID", "STATUS", "AGENT", "MODEL", "CREATED", "TITLE"
+                    "{:<12} {:<12} {:<8} {:<20} {:<26} TITLE",
+                    "ID", "STATUS", "AGENT", "MODEL", "CREATED"
                 );
             }
             for r in runs {
@@ -1748,7 +1905,10 @@ fn cmd_status(flags: &HashMap<String, String>, pos: &[String]) {
     }
     let c = local_client(flags);
     match c.req("GET", &format!("/v1/runs/{}", id), None) {
-        Ok(v) => println!("{}", serde_json::to_string_pretty(&v["run"]).unwrap_or_default()),
+        Ok(v) => println!(
+            "{}",
+            serde_json::to_string_pretty(&v["run"]).unwrap_or_default()
+        ),
         Err(e) => eprintln!("status failed: {}", e),
     }
 }
@@ -1826,8 +1986,19 @@ fn prune_max_age_days(flags: &HashMap<String, String>) -> Result<Option<u64>, ()
 
 fn cmd_prune(flags: &HashMap<String, String>, pos: &[String]) {
     const PRUNE_FLAGS: &[&str] = &[
-        "dry-run", "keep", "max-age-days", "yes", "host", "data", "home", "token", "format", "json",
-        "quiet", "no-color", "no-headers",
+        "dry-run",
+        "keep",
+        "max-age-days",
+        "yes",
+        "host",
+        "data",
+        "home",
+        "token",
+        "format",
+        "json",
+        "quiet",
+        "no-color",
+        "no-headers",
     ];
     for key in flags.keys() {
         if !PRUNE_FLAGS.contains(&key.as_str()) {
@@ -1883,8 +2054,16 @@ fn cmd_prune(flags: &HashMap<String, String>, pos: &[String]) {
 
 fn cmd_backup(flags: &HashMap<String, String>, pos: &[String]) {
     const BACKUP_FLAGS: &[&str] = &[
-        "out", "keep", "data", "home", "token", "format", "json", "quiet",
-        "no-color", "no-headers",
+        "out",
+        "keep",
+        "data",
+        "home",
+        "token",
+        "format",
+        "json",
+        "quiet",
+        "no-color",
+        "no-headers",
     ];
     for key in flags.keys() {
         if !BACKUP_FLAGS.contains(&key.as_str()) {
@@ -1954,8 +2133,17 @@ fn cmd_backup(flags: &HashMap<String, String>, pos: &[String]) {
 
 fn cmd_restore(flags: &HashMap<String, String>, pos: &[String]) {
     const RESTORE_FLAGS: &[&str] = &[
-        "from", "force", "yes", "data", "home", "token", "format", "json", "quiet",
-        "no-color", "no-headers",
+        "from",
+        "force",
+        "yes",
+        "data",
+        "home",
+        "token",
+        "format",
+        "json",
+        "quiet",
+        "no-color",
+        "no-headers",
     ];
     for key in flags.keys() {
         if !RESTORE_FLAGS.contains(&key.as_str()) {
@@ -2027,8 +2215,8 @@ fn cmd_jobs(flags: &HashMap<String, String>) {
             let empty = vec![];
             let jobs = v["jobs"].as_array().unwrap_or(&empty);
             println!(
-                "{:<10} {:<5} {:<8} {:<10} {:<26} {:<20} {:<16} {}",
-                "ID", "ON", "AGENT", "EVERY", "NEXT", "LAST", "AFTER", "TITLE"
+                "{:<10} {:<5} {:<8} {:<10} {:<26} {:<20} {:<16} TITLE",
+                "ID", "ON", "AGENT", "EVERY", "NEXT", "LAST", "AFTER"
             );
             for j in jobs {
                 let every = j["every_secs"]
@@ -2054,7 +2242,11 @@ fn cmd_jobs(flags: &HashMap<String, String>) {
                 println!(
                     "{:<10} {:<5} {:<8} {:<10} {:<26} {:<20} {:<16} {}{}",
                     j["id"].as_str().unwrap_or(""),
-                    if j["enabled"].as_bool().unwrap_or(false) { "yes" } else { "no" },
+                    if j["enabled"].as_bool().unwrap_or(false) {
+                        "yes"
+                    } else {
+                        "no"
+                    },
                     j["agent"].as_str().unwrap_or(""),
                     every,
                     j["next_at"].as_i64().map(iso).unwrap_or_else(|| "-".into()),
@@ -2102,7 +2294,10 @@ fn cmd_jobs_add(flags: &HashMap<String, String>, pos: &[String]) {
     }
     let c = local_client(flags);
     match c.req("POST", "/v1/jobs", Some(body)) {
-        Ok(v) => println!("{}", serde_json::to_string_pretty(&v["job"]).unwrap_or_default()),
+        Ok(v) => println!(
+            "{}",
+            serde_json::to_string_pretty(&v["job"]).unwrap_or_default()
+        ),
         Err(e) => eprintln!("{}", api_error_text("jobs-add", &e)),
     }
 }
@@ -2201,14 +2396,20 @@ fn cmd_schedule_create(flags: &HashMap<String, String>, pos: &[String]) {
     match request(flags, "POST", "/v1/schedules", Some(body)) {
         Ok(v) => {
             if flags.contains_key("json") {
-                println!("{}", serde_json::to_string_pretty(&v["schedule"]).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&v["schedule"]).unwrap_or_default()
+                );
             } else {
                 let s = &v["schedule"];
                 println!(
                     "created {} {}\tnext={}",
                     s["id"].as_str().unwrap_or(""),
                     s["name"].as_str().unwrap_or(""),
-                    s["next_run_at"].as_i64().map(iso).unwrap_or_else(|| "-".into())
+                    s["next_run_at"]
+                        .as_i64()
+                        .map(iso)
+                        .unwrap_or_else(|| "-".into())
                 );
             }
         }
@@ -2238,8 +2439,8 @@ fn cmd_schedule_ls(flags: &HashMap<String, String>) {
             }
             if !flags.contains_key("no-headers") {
                 println!(
-                    "{:<13} {:<20} {:<26} {:<6} {:<26} {}",
-                    "ID", "NAME", "NEXT", "RUNS", "LAST", "CRON"
+                    "{:<13} {:<20} {:<26} {:<6} {:<26} CRON",
+                    "ID", "NAME", "NEXT", "RUNS", "LAST"
                 );
             }
             for s in scheds {
@@ -2247,9 +2448,15 @@ fn cmd_schedule_ls(flags: &HashMap<String, String>) {
                     "{:<13} {:<20} {:<26} {:<6} {:<26} {}",
                     s["id"].as_str().unwrap_or(""),
                     trunc(s["name"].as_str().unwrap_or(""), 20),
-                    s["next_run_at"].as_i64().map(iso).unwrap_or_else(|| "-".into()),
+                    s["next_run_at"]
+                        .as_i64()
+                        .map(iso)
+                        .unwrap_or_else(|| "-".into()),
                     s["runs_count"].as_u64().unwrap_or(0),
-                    s["last_run_at"].as_i64().map(iso).unwrap_or_else(|| "-".into()),
+                    s["last_run_at"]
+                        .as_i64()
+                        .map(iso)
+                        .unwrap_or_else(|| "-".into()),
                     trunc(s["cron"].as_str().unwrap_or("-"), 24)
                 );
             }
@@ -2269,16 +2476,22 @@ fn cmd_schedule_inspect(flags: &HashMap<String, String>, pos: &[String]) {
                 println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
                 return;
             }
-            println!("{}", serde_json::to_string_pretty(&v["schedule"]).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&v["schedule"]).unwrap_or_default()
+            );
             let empty = vec![];
             let runs = v["runs"].as_array().unwrap_or(&empty);
-            println!("{:<12} {:<10} {:<26} {}", "RUN", "STATUS", "CREATED", "ERROR");
+            println!("{:<12} {:<10} {:<26} ERROR", "RUN", "STATUS", "CREATED");
             for r in runs {
                 println!(
                     "{:<12} {:<10} {:<26} {}",
                     r["id"].as_str().unwrap_or(""),
                     r["status"].as_str().unwrap_or(""),
-                    r["created_at"].as_i64().map(iso).unwrap_or_else(|| "-".into()),
+                    r["created_at"]
+                        .as_i64()
+                        .map(iso)
+                        .unwrap_or_else(|| "-".into()),
                     trunc(r["error"].as_str().unwrap_or(""), 40)
                 );
             }
@@ -2293,7 +2506,12 @@ fn cmd_schedule_logs(flags: &HashMap<String, String>, pos: &[String]) {
         None => return usage_error("usage: roamway schedule logs <id|name> [--tail 20]"),
     };
     let tail = flags.get("tail").cloned().unwrap_or_else(|| "20".into());
-    match request(flags, "GET", &format!("/v1/schedules/{}/logs?tail={}", key, tail), None) {
+    match request(
+        flags,
+        "GET",
+        &format!("/v1/schedules/{}/logs?tail={}", key, tail),
+        None,
+    ) {
         Ok(v) => {
             if flags.contains_key("json") {
                 println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
@@ -2310,7 +2528,12 @@ fn cmd_schedule_pause(flags: &HashMap<String, String>, pos: &[String]) {
         Some(k) => k,
         None => return usage_error("usage: roamway schedule pause <id|name>"),
     };
-    match request(flags, "POST", &format!("/v1/schedules/{}/pause", key), Some(json!({}))) {
+    match request(
+        flags,
+        "POST",
+        &format!("/v1/schedules/{}/pause", key),
+        Some(json!({})),
+    ) {
         Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
         Err(e) => eprintln!("schedule pause failed: {}", e),
     }
@@ -2321,7 +2544,12 @@ fn cmd_schedule_resume(flags: &HashMap<String, String>, pos: &[String]) {
         Some(k) => k,
         None => return usage_error("usage: roamway schedule resume <id|name>"),
     };
-    match request(flags, "POST", &format!("/v1/schedules/{}/resume", key), Some(json!({}))) {
+    match request(
+        flags,
+        "POST",
+        &format!("/v1/schedules/{}/resume", key),
+        Some(json!({})),
+    ) {
         Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
         Err(e) => eprintln!("schedule resume failed: {}", e),
     }
@@ -2343,7 +2571,12 @@ fn cmd_schedule_run_once(flags: &HashMap<String, String>, pos: &[String]) {
         Some(k) => k,
         None => return usage_error("usage: roamway schedule run-once <id|name>"),
     };
-    match request(flags, "POST", &format!("/v1/schedules/{}/run", key), Some(json!({}))) {
+    match request(
+        flags,
+        "POST",
+        &format!("/v1/schedules/{}/run", key),
+        Some(json!({})),
+    ) {
         Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
         Err(e) => eprintln!("schedule run-once failed: {}", e),
     }
@@ -2361,13 +2594,21 @@ fn cmd_schedule_update(flags: &HashMap<String, String>, pos: &[String]) {
         "prompt": flags.get("prompt"),
         "max_runs": flags.get("max-runs").and_then(|v| v.parse::<u64>().ok()),
         "timezone": flags.get("tz"),
-        "enabled": flags.contains_key("enabled").then(|| true),
+        "enabled": flags.contains_key("enabled").then_some(true),
     });
     if flags.contains_key("disabled") {
         body["enabled"] = json!(false);
     }
-    match request(flags, "PATCH", &format!("/v1/schedules/{}", key), Some(body)) {
-        Ok(v) => println!("{}", serde_json::to_string_pretty(&v["schedule"]).unwrap_or_default()),
+    match request(
+        flags,
+        "PATCH",
+        &format!("/v1/schedules/{}", key),
+        Some(body),
+    ) {
+        Ok(v) => println!(
+            "{}",
+            serde_json::to_string_pretty(&v["schedule"]).unwrap_or_default()
+        ),
         Err(e) => eprintln!("schedule update failed: {}", e),
     }
 }
@@ -2402,7 +2643,9 @@ fn cmd_hub(flags: &HashMap<String, String>, pos: &[String]) {
         "token" => cmd_hub_token(flags, pos),
         other => {
             eprintln!("unknown hub subcommand: {}", other);
-            usage_error("usage: roamway hub [init|permissions|projects|deploy|logout|status|token rotate]");
+            usage_error(
+                "usage: roamway hub [init|permissions|projects|deploy|logout|status|token rotate]",
+            );
         }
     }
 }
@@ -2443,7 +2686,10 @@ fn cmd_hub_permissions(flags: &HashMap<String, String>, pos: &[String]) {
         "ls" => {
             let h = load_hub_or_exit(flags);
             if flags.contains_key("json") {
-                println!("{}", serde_json::to_string_pretty(&h.permissions).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&h.permissions).unwrap_or_default()
+                );
             } else {
                 for p in &h.permissions {
                     println!("{:<20} {:<8} {}", p.subject, p.scope, p.granted_at);
@@ -2490,7 +2736,9 @@ fn cmd_hub_permissions(flags: &HashMap<String, String>, pos: &[String]) {
             }
         }
         _ => {
-            usage_error("usage: roamway hub permissions [ls|grant <subject> <scope>|revoke <subject>]");
+            usage_error(
+                "usage: roamway hub permissions [ls|grant <subject> <scope>|revoke <subject>]",
+            );
             std::process::exit(2);
         }
     }
@@ -2502,7 +2750,10 @@ fn cmd_hub_projects(flags: &HashMap<String, String>, pos: &[String]) {
         "ls" => {
             let h = load_hub_or_exit(flags);
             if flags.contains_key("json") {
-                println!("{}", serde_json::to_string_pretty(&h.projects).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&h.projects).unwrap_or_default()
+                );
             } else {
                 for p in &h.projects {
                     println!("{}", p);
@@ -2570,7 +2821,10 @@ fn cmd_hub_deploy(flags: &HashMap<String, String>) {
     }
     match hub::deploy(&dir, &path) {
         Ok((imported, updated, skipped)) => {
-            println!("imported {}, updated {}, skipped {}", imported, updated, skipped)
+            println!(
+                "imported {}, updated {}, skipped {}",
+                imported, updated, skipped
+            )
         }
         Err(e) => {
             eprintln!("{}", e);
@@ -2664,11 +2918,17 @@ fn cmd_status_summary(flags: &HashMap<String, String>) {
             );
             println!(
                 "next_run  {}",
-                v["next_run_at"].as_i64().map(iso).unwrap_or_else(|| "-".into())
+                v["next_run_at"]
+                    .as_i64()
+                    .map(iso)
+                    .unwrap_or_else(|| "-".into())
             );
             println!(
                 "last_fail {}",
-                v["last_failure"].as_i64().map(iso).unwrap_or_else(|| "-".into())
+                v["last_failure"]
+                    .as_i64()
+                    .map(iso)
+                    .unwrap_or_else(|| "-".into())
             );
         }
         Err(e) => eprintln!("status failed: {}", e),
@@ -2682,15 +2942,13 @@ fn cmd_health(flags: &HashMap<String, String>) {
     }
 }
 
-
-
 fn print_workspaces_table(text: &str) {
     let v: Value = serde_json::from_str(text).unwrap_or_else(|_| json!({}));
     let empty = vec![];
     let workspaces = v["workspaces"].as_array().unwrap_or(&empty);
     println!(
-        "{:<10} {:<16} {:<26} {:<8} {}",
-        "ID", "NAME", "PATH", "HOST", "CREATED"
+        "{:<10} {:<16} {:<26} {:<8} CREATED",
+        "ID", "NAME", "PATH", "HOST"
     );
     for w in workspaces {
         println!(
@@ -2699,7 +2957,10 @@ fn print_workspaces_table(text: &str) {
             w["name"].as_str().unwrap_or(""),
             w["path"].as_str().unwrap_or(""),
             w["host"].as_str().unwrap_or(""),
-            w["created_at"].as_i64().map(iso).unwrap_or_else(|| "-".into())
+            w["created_at"]
+                .as_i64()
+                .map(iso)
+                .unwrap_or_else(|| "-".into())
         );
     }
 }
@@ -2712,7 +2973,10 @@ fn cmd_clone(flags: &HashMap<String, String>, pos: &[String]) {
             return;
         }
     };
-    let protocol = flags.get("protocol").cloned().unwrap_or_else(|| "https".into());
+    let protocol = flags
+        .get("protocol")
+        .cloned()
+        .unwrap_or_else(|| "https".into());
     let dir = flags.get("dir").cloned();
     if let Some(h) = resolve_host(flags) {
         let body = json!({"input": input, "dir": dir, "protocol": protocol});
@@ -2721,7 +2985,10 @@ fn cmd_clone(flags: &HashMap<String, String>, pos: &[String]) {
             Ok((code, text)) if (200..300).contains(&code) => {
                 let v: Value = serde_json::from_str(&text).unwrap_or_else(|_| json!({}));
                 if flags.contains_key("json") {
-                    println!("{}", serde_json::to_string_pretty(&v["workspace"]).unwrap_or_default());
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&v["workspace"]).unwrap_or_default()
+                    );
                 } else {
                     println!(
                         "cloned {} → {}",
@@ -2796,8 +3063,8 @@ fn cmd_workspace_ls(flags: &HashMap<String, String>) {
     }
     if !flags.contains_key("no-headers") {
         println!(
-            "{:<10} {:<16} {:<26} {:<8} {}",
-            "ID", "NAME", "PATH", "HOST", "CREATED"
+            "{:<10} {:<16} {:<26} {:<8} CREATED",
+            "ID", "NAME", "PATH", "HOST"
         );
     }
     for w in &reg.workspaces {
@@ -2817,7 +3084,10 @@ fn cmd_workspace_create(flags: &HashMap<String, String>, pos: &[String]) {
         Some(n) if !n.trim().is_empty() => n.clone(),
         _ => return usage_error("usage: roamway workspace create <name> --path DIR"),
     };
-    let path = match flags.get("path").filter(|p| !p.trim().is_empty() && p.as_str() != "true") {
+    let path = match flags
+        .get("path")
+        .filter(|p| !p.trim().is_empty() && p.as_str() != "true")
+    {
         Some(p) => p.clone(),
         None => return usage_error("--path is required"),
     };
@@ -2870,7 +3140,11 @@ fn cmd_workspace_setup(flags: &HashMap<String, String>, pos: &[String]) {
         }
     };
     let store = terminals::TerminalStore::load(&dir);
-    let script = match store.scripts.iter().find(|s| s.name == name || s.id == name) {
+    let script = match store
+        .scripts
+        .iter()
+        .find(|s| s.name == name || s.id == name)
+    {
         Some(s) => s.clone(),
         None => {
             eprintln!("no setup script for {}", name);
@@ -2888,14 +3162,18 @@ fn cmd_workspace_setup(flags: &HashMap<String, String>, pos: &[String]) {
         c
     };
     cmd.current_dir(&ws.path);
-    cmd.stdin(Stdio::null()).stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
     match cmd.status() {
         Ok(st) if st.success() => {}
         Ok(st) => {
             eprintln!(
                 "setup {} exited {}",
                 name,
-                st.code().map(|c| c.to_string()).unwrap_or_else(|| "-".into())
+                st.code()
+                    .map(|c| c.to_string())
+                    .unwrap_or_else(|| "-".into())
             );
             fail(1);
         }
@@ -2941,13 +3219,17 @@ fn probe_run_status(flags: &HashMap<String, String>, id: &str) -> Option<String>
     let (base, token) = if let Some(h) = resolve_host(flags) {
         (
             hosts::endpoint_normalize(&h.endpoint),
-            if h.token.is_empty() { None } else { Some(h.token.clone()) },
+            if h.token.is_empty() {
+                None
+            } else {
+                Some(h.token.clone())
+            },
         )
     } else {
         let c = local_client(flags);
         (c.base.clone(), c.token.clone())
     };
-    let url = format!("{}{}", base.trim_end_matches('/'), format!("/v1/runs/{}", id));
+    let url = format!("{}/v1/runs/{}", base.trim_end_matches('/'), id);
     let mut r = ureq::get(&url).timeout(Duration::from_secs(10));
     if let Some(t) = &token {
         r = r.set("x-roamway-token", t);
@@ -2957,7 +3239,7 @@ fn probe_run_status(flags: &HashMap<String, String>, id: &str) -> Option<String>
             let v: Value = resp.into_json().ok()?;
             Some(v["run"]["status"].as_str().unwrap_or("").to_string())
         }
-        Err(ureq::Error::Status(code, _)) if code == 404 => None,
+        Err(ureq::Error::Status(404, _)) => None,
         Err(_) => None,
     }
 }
@@ -3045,7 +3327,10 @@ fn cmd_heartbeat(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_heartbeat_ls(flags: &HashMap<String, String>) {
     match request(flags, "GET", "/v1/schedules", None) {
         Ok(v) => {
-            let agent = flags.get("agent").cloned().filter(|a| !a.is_empty() && a != "true");
+            let agent = flags
+                .get("agent")
+                .cloned()
+                .filter(|a| !a.is_empty() && a != "true");
             let mut out = v.clone();
             if let Some(ag) = &agent {
                 let filtered: Vec<Value> = out
@@ -3053,7 +3338,9 @@ fn cmd_heartbeat_ls(flags: &HashMap<String, String>) {
                     .and_then(|s| s.as_array())
                     .map(|arr| {
                         arr.iter()
-                            .filter(|s| s.get("agent").and_then(|a| a.as_str()) == Some(ag.as_str()))
+                            .filter(|s| {
+                                s.get("agent").and_then(|a| a.as_str()) == Some(ag.as_str())
+                            })
                             .cloned()
                             .collect()
                     })
@@ -3074,8 +3361,8 @@ fn cmd_heartbeat_ls(flags: &HashMap<String, String>) {
             }
             if !flags.contains_key("no-headers") {
                 println!(
-                    "{:<13} {:<20} {:<26} {:<6} {:<26} {}",
-                    "ID", "NAME", "NEXT", "RUNS", "LAST", "CRON"
+                    "{:<13} {:<20} {:<26} {:<6} {:<26} CRON",
+                    "ID", "NAME", "NEXT", "RUNS", "LAST"
                 );
             }
             for s in scheds {
@@ -3083,9 +3370,15 @@ fn cmd_heartbeat_ls(flags: &HashMap<String, String>) {
                     "{:<13} {:<20} {:<26} {:<6} {:<26} {}",
                     s["id"].as_str().unwrap_or(""),
                     trunc(s["name"].as_str().unwrap_or(""), 20),
-                    s["next_run_at"].as_i64().map(iso).unwrap_or_else(|| "-".into()),
+                    s["next_run_at"]
+                        .as_i64()
+                        .map(iso)
+                        .unwrap_or_else(|| "-".into()),
                     s["runs_count"].as_u64().unwrap_or(0),
-                    s["last_run_at"].as_i64().map(iso).unwrap_or_else(|| "-".into()),
+                    s["last_run_at"]
+                        .as_i64()
+                        .map(iso)
+                        .unwrap_or_else(|| "-".into()),
                     trunc(s["cron"].as_str().unwrap_or("-"), 24)
                 );
             }
@@ -3100,7 +3393,11 @@ fn cmd_heartbeat_create(flags: &HashMap<String, String>, pos: &[String]) {
         usage_error("--name is required");
         return;
     }
-    let agent = flags.get("agent").cloned().filter(|a| !a.is_empty() && a != "true").unwrap_or_default();
+    let agent = flags
+        .get("agent")
+        .cloned()
+        .filter(|a| !a.is_empty() && a != "true")
+        .unwrap_or_default();
     if agent.is_empty() {
         usage_error("--agent is required");
         return;
@@ -3115,8 +3412,14 @@ fn cmd_heartbeat_create(flags: &HashMap<String, String>, pos: &[String]) {
         usage_error("prompt is required");
         return;
     }
-    let cron = flags.get("cron").cloned().filter(|v| !v.is_empty() && v != "true");
-    let every = flags.get("every").cloned().filter(|v| !v.is_empty() && v != "true");
+    let cron = flags
+        .get("cron")
+        .cloned()
+        .filter(|v| !v.is_empty() && v != "true");
+    let every = flags
+        .get("every")
+        .cloned()
+        .filter(|v| !v.is_empty() && v != "true");
     if cron.is_none() && every.is_none() {
         usage_error("--cron or --every is required");
         return;
@@ -3145,7 +3448,10 @@ fn cmd_heartbeat_create(flags: &HashMap<String, String>, pos: &[String]) {
                     "created {} {}\tnext={}",
                     s["id"].as_str().unwrap_or(""),
                     s["name"].as_str().unwrap_or(""),
-                    s["next_run_at"].as_i64().map(iso).unwrap_or_else(|| "-".into())
+                    s["next_run_at"]
+                        .as_i64()
+                        .map(iso)
+                        .unwrap_or_else(|| "-".into())
                 );
             }
         }
@@ -3156,7 +3462,11 @@ fn cmd_heartbeat_create(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_heartbeat_update(flags: &HashMap<String, String>, pos: &[String]) {
     let key = match pos.first() {
         Some(k) if !k.trim().is_empty() => k.clone(),
-        _ => return usage_error("usage: roamway heartbeat update <id> [--name --agent --cron|--every --prompt]"),
+        _ => {
+            return usage_error(
+                "usage: roamway heartbeat update <id> [--name --agent --cron|--every --prompt]",
+            )
+        }
     };
     let mut body = json!({
         "name": flags.get("name"),
@@ -3166,17 +3476,25 @@ fn cmd_heartbeat_update(flags: &HashMap<String, String>, pos: &[String]) {
         "prompt": flags.get("prompt"),
         "max_runs": flags.get("max-runs").and_then(|v| v.parse::<u64>().ok()),
         "timezone": flags.get("tz"),
-        "enabled": flags.contains_key("enabled").then(|| true),
+        "enabled": flags.contains_key("enabled").then_some(true),
     });
     if flags.contains_key("disabled") {
         body["enabled"] = json!(false);
     }
-    match request(flags, "PATCH", &format!("/v1/schedules/{}", key), Some(body)) {
+    match request(
+        flags,
+        "PATCH",
+        &format!("/v1/schedules/{}", key),
+        Some(body),
+    ) {
         Ok(v) => {
             if format_is_json(flags) || format_is_yaml(flags) {
                 print_formatted(flags, &v["schedule"]);
             } else {
-                println!("{}", serde_json::to_string_pretty(&v["schedule"]).unwrap_or_default());
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&v["schedule"]).unwrap_or_default()
+                );
             }
         }
         Err(e) => eprintln!("heartbeat update failed: {}", e),
@@ -3239,8 +3557,8 @@ fn cmd_terminal(flags: &HashMap<String, String>, pos: &[String]) {
                 let empty = Vec::new();
                 let list = v["terminals"].as_array().unwrap_or(&empty);
                 println!(
-                    "{:<14} {:<16} {:<8} {:<7} {:>9} {}",
-                    "ID", "NAME", "STATE", "PID", "BYTES", "WORKSPACE"
+                    "{:<14} {:<16} {:<8} {:<7} {:>9} WORKSPACE",
+                    "ID", "NAME", "STATE", "PID", "BYTES"
                 );
                 for t in list {
                     println!(
@@ -3325,14 +3643,23 @@ fn cmd_script(flags: &HashMap<String, String>, pos: &[String]) {
                 }
                 let empty = Vec::new();
                 let list = v["scripts"].as_array().unwrap_or(&empty);
-                println!("{:<16} {:<9} {:<7} {:<6} {}", "NAME", "STATE", "PID", "EXIT", "CMD");
+                println!(
+                    "{:<16} {:<9} {:<7} {:<6} CMD",
+                    "NAME", "STATE", "PID", "EXIT"
+                );
                 for s in list {
                     println!(
                         "{:<16} {:<9} {:<7} {:<6} {}",
                         s["name"].as_str().unwrap_or(""),
                         s["state"].as_str().unwrap_or(""),
-                        s["pid"].as_u64().map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
-                        s["last_exit"].as_i64().map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+                        s["pid"]
+                            .as_u64()
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "-".into()),
+                        s["last_exit"]
+                            .as_i64()
+                            .map(|p| p.to_string())
+                            .unwrap_or_else(|| "-".into()),
                         s["cmd"].as_str().unwrap_or("")
                     );
                 }
@@ -3343,7 +3670,9 @@ fn cmd_script(flags: &HashMap<String, String>, pos: &[String]) {
             let name = flags.get("name").cloned().unwrap_or_default();
             let cmd = flags.get("cmd").cloned().unwrap_or_default();
             if name.trim().is_empty() || cmd.trim().is_empty() {
-                return usage_error("usage: roamway script add --name N --cmd \"...\" [--workspace DIR]");
+                return usage_error(
+                    "usage: roamway script add --name N --cmd \"...\" [--workspace DIR]",
+                );
             }
             let body = json!({
                 "name": name,
@@ -3353,7 +3682,10 @@ fn cmd_script(flags: &HashMap<String, String>, pos: &[String]) {
             match c.req("POST", "/v1/scripts", Some(body)) {
                 Ok(v) => {
                     if json_out {
-                        println!("{}", serde_json::to_string_pretty(&v["script"]).unwrap_or_default());
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&v["script"]).unwrap_or_default()
+                        );
                     } else {
                         println!("added {}", v["script"]["name"].as_str().unwrap_or(&name));
                     }
@@ -3380,14 +3712,20 @@ fn cmd_script(flags: &HashMap<String, String>, pos: &[String]) {
             match c.req("POST", &format!("/v1/scripts/{}/{}", name, action), None) {
                 Ok(v) => {
                     if json_out {
-                        println!("{}", serde_json::to_string_pretty(&v["script"]).unwrap_or_default());
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&v["script"]).unwrap_or_default()
+                        );
                     } else {
                         let s = &v["script"];
                         println!(
                             "{}\t{}\t{}",
                             s["name"].as_str().unwrap_or(name),
                             s["state"].as_str().unwrap_or(""),
-                            s["pid"].as_u64().map(|p| p.to_string()).unwrap_or_else(|| "-".into())
+                            s["pid"]
+                                .as_u64()
+                                .map(|p| p.to_string())
+                                .unwrap_or_else(|| "-".into())
                         );
                     }
                 }
@@ -3398,7 +3736,12 @@ fn cmd_script(flags: &HashMap<String, String>, pos: &[String]) {
     }
 }
 
-fn cmd_run_remote(h: &hosts::Host, flags: &HashMap<String, String>, pos: &[String], plan: &RunPlan) {
+fn cmd_run_remote(
+    h: &hosts::Host,
+    flags: &HashMap<String, String>,
+    pos: &[String],
+    plan: &RunPlan,
+) {
     let mut prompt = pos.join(" ");
     if prompt.trim().is_empty() {
         prompt = flags.get("prompt").cloned().unwrap_or_default();
@@ -3432,14 +3775,21 @@ fn cmd_run_remote(h: &hosts::Host, flags: &HashMap<String, String>, pos: &[Strin
         return;
     }
     let mut fetch_status = |rid: &str| dispatch_json(h, "GET", &format!("/v1/runs/{}", rid));
-    let mut fetch_log = |rid: &str| dispatch_json(h, "GET", &format!("/v1/runs/{}/log?tail=40", rid));
-    wait_run(flags, &id, plan.wait_timeout, &mut fetch_status, &mut fetch_log);
+    let mut fetch_log =
+        |rid: &str| dispatch_json(h, "GET", &format!("/v1/runs/{}/log?tail=40", rid));
+    wait_run(
+        flags,
+        &id,
+        plan.wait_timeout,
+        &mut fetch_status,
+        &mut fetch_log,
+    );
 }
 
 fn print_runs_table(runs: &[Value]) {
     println!(
-        "{:<10} {:<12} {:<12} {:<8} {:<20} {:<26} {}",
-        "HOST", "ID", "STATUS", "AGENT", "MODEL", "CREATED", "TITLE"
+        "{:<10} {:<12} {:<12} {:<8} {:<20} {:<26} TITLE",
+        "HOST", "ID", "STATUS", "AGENT", "MODEL", "CREATED"
     );
     for r in runs {
         println!(
@@ -3502,12 +3852,13 @@ fn cmd_ls_all(flags: &HashMap<String, String>) {
             .iter()
             .map(|h| {
                 s.spawn(move || -> Result<Vec<Value>, String> {
-                    let (code, text) = hosts::dispatch(h, "GET", &format!("/v1/runs?limit={}", limit), None)?;
+                    let (code, text) =
+                        hosts::dispatch(h, "GET", &format!("/v1/runs?limit={}", limit), None)?;
                     if !(200..300).contains(&code) {
                         return Err(format!("{}: HTTP {}: {}", h.name, code, text));
                     }
-                    let v: Value =
-                        serde_json::from_str(&text).map_err(|e| format!("{}: bad response: {}", h.name, e))?;
+                    let v: Value = serde_json::from_str(&text)
+                        .map_err(|e| format!("{}: bad response: {}", h.name, e))?;
                     Ok(v["runs"]
                         .as_array()
                         .cloned()
@@ -3550,7 +3901,10 @@ fn cmd_ls_all(flags: &HashMap<String, String>) {
 
 fn cmd_status_remote(h: &hosts::Host, id: &str) {
     match dispatch_json(h, "GET", &format!("/v1/runs/{}", id)) {
-        Ok(v) => println!("{}", serde_json::to_string_pretty(&v["run"]).unwrap_or_default()),
+        Ok(v) => println!(
+            "{}",
+            serde_json::to_string_pretty(&v["run"]).unwrap_or_default()
+        ),
         Err(e) => eprintln!("status failed: {}", e),
     }
 }
@@ -3605,10 +3959,10 @@ fn cmd_host_add(flags: &HashMap<String, String>, pos: &[String]) {
     let token = match token {
         Some(t) => t,
         None => {
-                eprintln!("token required: --token or environment {}", env_name);
-                fail(2);
-                return;
-            }
+            eprintln!("token required: --token or environment {}", env_name);
+            fail(2);
+            return;
+        }
     };
     let mut reg = registry_for(flags);
     if reg.get(name).is_some() {
@@ -3623,7 +3977,10 @@ fn cmd_host_add(flags: &HashMap<String, String>, pos: &[String]) {
         Ok(h) => {
             let entry = host_json(h);
             let _ = reg.save();
-            println!("{}", serde_json::to_string_pretty(&entry).unwrap_or_default());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&entry).unwrap_or_default()
+            );
         }
         Err(e) => eprintln!("host add failed: {}", e),
     }
@@ -3740,7 +4097,10 @@ fn cmd_host_probe(flags: &HashMap<String, String>, pos: &[String]) {
     if let Some(note) = wildcard_endpoint_note(&reg.hosts[idx].endpoint) {
         eprintln!("{}", note);
     }
-    println!("{}", serde_json::to_string_pretty(&host_json(&reg.hosts[idx])).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&host_json(&reg.hosts[idx])).unwrap_or_default()
+    );
 }
 
 /// wildcard endpoint 是 listen 地址，probe 本身连不上；文案直接给下一步，
@@ -3853,8 +4213,8 @@ fn cmd_agent_ls(flags: &HashMap<String, String>) {
             let empty = vec![];
             let agents = v["agents"].as_array().unwrap_or(&empty);
             println!(
-                "{:<12} {:<10} {:<14} {:<16} {:<22} {}",
-                "ID", "STATE", "KIND", "MODEL", "TITLE", "UPDATED"
+                "{:<12} {:<10} {:<14} {:<16} {:<22} UPDATED",
+                "ID", "STATE", "KIND", "MODEL", "TITLE"
             );
             for a in agents {
                 println!(
@@ -3896,15 +4256,40 @@ fn cmd_agent_inspect(flags: &HashMap<String, String>, pos: &[String]) {
             let resumable = v["resumable"].as_bool().unwrap_or(false);
             println!("resumable:  {}", if resumable { "yes" } else { "no" });
             let session = a["session_id"].as_str().unwrap_or("");
-            println!("session:    {}", if session.is_empty() { "-" } else { session });
+            println!(
+                "session:    {}",
+                if session.is_empty() { "-" } else { session }
+            );
             println!("state:      {}", a["state"].as_str().unwrap_or(""));
             println!("parent:     {}", a["parent"].as_str().unwrap_or(""));
-            println!("history:    {} msgs", a["history"].as_array().map(|h| h.len()).unwrap_or(0));
-            println!("created_at: {}", a["created_at"].as_i64().map(iso).unwrap_or_else(|| "-".into()));
-            println!("updated_at: {}", a["updated_at"].as_i64().map(iso).unwrap_or_else(|| "-".into()));
+            println!(
+                "history:    {} msgs",
+                a["history"].as_array().map(|h| h.len()).unwrap_or(0)
+            );
+            println!(
+                "created_at: {}",
+                a["created_at"]
+                    .as_i64()
+                    .map(iso)
+                    .unwrap_or_else(|| "-".into())
+            );
+            println!(
+                "updated_at: {}",
+                a["updated_at"]
+                    .as_i64()
+                    .map(iso)
+                    .unwrap_or_else(|| "-".into())
+            );
             println!("last_run:   {}", a["last_run_id"].as_str().unwrap_or(""));
             let last_error = a["last_error"].as_str().unwrap_or("");
-            println!("last_error: {}", if last_error.is_empty() { "-" } else { last_error });
+            println!(
+                "last_error: {}",
+                if last_error.is_empty() {
+                    "-"
+                } else {
+                    last_error
+                }
+            );
             let empty = vec![];
             let runs = v["runs"].as_array().unwrap_or(&empty);
             if let Some(run) = runs.first() {
@@ -3924,8 +4309,14 @@ fn cmd_agent_inspect(flags: &HashMap<String, String>, pos: &[String]) {
                     "  {:<12} {:<12} {} -> {}",
                     r["id"].as_str().unwrap_or(""),
                     r["status"].as_str().unwrap_or(""),
-                    r["created_at"].as_i64().map(iso).unwrap_or_else(|| "-".into()),
-                    r["ended_at"].as_i64().map(iso).unwrap_or_else(|| "-".into())
+                    r["created_at"]
+                        .as_i64()
+                        .map(iso)
+                        .unwrap_or_else(|| "-".into()),
+                    r["ended_at"]
+                        .as_i64()
+                        .map(iso)
+                        .unwrap_or_else(|| "-".into())
                 );
             }
         }
@@ -3952,7 +4343,12 @@ fn cmd_agent_logs(flags: &HashMap<String, String>, pos: &[String]) {
         let rid = r["id"].as_str().unwrap_or("");
         let status = r["status"].as_str().unwrap_or("");
         println!("--- {} {}", rid, status);
-        match request(flags, "GET", &format!("/v1/runs/{}/log?tail={}", rid, tail), None) {
+        match request(
+            flags,
+            "GET",
+            &format!("/v1/runs/{}/log?tail={}", rid, tail),
+            None,
+        ) {
             Ok(l) => println!("{}", l["log"].as_str().unwrap_or("")),
             Err(e) => eprintln!("  log fetch failed: {}", e),
         }
@@ -3964,7 +4360,10 @@ fn cmd_agent_wait(flags: &HashMap<String, String>, pos: &[String]) {
         Some(i) => i,
         None => return usage_error("usage: roamway wait <id> [--timeout 60]"),
     };
-    let timeout = flags.get("timeout").and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+    let timeout = flags
+        .get("timeout")
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
     let started = std::time::Instant::now();
     loop {
         if timeout > 0 && started.elapsed().as_secs() > timeout {
@@ -4015,7 +4414,12 @@ fn cmd_agent_reload(flags: &HashMap<String, String>, pos: &[String]) {
         Some(i) => i,
         None => return usage_error("usage: roamway agent reload <id>"),
     };
-    match request(flags, "POST", &format!("/v1/agents/{}/reload", id), Some(json!({}))) {
+    match request(
+        flags,
+        "POST",
+        &format!("/v1/agents/{}/reload", id),
+        Some(json!({})),
+    ) {
         Ok(v) => {
             if flags.contains_key("json") {
                 println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
@@ -4030,7 +4434,9 @@ fn cmd_agent_reload(flags: &HashMap<String, String>, pos: &[String]) {
 fn cmd_agent_update(flags: &HashMap<String, String>, pos: &[String]) {
     let id = match pos.first() {
         Some(i) => i,
-        None => return usage_error("usage: roamway agent update <id> [--title --model --workspace]"),
+        None => {
+            return usage_error("usage: roamway agent update <id> [--title --model --workspace]")
+        }
     };
     let body = json!({
         "title": flags.get("title"),
@@ -4097,8 +4503,18 @@ fn ui_target(flags: &HashMap<String, String>) -> &'static str {
 
 fn cmd_ui(flags: &HashMap<String, String>, pos: &[String]) {
     const UI_FLAGS: &[&str] = &[
-        "print", "board", "host", "data", "home", "token", "format", "json", "quiet",
-        "no-color", "no-headers", "bind",
+        "print",
+        "board",
+        "host",
+        "data",
+        "home",
+        "token",
+        "format",
+        "json",
+        "quiet",
+        "no-color",
+        "no-headers",
+        "bind",
     ];
     for key in flags.keys() {
         if !UI_FLAGS.contains(&key.as_str()) {
@@ -4129,7 +4545,12 @@ fn cmd_agent_detach(flags: &HashMap<String, String>, pos: &[String]) {
         Some(i) => i,
         None => return usage_error("usage: roamway agent detach <id>"),
     };
-    match request(flags, "POST", &format!("/v1/agents/{}/detach", id), Some(json!({}))) {
+    match request(
+        flags,
+        "POST",
+        &format!("/v1/agents/{}/detach", id),
+        Some(json!({})),
+    ) {
         Ok(v) => {
             if v["detached"].as_bool() == Some(false) {
                 println!("already independent");
@@ -4254,7 +4675,154 @@ fn cmd_daemon(flags: &HashMap<String, String>, pos: &[String]) {
         "reload" => cmd_daemon_reload(flags),
         "pair" => cmd_daemon_pair(flags),
         "set-password" => cmd_daemon_set_password(flags),
-        _ => usage_error("usage: roamway daemon status|config|start|stop|restart|reload|pair|set-password|run"),
+        _ => usage_error(
+            "usage: roamway daemon status|config|start|stop|restart|reload|pair|set-password|run",
+        ),
+    }
+}
+
+/// status 的 bind/pid 判定抽成纯函数：alive 只回答 pid 是否存活，不碰端口。
+/// 返回 (effective_bind, bind_source, pid, stale_pid)；pid 为 None 表示不要联网。
+fn status_target(
+    data: &std::path::Path,
+    cfg_bind: &str,
+    alive: &dyn Fn(u32) -> bool,
+) -> (String, &'static str, Option<u32>, Option<u32>) {
+    const DEFAULT_BIND: &str = "127.0.0.1:8796";
+    let writer = backup::writer_lock_owner(data);
+    let writer_live = writer.as_ref().filter(|(owner, _)| alive(*owner));
+    let (bind, bind_source) = match writer_live {
+        Some((_, owner_bind)) => (owner_bind.clone(), "writer"),
+        None if cfg_bind.trim().is_empty() => (DEFAULT_BIND.to_string(), "default"),
+        None => (cfg_bind.to_string(), "config"),
+    };
+    let pid_file = backup::pid_file_owner(data);
+    let (pid, stale_pid) = match writer_live {
+        Some((owner, _)) => match pid_file {
+            Some(pf) if pf != *owner => (Some(*owner), Some(pf)),
+            _ => (Some(*owner), None),
+        },
+        None => match pid_file {
+            Some(pf) if alive(pf) => (Some(pf), None),
+            Some(pf) => (None, Some(pf)),
+            None => (None, None),
+        },
+    };
+    (bind, bind_source, pid, stale_pid)
+}
+
+/// status 的“无活体”JSON 基座（纯函数）：不联网、不碰端口，活体实例的 health/readyz 结果
+/// 由 cmd_daemon_status 覆盖。stale_pid 为 pid 文件里已死的 pid。
+fn offline_status(
+    data: &std::path::Path,
+    config_file: &std::path::Path,
+    effective_bind: &str,
+    bind_source: &str,
+    stale_pid: Option<u32>,
+) -> Value {
+    let error = match stale_pid {
+        Some(n) => format!("stale pid file (pid {} not running)", n),
+        None => "not running".to_string(),
+    };
+    let stale_json = match stale_pid {
+        Some(n) => json!(n),
+        None => Value::Null,
+    };
+    json!({
+        "ok": false,
+        "error": error,
+        "version": "",
+        "uptime_s": 0,
+        "pid": Value::Null,
+        "data_dir": data.to_string_lossy(),
+        "config_file": config_file.to_string_lossy(),
+        "effective_bind": effective_bind,
+        "bind_source": bind_source,
+        "stale_pid": stale_json,
+        "ready": false,
+        "ready_reason": Value::Null,
+        "store_source": "offline",
+        "store_error": Value::Null,
+        "store": inspect_store_health(data).as_str(),
+    })
+}
+
+struct ReadyVerdict {
+    store: Option<String>,
+    ready: bool,
+    ready_reason: Option<String>,
+    store_source: &'static str,
+    store_error: Option<String>,
+}
+
+/// /readyz 回包的判定纯函数：status 里 ready/store 相关键完全由此决定。
+fn readyz_verdict(code: u16, body: &Value) -> ReadyVerdict {
+    let reason = body.get("reason").and_then(Value::as_str);
+    let store = body.get("store").and_then(Value::as_str);
+    match code {
+        200 => match store {
+            Some(s) => ReadyVerdict {
+                store: Some(s.to_string()),
+                ready: true,
+                ready_reason: None,
+                store_source: "live",
+                store_error: None,
+            },
+            None => ReadyVerdict {
+                store: None,
+                ready: false,
+                ready_reason: None,
+                store_source: "offline",
+                store_error: Some("readyz 200 without store".to_string()),
+            },
+        },
+        503 => match reason {
+            Some("state_unreadable") => ReadyVerdict {
+                store: Some("unrecoverable".to_string()),
+                ready: false,
+                ready_reason: Some("state_unreadable".to_string()),
+                store_source: "live",
+                store_error: None,
+            },
+            Some("busy") => ReadyVerdict {
+                store: None,
+                ready: false,
+                ready_reason: Some("busy".to_string()),
+                store_source: "offline",
+                store_error: None,
+            },
+            other => ReadyVerdict {
+                store: None,
+                ready: false,
+                ready_reason: other.map(str::to_string),
+                store_source: "offline",
+                store_error: Some(format!("readyz HTTP 503 {}", other.unwrap_or("unknown"))),
+            },
+        },
+        401 => ReadyVerdict {
+            store: None,
+            ready: false,
+            ready_reason: None,
+            store_source: "offline",
+            store_error: Some(
+                body.get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("token unavailable")
+                    .to_string(),
+            ),
+        },
+        _ => ReadyVerdict {
+            store: None,
+            ready: false,
+            ready_reason: None,
+            store_source: "offline",
+            store_error: Some(
+                body.get("error")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("readyz HTTP {}", code)),
+            ),
+        },
     }
 }
 
@@ -4279,33 +4847,30 @@ fn cmd_daemon_status(flags: &HashMap<String, String>) {
     }
     let data = data_dir_for(flags);
     let config_file = data.join("config.json");
-    let effective_bind = resolved_config(flags)
-        .map(|c| c.bind)
-        .unwrap_or_else(|_| "127.0.0.1:8796".to_string());
-    let mut status = json!({
-        "ok": false,
-        "error": "not running",
-        "version": "",
-        "uptime_s": 0,
-        "pid": Value::Null,
-        "data_dir": data.to_string_lossy(),
-        "config_file": config_file.to_string_lossy(),
-        "effective_bind": effective_bind.clone(),
-    });
+    let cfg_bind = resolved_config(flags).ok().map(|c| c.bind);
+    let (effective_bind, bind_source, pid, stale_pid) = status_target(
+        &data,
+        cfg_bind.as_deref().unwrap_or(""),
+        &(backup::process_alive as fn(u32) -> bool),
+    );
+    let mut status = offline_status(&data, &config_file, &effective_bind, bind_source, stale_pid);
     let writer = backup::writer_lock_owner(&data);
-    status["store"] = json!(inspect_store_health(&data).as_str());
     status["writer"] = match &writer {
         Some((writer_pid, writer_bind)) => json!({"pid": writer_pid, "bind": writer_bind}),
         None => Value::Null,
     };
-    if let Some((pid, bind)) = read_pid(flags) {
-        status["pid"] = json!(pid);
-        let c = Client {
-            base: hosts::endpoint_normalize(&bind),
+    if let Some(alive_pid) = pid {
+        status["pid"] = json!(alive_pid);
+        status["stale_pid"] = match stale_pid {
+            Some(n) => json!(n),
+            None => Value::Null,
+        };
+        let client = Client {
+            base: hosts::endpoint_normalize(&effective_bind),
             token: local_token(flags),
         };
-        match c.req("GET", "/health", None) {
-            Ok(v) => {
+        match client.req_status("/health") {
+            (200, Ok(v)) => {
                 status["ok"] = json!(true);
                 status["version"] = v["version"].clone();
                 status["uptime_s"] = v["uptime_s"].clone();
@@ -4313,34 +4878,81 @@ fn cmd_daemon_status(flags: &HashMap<String, String>) {
                 status["queued"] = v["queued"].clone();
                 status["error"] = Value::Null;
             }
-            Err(e) => status["error"] = json!(e),
+            _ => {
+                status["error"] = json!(format!("healthz unreachable at {}", effective_bind));
+            }
         }
+        let (code, parsed) = client.req_status("/readyz");
+        let verdict = match parsed {
+            Ok(body) => readyz_verdict(code, &body),
+            Err(e) => ReadyVerdict {
+                store: None,
+                ready: false,
+                ready_reason: None,
+                store_source: "offline",
+                store_error: Some(e),
+            },
+        };
+        if let Some(s) = verdict.store {
+            status["store"] = json!(s);
+        }
+        status["store_source"] = json!(verdict.store_source);
+        status["ready"] = json!(verdict.ready);
+        status["ready_reason"] = match verdict.ready_reason {
+            Some(r) => json!(r),
+            None => Value::Null,
+        };
+        status["store_error"] = match verdict.store_error {
+            Some(e) => json!(e),
+            None => Value::Null,
+        };
     }
     if flags.contains_key("json") {
-        println!("{}", serde_json::to_string_pretty(&status).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&status).unwrap_or_default()
+        );
         return;
     }
     let store_label = status["store"].as_str().unwrap_or("unknown");
     let writer_text = match &writer {
-        Some((writer_pid, writer_bind)) => format!("writer pid {} bind {}", writer_pid, writer_bind),
+        Some((writer_pid, writer_bind)) => {
+            format!("writer pid {} bind {}", writer_pid, writer_bind)
+        }
         None => "writer none".to_string(),
     };
-    if status["pid"].is_null() {
-        println!("daemon offline | data {}", data.display());
-        println!("config {}  effective_bind {}", config_file.display(), effective_bind);
-        println!("store {}  {}", store_label, writer_text);
-        return;
-    }
+    let online = status["ok"].as_bool().unwrap_or(false);
+    let version_text = status["version"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("-");
+    let pid_text = status["pid"]
+        .as_u64()
+        .map(|p| p.to_string())
+        .unwrap_or_else(|| "-".into());
+    let ready_text = if status["ready"].as_bool().unwrap_or(false) {
+        "yes"
+    } else {
+        "no"
+    };
     println!(
         "daemon {} | version {} | pid {} | uptime {}s | data {}",
-        if status["ok"].as_bool().unwrap_or(false) { "online" } else { "offline" },
-        status["version"].as_str().unwrap_or("-"),
-        status["pid"].as_u64().map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+        if online { "online" } else { "offline" },
+        version_text,
+        pid_text,
         status["uptime_s"].as_i64().unwrap_or(0),
         status["data_dir"].as_str().unwrap_or("-")
     );
-    println!("config {}  effective_bind {}", config_file.display(), effective_bind);
-    println!("store {}  {}", store_label, writer_text);
+    println!(
+        "config {}  effective_bind {} ({})",
+        config_file.display(),
+        effective_bind,
+        bind_source
+    );
+    println!(
+        "store {}  {}  ready {}",
+        store_label, writer_text, ready_text
+    );
 }
 
 fn cmd_daemon_config(flags: &HashMap<String, String>, pos: &[String]) {
@@ -4624,10 +5236,10 @@ fn cmd_daemon_pair(flags: &HashMap<String, String>) {
     let token = match token {
         Some(t) => t,
         None => {
-                eprintln!("token required: --token, ROAMWAY_TOKEN, or <data>/token");
-                fail(2);
-                return;
-            }
+            eprintln!("token required: --token, ROAMWAY_TOKEN, or <data>/token");
+            fail(2);
+            return;
+        }
     };
     let bind = flags
         .get("bind")
@@ -4703,7 +5315,7 @@ fn cmd_token_create(flags: &HashMap<String, String>, data: &std::path::Path) {
     let ttl = flags.get("ttl").and_then(|v| auth::parse_ttl(v));
     let mut store = auth::TokenStore::load(data);
     let (id, plain) = store.create(name_opt.clone(), scopes.clone(), ttl);
-    let name = name_opt.unwrap_or_else(|| format!("token-{}", &id));
+    let name = name_opt.unwrap_or_else(|| format!("token-{}", id));
     if flags.contains_key("json") {
         println!(
             "{}",
@@ -4732,14 +5344,20 @@ fn cmd_token_ls(flags: &HashMap<String, String>, data: &std::path::Path) {
     let store = auth::TokenStore::load(data);
     let tokens = store.list();
     if flags.contains_key("json") {
-        println!("{}", serde_json::to_string_pretty(&tokens).unwrap_or_default());
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&tokens).unwrap_or_default()
+        );
         return;
     }
     if tokens.is_empty() {
         println!("no tokens");
         return;
     }
-    println!("{:<34} {:<20} {:<18} {:<21} sha256", "id", "name", "scopes", "expires");
+    println!(
+        "{:<34} {:<20} {:<18} {:<21} sha256",
+        "id", "name", "scopes", "expires"
+    );
     for t in &tokens {
         let name: String = t.name.chars().take(20).collect();
         let exp = match t.expires_at {
@@ -4777,8 +5395,7 @@ fn cmd_pair(flags: &HashMap<String, String>) {
     let endpoint = format!("{}/v1/auth/pair", host.trim_end_matches('/'));
     let exchange = format!(
         "curl -X POST {} -H 'content-type: application/json' -d '{{\"code\":\"{}\"}}'",
-        endpoint,
-        code
+        endpoint, code
     );
     if flags.contains_key("json") {
         println!(
@@ -4802,8 +5419,15 @@ fn cmd_approve(flags: &HashMap<String, String>, pos: &[String]) {
         usage_error("usage: roamway approve <id>");
         return;
     }
-    match request(flags, "POST", &format!("/v1/approvals/{}/approve", id), None) {
-        Ok(v) if flags.contains_key("json") => println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default()),
+    match request(
+        flags,
+        "POST",
+        &format!("/v1/approvals/{}/approve", id),
+        None,
+    ) {
+        Ok(v) if flags.contains_key("json") => {
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default())
+        }
         Ok(v) => println!("{} {}", id, v["status"].as_str().unwrap_or("approved")),
         Err(e) => eprintln!("approve failed: {}", e),
     }
@@ -4816,21 +5440,31 @@ fn cmd_deny(flags: &HashMap<String, String>, pos: &[String]) {
         return;
     }
     match request(flags, "POST", &format!("/v1/approvals/{}/deny", id), None) {
-        Ok(v) if flags.contains_key("json") => println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default()),
+        Ok(v) if flags.contains_key("json") => {
+            println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default())
+        }
         Ok(v) => println!("{} {}", id, v["status"].as_str().unwrap_or("denied")),
         Err(e) => eprintln!("deny failed: {}", e),
     }
 }
 
 fn cmd_approvals(flags: &HashMap<String, String>) {
-    let path = if flags.contains_key("all") { "/v1/approvals?all=1" } else { "/v1/approvals" };
+    let path = if flags.contains_key("all") {
+        "/v1/approvals?all=1"
+    } else {
+        "/v1/approvals"
+    };
     match request(flags, "GET", path, None) {
         Ok(v) => {
             if format_is_json(flags) || format_is_yaml(flags) {
                 print_formatted(flags, &v);
                 return;
             }
-            let arr = v.get("approvals").and_then(|a| a.as_array()).cloned().unwrap_or_default();
+            let arr = v
+                .get("approvals")
+                .and_then(|a| a.as_array())
+                .cloned()
+                .unwrap_or_default();
             if flags.contains_key("quiet") {
                 for a in &arr {
                     println!("{}", a["id"].as_str().unwrap_or("-"));
@@ -4842,10 +5476,7 @@ fn cmd_approvals(flags: &HashMap<String, String>) {
                 return;
             }
             if !flags.contains_key("no-headers") {
-                println!(
-                    "{:<34} {:<8} {:<6} {} {}",
-                    "ID", "STATUS", "METHOD", "PATH", "TS"
-                );
+                println!("{:<34} {:<8} {:<6} PATH TS", "ID", "STATUS", "METHOD");
             }
             for a in &arr {
                 println!(
@@ -4882,9 +5513,23 @@ fn cmd_onboard(flags: &HashMap<String, String>) {
     let serve = format!("roamway serve --bind {} --data {}", bind, data.display());
     let log = data.join("roamway.log");
     println!("token:    {}", token_file.display());
-    println!("foreground:  ROAMWAY_TOKEN=$(cat {}) {}", token_file.display(), serve);
-    println!("background:  nohup env ROAMWAY_TOKEN=$(cat {}) {} >>{} 2>&1 &", token_file.display(), serve, log.display());
-    println!("crontab:     @reboot /usr/bin/env ROAMWAY_TOKEN=$(cat {}) {} >>{} 2>&1", token_file.display(), serve, log.display());
+    println!(
+        "foreground:  ROAMWAY_TOKEN=$(cat {}) {}",
+        token_file.display(),
+        serve
+    );
+    println!(
+        "background:  nohup env ROAMWAY_TOKEN=$(cat {}) {} >>{} 2>&1 &",
+        token_file.display(),
+        serve,
+        log.display()
+    );
+    println!(
+        "crontab:     @reboot /usr/bin/env ROAMWAY_TOKEN=$(cat {}) {} >>{} 2>&1",
+        token_file.display(),
+        serve,
+        log.display()
+    );
     let port = bind_parts(&bind).map(|(_, p)| p).unwrap_or(8796);
     println!(
         "other machine: roamway host add nas --endpoint http://{}:{} --token $ROAMWAY_TOKEN",
@@ -4915,8 +5560,8 @@ fn cmd_provider(flags: &HashMap<String, String>, pos: &[String]) {
     match pos.first().map(String::as_str).unwrap_or("ls") {
         "ls" | "list" | "" => {
             println!(
-                "{:<14} {:<6} {:<10} {:<7} {:<9} {}",
-                "ID", "KIND", "STATUS", "MODELS", "KEY", "ENDPOINT"
+                "{:<14} {:<6} {:<10} {:<7} {:<9} ENDPOINT",
+                "ID", "KIND", "STATUS", "MODELS", "KEY"
             );
             for p in &providers {
                 let key = if p.kind == "api" {
@@ -4931,7 +5576,11 @@ fn cmd_provider(flags: &HashMap<String, String>, pos: &[String]) {
                 } else {
                     "-".to_string()
                 };
-                let endpoint = if p.base_url.is_empty() { "-".to_string() } else { p.base_url.clone() };
+                let endpoint = if p.base_url.is_empty() {
+                    "-".to_string()
+                } else {
+                    p.base_url.clone()
+                };
                 println!(
                     "{:<14} {:<6} {:<10} {:<7} {:<9} {}",
                     p.id,
@@ -4982,7 +5631,10 @@ fn cmd_provider_models(
         if flags.contains_key("refresh") && p.kind == "api" && !p.base_url.is_empty() {
             match providers::fetch_models(&p.base_url) {
                 Ok(list) => models = list,
-                Err(e) => eprintln!("roamway: refresh {} models failed: {} (using builtins)", p.id, e),
+                Err(e) => eprintln!(
+                    "roamway: refresh {} models failed: {} (using builtins)",
+                    p.id, e
+                ),
             }
         }
         let rendered = if models.is_empty() {
@@ -5016,8 +5668,8 @@ fn cmd_usage(flags: &HashMap<String, String>, pos: &[String]) {
             let provider = flags.get("provider").map(String::as_str);
             let rows = usage::aggregate(&state, since, provider);
             println!(
-                "{:<12} {:<14} {:<20} {:<6} {:<8} {:<8} {}",
-                "DAY", "PROVIDER", "MODEL", "RUNS", "IN", "OUT", "TOTAL"
+                "{:<12} {:<14} {:<20} {:<6} {:<8} {:<8} TOTAL",
+                "DAY", "PROVIDER", "MODEL", "RUNS", "IN", "OUT"
             );
             for r in rows {
                 println!(
@@ -5096,8 +5748,8 @@ fn cmd_plugin(flags: &HashMap<String, String>, pos: &[String]) {
         "ls" | "list" | "" => {
             let reg = plugins::Registry::load(&dir);
             println!(
-                "{:<16} {:<10} {:<8} {:<8} {:<8} {}",
-                "NAME", "VERSION", "ENABLED", "TRUSTED", "TIMEOUT", "ENTRY"
+                "{:<16} {:<10} {:<8} {:<8} {:<8} ENTRY",
+                "NAME", "VERSION", "ENABLED", "TRUSTED", "TIMEOUT"
             );
             for p in &reg.plugins {
                 println!(
@@ -5338,7 +5990,10 @@ mod tests {
         ];
         let (flags, _) = parse_flags(&args);
         assert_eq!(flag_many(&flags, "scope"), vec!["read", "run"]);
-        assert_eq!(flag_many(&flags, "allow-host"), vec!["a.example", "b.example"]);
+        assert_eq!(
+            flag_many(&flags, "allow-host"),
+            vec!["a.example", "b.example"]
+        );
     }
 
     #[test]
@@ -5377,7 +6032,10 @@ mod tests {
         flags.insert("host".to_string(), "wild".to_string());
         // --host name 用 registry 的 endpoint 原样访问：只修本地 bind 推导，不改远端地址
         let h = resolve_host(&flags).expect("registered host");
-        assert_eq!(hosts::endpoint_normalize(&h.endpoint), "http://0.0.0.0:8796");
+        assert_eq!(
+            hosts::endpoint_normalize(&h.endpoint),
+            "http://0.0.0.0:8796"
+        );
         // wildcard 时 probe 必须给可执行提示，而不是让人反复试 421
         let note = wildcard_endpoint_note(&h.endpoint).expect("wildcard must be called out");
         assert!(note.contains("wildcard"), "{}", note);
@@ -5436,6 +6094,122 @@ mod tests {
             Some(v) => std::env::set_var("ROAMWAY_TOKEN", v),
             None => std::env::remove_var("ROAMWAY_TOKEN"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_target_prefers_live_writer_bind_and_source() {
+        let dir = std::env::temp_dir().join(format!("roamway-status-writer-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("roamway.lock"), "18802 127.0.0.1:18802\n").unwrap();
+        let alive = |_: u32| true;
+        let (bind, source, pid, stale) = status_target(&dir, "127.0.0.1:8796", &alive);
+        assert_eq!(bind, "127.0.0.1:18802");
+        assert_eq!(source, "writer");
+        assert_eq!(pid, Some(18802));
+        assert_eq!(stale, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_target_uses_config_bind_without_live_writer() {
+        let dir = std::env::temp_dir().join(format!("roamway-status-config-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let alive = |_: u32| true;
+        let (bind, source, pid, stale) = status_target(&dir, "127.0.0.1:8796", &alive);
+        assert_eq!(bind, "127.0.0.1:8796");
+        assert_eq!(source, "config");
+        assert_eq!(pid, None);
+        assert_eq!(stale, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_target_dead_pid_file_marks_stale_and_offline() {
+        let dir = std::env::temp_dir().join(format!("roamway-status-dead-pid-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("roamway.pid"), "4242\n").unwrap();
+        let alive = |pid: u32| pid != 4242;
+        let (bind, source, pid, stale) = status_target(&dir, "127.0.0.1:9000", &alive);
+        assert_eq!(source, "config");
+        assert_eq!(pid, None);
+        assert_eq!(stale, Some(4242));
+        let status = offline_status(&dir, &dir.join("config.json"), &bind, source, stale);
+        assert_eq!(status["ok"], json!(false));
+        assert_eq!(status["uptime_s"], json!(0));
+        assert_eq!(status["pid"], Value::Null);
+        assert_eq!(status["stale_pid"], json!(4242));
+        assert!(
+            status["error"].as_str().unwrap().contains("stale pid file"),
+            "error must mention the stale pid file"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_target_writer_overrides_diverging_live_pid_file() {
+        let dir = std::env::temp_dir().join(format!("roamway-status-stale-live-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("roamway.pid"), "4242\n").unwrap();
+        std::fs::write(dir.join("roamway.lock"), "18802 127.0.0.1:18802\n").unwrap();
+        let alive = |pid: u32| pid == 4242 || pid == 18802;
+        let (bind, source, pid, stale) = status_target(&dir, "127.0.0.1:8796", &alive);
+        assert_eq!(bind, "127.0.0.1:18802");
+        assert_eq!(source, "writer");
+        assert_eq!(pid, Some(18802));
+        assert_eq!(stale, Some(4242));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_target_live_writer_wins_even_when_pid_file_is_dead() {
+        let dir = std::env::temp_dir().join(format!("roamway-status-writer-dead-file-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("roamway.pid"), "4242\n").unwrap();
+        std::fs::write(dir.join("roamway.lock"), "18802 127.0.0.1:18802\n").unwrap();
+        let alive = |pid: u32| pid == 18802;
+        let (bind, source, pid, stale) = status_target(&dir, "127.0.0.1:8796", &alive);
+        assert_eq!(bind, "127.0.0.1:18802");
+        assert_eq!(source, "writer");
+        assert_eq!(pid, Some(18802));
+        assert_eq!(stale, Some(4242));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn readyz_verdict_200_recovered_is_live_and_ready() {
+        let body = json!({"store": "recovered"});
+        let v = readyz_verdict(200, &body);
+        assert_eq!(v.store.as_deref(), Some("recovered"));
+        assert!(v.ready);
+        assert_eq!(v.store_source, "live");
+        assert_eq!(v.ready_reason, None);
+        assert_eq!(v.store_error, None);
+    }
+
+    #[test]
+    fn readyz_verdict_503_state_unreadable_is_unrecoverable() {
+        let body = json!({"reason": "state_unreadable"});
+        let v = readyz_verdict(503, &body);
+        assert_eq!(v.store.as_deref(), Some("unrecoverable"));
+        assert!(!v.ready);
+        assert_eq!(v.ready_reason.as_deref(), Some("state_unreadable"));
+        assert_eq!(v.store_source, "live");
+    }
+
+    #[test]
+    fn offline_status_store_matches_inspect_store_health() {
+        let dir = std::env::temp_dir().join(format!("roamway-status-offline-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let expected = inspect_store_health(&dir);
+        let alive = |_: u32| true;
+        let (bind, source, pid, stale) = status_target(&dir, "127.0.0.1:8796", &alive);
+        assert_eq!(pid, None);
+        assert_eq!(stale, None);
+        let status = offline_status(&dir, &dir.join("config.json"), &bind, source, stale);
+        assert_eq!(status["store_source"], json!("offline"));
+        assert_eq!(status["store"].as_str(), Some(expected.as_str()));
+        assert_eq!(status["ok"], json!(false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5518,8 +6292,16 @@ mod tests {
 
     #[test]
     fn parse_args_passes_everything_after_double_dash_through() {
-        let p = parse_args(&["run".to_string(), "--".to_string(), "-x".to_string(), "y".to_string()]);
-        assert_eq!(p.pos, vec!["run".to_string(), "-x".to_string(), "y".to_string()]);
+        let p = parse_args(&[
+            "run".to_string(),
+            "--".to_string(),
+            "-x".to_string(),
+            "y".to_string(),
+        ]);
+        assert_eq!(
+            p.pos,
+            vec!["run".to_string(), "-x".to_string(), "y".to_string()]
+        );
         assert!(p.unknown.is_empty());
 
         let (flags, pos) = parse_flags(&[
@@ -5563,7 +6345,10 @@ mod tests {
     #[test]
     fn dispatch_returns_2_for_unknown_short_flag() {
         assert_eq!(dispatch(&["-x".to_string()]), 2);
-        assert_eq!(dispatch(&["run".to_string(), "-x".to_string(), "echo".to_string()]), 2);
+        assert_eq!(
+            dispatch(&["run".to_string(), "-x".to_string(), "echo".to_string()]),
+            2
+        );
     }
 
     #[test]
@@ -5588,10 +6373,7 @@ mod tests {
             dispatch(&["prune".to_string(), "--keep".to_string(), "abc".to_string()]),
             2
         );
-        assert_eq!(
-            dispatch(&["prune".to_string(), "--bogus".to_string()]),
-            2
-        );
+        assert_eq!(dispatch(&["prune".to_string(), "--bogus".to_string()]), 2);
     }
 
     #[test]
@@ -5605,7 +6387,10 @@ mod tests {
         );
 
         let no_prompt = vec!["ag_1".to_string()];
-        assert_eq!(resume_target(&flags, &no_prompt).unwrap_err(), "prompt required");
+        assert_eq!(
+            resume_target(&flags, &no_prompt).unwrap_err(),
+            "prompt required"
+        );
 
         flags.insert("continue".to_string(), "true".to_string());
         assert!(resume_target(&flags, &pos).is_err());
@@ -5645,11 +6430,15 @@ mod tests {
 
         let mut f2: HashMap<String, String> = HashMap::new();
         f2.insert("worktree-mode".to_string(), "checkout-pr".to_string());
-        assert!(run_plan(&f2).unwrap_err().contains("checkout-pr requires --pr-number"));
+        assert!(run_plan(&f2)
+            .unwrap_err()
+            .contains("checkout-pr requires --pr-number"));
 
         let mut f3: HashMap<String, String> = HashMap::new();
         f3.insert("worktree-slug".to_string(), "slug".to_string());
-        assert!(run_plan(&f3).unwrap_err().contains("requires --new-workspace worktree"));
+        assert!(run_plan(&f3)
+            .unwrap_err()
+            .contains("requires --new-workspace worktree"));
 
         let mut f4: HashMap<String, String> = HashMap::new();
         f4.insert("env".to_string(), "1BAD=x".to_string());
@@ -5700,7 +6489,9 @@ mod tests {
 
         let mut f2: HashMap<String, String> = HashMap::new();
         f2.insert("label".to_string(), "=x".to_string());
-        assert!(ls_plan(&f2).unwrap_err().contains("label key must not be empty"));
+        assert!(ls_plan(&f2)
+            .unwrap_err()
+            .contains("label key must not be empty"));
 
         let mut f3: HashMap<String, String> = HashMap::new();
         f3.insert("label".to_string(), "team=p12".to_string());
@@ -5749,15 +6540,21 @@ mod tests {
 
         let mut thinking: BTreeMap<String, String> = BTreeMap::new();
         thinking.insert("thinking".to_string(), "bogus".to_string());
-        assert!(validate_run_options(&thinking).unwrap_err().contains("none|low|medium|high"));
+        assert!(validate_run_options(&thinking)
+            .unwrap_err()
+            .contains("none|low|medium|high"));
 
         let mut mode: BTreeMap<String, String> = BTreeMap::new();
         mode.insert("mode".to_string(), "x".to_string());
-        assert!(validate_run_options(&mode).unwrap_err().contains("read-only|workspace-write|danger-full-access"));
+        assert!(validate_run_options(&mode)
+            .unwrap_err()
+            .contains("read-only|workspace-write|danger-full-access"));
 
         let mut schema: BTreeMap<String, String> = BTreeMap::new();
         schema.insert("output_schema".to_string(), "/nope".to_string());
-        assert!(validate_run_options(&schema).unwrap_err().contains("not a JSON object with type"));
+        assert!(validate_run_options(&schema)
+            .unwrap_err()
+            .contains("not a JSON object with type"));
     }
 
     #[test]
@@ -5767,13 +6564,24 @@ mod tests {
         f.insert("mode".to_string(), "read-only".to_string());
         f.insert("provider".to_string(), "ollama".to_string());
         let plan = run_plan(&f).unwrap();
-        assert_eq!(plan.options.get("thinking").map(String::as_str), Some("high"));
-        assert_eq!(plan.options.get("mode").map(String::as_str), Some("read-only"));
-        assert_eq!(plan.options.get("provider").map(String::as_str), Some("ollama"));
+        assert_eq!(
+            plan.options.get("thinking").map(String::as_str),
+            Some("high")
+        );
+        assert_eq!(
+            plan.options.get("mode").map(String::as_str),
+            Some("read-only")
+        );
+        assert_eq!(
+            plan.options.get("provider").map(String::as_str),
+            Some("ollama")
+        );
 
         let mut w: HashMap<String, String> = HashMap::new();
         w.insert("worktree-slug".to_string(), "slug".to_string());
-        assert!(run_plan(&w).unwrap_err().contains("requires --new-workspace worktree"));
+        assert!(run_plan(&w)
+            .unwrap_err()
+            .contains("requires --new-workspace worktree"));
     }
 
     #[test]
@@ -5785,7 +6593,10 @@ mod tests {
         let pid = crate::backup::write_pid_file(&dir).unwrap();
         assert_eq!(pid, std::process::id());
         assert!(pid_path.is_file());
-        assert_eq!(crate::backup::pid_file_owner(&dir), Some(std::process::id()));
+        assert_eq!(
+            crate::backup::pid_file_owner(&dir),
+            Some(std::process::id())
+        );
         crate::backup::clear_pid_file(&dir);
         assert!(!pid_path.exists());
         let _ = std::fs::remove_dir_all(&dir);

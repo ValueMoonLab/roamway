@@ -29,7 +29,10 @@ impl BackupError {
 }
 
 fn err(code: i32, msg: impl Into<String>) -> BackupError {
-    BackupError { code, msg: msg.into() }
+    BackupError {
+        code,
+        msg: msg.into(),
+    }
 }
 
 #[derive(Debug)]
@@ -84,21 +87,24 @@ fn sha256(data: &[u8]) -> [u8; 32] {
     padded.extend_from_slice(&bit_len.to_be_bytes());
 
     let mut state: [u32; 8] = [
-        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19,
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
     ];
-    for block in padded.chunks_exact(64) {
+    for block in padded.as_chunks::<64>().0 {
         let mut w = [0u32; 64];
-        for i in 0..16 {
-            let j = i * 4;
-            w[i] = ((block[j] as u32) << 24)
-                | ((block[j + 1] as u32) << 16)
-                | ((block[j + 2] as u32) << 8)
-                | (block[j + 3] as u32);
+        for (i, chunk) in block.as_chunks::<4>().0.iter().enumerate() {
+            w[i] = ((chunk[0] as u32) << 24)
+                | ((chunk[1] as u32) << 16)
+                | ((chunk[2] as u32) << 8)
+                | (chunk[3] as u32);
         }
         for i in 16..64 {
             let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
             let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
-            w[i] = w[i - 16].wrapping_add(s0).wrapping_add(w[i - 7]).wrapping_add(s1);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
         }
         let (mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h) = (
             state[0], state[1], state[2], state[3], state[4], state[5], state[6], state[7],
@@ -106,7 +112,11 @@ fn sha256(data: &[u8]) -> [u8; 32] {
         for i in 0..64 {
             let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
             let ch = (e & f) ^ ((!e) & g);
-            let t1 = h.wrapping_add(s1).wrapping_add(ch).wrapping_add(K[i]).wrapping_add(w[i]);
+            let t1 = h
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(K[i])
+                .wrapping_add(w[i]);
             let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
             let maj = (a & b) ^ (a & c) ^ (b & c);
             let t2 = s0.wrapping_add(maj);
@@ -202,13 +212,21 @@ fn prune_backup_dirs(out: &Path, keep: usize) -> Result<usize, BackupError> {
 }
 
 /// 生成备份：只复制三件套并写 manifest；失败时删除半成品目录并返回 exit 1 语义。
-pub fn backup(data: &Path, out: &Path, keep: usize, tz_offset_hours: i64) -> Result<BackupResult, BackupError> {
+pub fn backup(
+    data: &Path,
+    out: &Path,
+    keep: usize,
+    tz_offset_hours: i64,
+) -> Result<BackupResult, BackupError> {
     fs::create_dir_all(out)
         .map_err(|e| err(1, format!("backup: cannot create {}: {}", out.display(), e)))?;
     let ts = crate::types::now();
     let dir = unique_backup_dir(out, ts, tz_offset_hours);
     if let Err(e) = fs::create_dir_all(&dir) {
-        return Err(err(1, format!("backup: cannot create {}: {}", dir.display(), e)));
+        return Err(err(
+            1,
+            format!("backup: cannot create {}: {}", dir.display(), e),
+        ));
     }
     let result = build_backup_dir(data, &dir, ts);
     if let Err(e) = result {
@@ -228,10 +246,19 @@ pub fn backup(data: &Path, out: &Path, keep: usize, tz_offset_hours: i64) -> Res
         return Err(err(1, format!("backup: cannot write manifest: {}", e)));
     }
     let pruned = prune_backup_dirs(out, keep)?;
-    Ok(BackupResult { dir, files, bytes, pruned })
+    Ok(BackupResult {
+        dir,
+        files,
+        bytes,
+        pruned,
+    })
 }
 
-fn build_backup_dir(data: &Path, dir: &Path, ts: i64) -> Result<(usize, u64, Manifest), BackupError> {
+fn build_backup_dir(
+    data: &Path,
+    dir: &Path,
+    ts: i64,
+) -> Result<(usize, u64, Manifest), BackupError> {
     let mut files = Vec::new();
     let mut total = 0u64;
     for name in BACKUP_FILES {
@@ -417,14 +444,13 @@ pub fn writer_takeover_message(data: &Path, owner_pid: u32) -> String {
     )
 }
 
-
 #[cfg(target_os = "linux")]
-fn process_alive(pid: u32) -> bool {
+pub fn process_alive(pid: u32) -> bool {
     Path::new("/proc").join(pid.to_string()).exists()
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn process_alive(pid: u32) -> bool {
+pub fn process_alive(pid: u32) -> bool {
     std::process::Command::new("ps")
         .arg("-p")
         .arg(pid.to_string())
@@ -439,7 +465,7 @@ fn process_alive(pid: u32) -> bool {
 ///
 /// 独立成纯函数是刻意的：解析坑来自本地化 INFO 行，而 NAS 门禁跑在 Linux 上看不见
 /// `#[cfg(windows)]` 分支——只有纯函数才能在任意平台被单测盯住。
-#[cfg_attr(not(windows), allow(dead_code))]
+#[cfg(any(windows, test))]
 fn pid_field_matches(csv: &str, pid: u32) -> bool {
     let want = pid.to_string();
     csv.lines().any(|line| match line.split(',').nth(1) {
@@ -449,7 +475,7 @@ fn pid_field_matches(csv: &str, pid: u32) -> bool {
 }
 
 #[cfg(windows)]
-fn process_alive(pid: u32) -> bool {
+pub fn process_alive(pid: u32) -> bool {
     // 必须用 CSV + 字段精确比较：`tasklist /NH` 在无匹配时会打印一条本地化 INFO 行
     // （zh-CN：`信息: 没有运行的任务匹配指定标准。`），判 "No tasks" 会让任何合法但已死的 pid
     // 都被当成活体 —— 中文 Windows 上 restore 因此永远要求 --force。CSV 的 INFO 行只有一个字段。
@@ -471,7 +497,11 @@ fn process_alive(pid: u32) -> bool {
 fn heartbeat_age_secs(data: &Path) -> Option<u64> {
     let modified = fs::metadata(data.join("heartbeat")).ok()?.modified().ok()?;
     let now = std::time::SystemTime::now();
-    Some(now.duration_since(modified).map(|d| d.as_secs()).unwrap_or(0))
+    Some(
+        now.duration_since(modified)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    )
 }
 
 /// 解析 `host:port`；支持 `[::1]:8796`。空 host / wildcard 不在此处归一化。
@@ -530,10 +560,16 @@ pub fn daemon_alive(data: &Path) -> Option<u32> {
 fn alive_error_message(alive: &Alive) -> String {
     match alive {
         Alive::Pid(pid) => {
-            format!("restore: daemon looks alive (pid {}); stop it or pass --force", pid)
+            format!(
+                "restore: daemon looks alive (pid {}); stop it or pass --force",
+                pid
+            )
         }
         Alive::Heartbeat(age) => {
-            format!("restore: daemon looks alive (heartbeat {}s ago); stop it or pass --force", age)
+            format!(
+                "restore: daemon looks alive (heartbeat {}s ago); stop it or pass --force",
+                age
+            )
         }
         Alive::Bind(addr) => {
             let port = parse_host_port(addr)
@@ -547,8 +583,16 @@ fn alive_error_message(alive: &Alive) -> String {
 /// 恢复备份：逐文件校验通过前不写任何字节；daemon 存活且无 --force 时 exit 3 语义。
 pub fn restore(data: &Path, from: &Path, force: bool) -> Result<RestoreResult, BackupError> {
     let manifest_path = from.join("manifest.json");
-    let raw = fs::read(&manifest_path)
-        .map_err(|e| err(1, format!("restore: missing manifest.json in {}: {}", from.display(), e)))?;
+    let raw = fs::read(&manifest_path).map_err(|e| {
+        err(
+            1,
+            format!(
+                "restore: missing manifest.json in {}: {}",
+                from.display(),
+                e
+            ),
+        )
+    })?;
     let manifest: Manifest = serde_json::from_slice(&raw)
         .map_err(|e| err(1, format!("restore: bad manifest: {}", e)))?;
     if manifest.format != BACKUP_FORMAT {
@@ -562,12 +606,26 @@ pub fn restore(data: &Path, from: &Path, force: bool) -> Result<RestoreResult, B
     let mut validated: Vec<(String, Vec<u8>)> = Vec::new();
     for f in &manifest.files {
         let p = from.join(&f.name);
-        let bytes = fs::read(&p)
-            .map_err(|e| err(1, format!("restore: {}: missing or unreadable ({}): {}", f.name, p.display(), e)))?;
+        let bytes = fs::read(&p).map_err(|e| {
+            err(
+                1,
+                format!(
+                    "restore: {}: missing or unreadable ({}): {}",
+                    f.name,
+                    p.display(),
+                    e
+                ),
+            )
+        })?;
         if bytes.len() as u64 != f.bytes {
             return Err(err(
                 1,
-                format!("restore: {}: bytes mismatch (manifest {} vs actual {})", f.name, f.bytes, bytes.len()),
+                format!(
+                    "restore: {}: bytes mismatch (manifest {} vs actual {})",
+                    f.name,
+                    f.bytes,
+                    bytes.len()
+                ),
             ));
         }
         let hex = sha256_hex(&bytes);
@@ -617,8 +675,12 @@ fn write_restore_file(dir: &Path, name: &str, bytes: &[u8], ts: i64) -> Result<(
     let p = dir.join(name);
     let tmp = dir.join(format!("{}.tmp", name));
     {
-        let mut f = fs::File::create(&tmp)
-            .map_err(|e| err(1, format!("restore: cannot create {}: {}", tmp.display(), e)))?;
+        let mut f = fs::File::create(&tmp).map_err(|e| {
+            err(
+                1,
+                format!("restore: cannot create {}: {}", tmp.display(), e),
+            )
+        })?;
         f.write_all(bytes)
             .map_err(|e| err(1, format!("restore: cannot write {}: {}", tmp.display(), e)))?;
         f.sync_all()
@@ -725,7 +787,10 @@ mod tests {
             999999
         ));
         // pid 数字出现在别的字段（内存 4242 K）不得误命中。
-        assert!(!pid_field_matches("\"a.exe\",\"11\",\"Console\",\"1\",\"4242 K\"\r\n", 4242));
+        assert!(!pid_field_matches(
+            "\"a.exe\",\"11\",\"Console\",\"1\",\"4242 K\"\r\n",
+            4242
+        ));
         // 空输出（tasklist 报错）判死。
         assert!(!pid_field_matches("", 4242));
     }
@@ -780,7 +845,10 @@ mod tests {
         fs::create_dir_all(&data).unwrap();
         dead_pid_file(&data);
         heartbeat_with_age(&data, 120);
-        assert!(daemon_probe(&data).is_none(), "三样都陈旧时必须判定为无证据");
+        assert!(
+            daemon_probe(&data).is_none(),
+            "三样都陈旧时必须判定为无证据"
+        );
         let _ = fs::remove_dir_all(&data);
     }
 
@@ -851,10 +919,8 @@ mod tests {
         assert_eq!(res.bytes, 10 + 11 + 14);
         assert_eq!(res.pruned, 0);
 
-        let manifest: Manifest = serde_json::from_slice(
-            &fs::read(res.dir.join("manifest.json")).unwrap(),
-        )
-        .unwrap();
+        let manifest: Manifest =
+            serde_json::from_slice(&fs::read(res.dir.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(manifest.format, "roamway-backup/1");
         assert_eq!(manifest.version, env!("CARGO_PKG_VERSION"));
         assert!(manifest.created_at > 0);
@@ -938,7 +1004,10 @@ mod tests {
         let e = restore(&data, &from, false).unwrap_err();
         assert_eq!(e.exit_code(), 1);
         assert!(e.message().contains("state.json"), "{}", e.message());
-        assert!(!data.join("config.json").exists(), "校验失败前不得写任何字节");
+        assert!(
+            !data.join("config.json").exists(),
+            "校验失败前不得写任何字节"
+        );
         assert!(!data.join("state.json").exists());
         let _ = fs::remove_dir_all(&data);
         let _ = fs::remove_dir_all(&from);
@@ -966,11 +1035,7 @@ mod tests {
             serde_json::to_vec_pretty(&manifest).unwrap(),
         )
         .unwrap();
-        fs::write(
-            data.join("roamway.pid"),
-            format!("{}", std::process::id()),
-        )
-        .unwrap();
+        fs::write(data.join("roamway.pid"), format!("{}", std::process::id())).unwrap();
 
         let e = restore(&data, &from, false).unwrap_err();
         assert_eq!(e.exit_code(), 3, "{}", e.message());
@@ -1003,7 +1068,11 @@ mod tests {
         let before = fs::read(&lock).unwrap();
         let err = try_acquire_writer_with(&data, "127.0.0.1:9001", 4242, &|_| true).unwrap_err();
         assert_eq!(err, (111, "10.0.0.1:9000".to_string()));
-        assert_eq!(fs::read(&lock).unwrap(), before, "lock file must be left untouched");
+        assert_eq!(
+            fs::read(&lock).unwrap(),
+            before,
+            "lock file must be left untouched"
+        );
         let _ = fs::remove_dir_all(&data);
     }
 
@@ -1011,7 +1080,11 @@ mod tests {
     fn stale_lock_taken_over_when_owner_dead() {
         let data = tmp("writer-stale");
         fs::create_dir_all(&data).unwrap();
-        fs::write(data.join("roamway.lock"), "111 10.0.0.1:9000 2020-01-01T00:00:00Z\n").unwrap();
+        fs::write(
+            data.join("roamway.lock"),
+            "111 10.0.0.1:9000 2020-01-01T00:00:00Z\n",
+        )
+        .unwrap();
         let got = try_acquire_writer_with(&data, "127.0.0.1:8796", 4242, &|_| false).unwrap();
         assert_eq!(got, 4242);
         let raw = fs::read_to_string(data.join("roamway.lock")).unwrap();
@@ -1025,7 +1098,11 @@ mod tests {
     fn stale_lock_taken_over_when_owner_is_self() {
         let data = tmp("writer-self");
         fs::create_dir_all(&data).unwrap();
-        fs::write(data.join("roamway.lock"), "4242 bind-a 2020-01-01T00:00:00Z\n").unwrap();
+        fs::write(
+            data.join("roamway.lock"),
+            "4242 bind-a 2020-01-01T00:00:00Z\n",
+        )
+        .unwrap();
         let got = try_acquire_writer_with(&data, "bind-b", 4242, &|_| true).unwrap();
         assert_eq!(got, 4242);
         let raw = fs::read_to_string(data.join("roamway.lock")).unwrap();
@@ -1053,7 +1130,11 @@ mod tests {
         fs::write(&lock, "4294967295 some-bind 2020-01-01T00:00:00Z\n").unwrap();
         release_writer(&data);
         assert!(lock.exists(), "another writer's lock must not be removed");
-        fs::write(&lock, format!("{} bind 2020-01-01T00:00:00Z\n", std::process::id())).unwrap();
+        fs::write(
+            &lock,
+            format!("{} bind 2020-01-01T00:00:00Z\n", std::process::id()),
+        )
+        .unwrap();
         release_writer(&data);
         assert!(!lock.exists());
         let _ = fs::remove_dir_all(&data);
@@ -1063,7 +1144,11 @@ mod tests {
     fn force_takeover_overwrites_live_lock() {
         let data = tmp("writer-force");
         fs::create_dir_all(&data).unwrap();
-        fs::write(data.join("roamway.lock"), "111 10.0.0.1:9000 2020-01-01T00:00:00Z\n").unwrap();
+        fs::write(
+            data.join("roamway.lock"),
+            "111 10.0.0.1:9000 2020-01-01T00:00:00Z\n",
+        )
+        .unwrap();
         let got = force_acquire_writer(&data, "127.0.0.1:8796").unwrap();
         assert_eq!(got, std::process::id());
         let raw = fs::read_to_string(data.join("roamway.lock")).unwrap();
@@ -1079,5 +1164,4 @@ mod tests {
         assert!(message.contains("4242"));
         assert!(message.contains("[::1]:8796"));
     }
-
 }

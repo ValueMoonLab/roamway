@@ -20,9 +20,7 @@ jobs:
         with:
           toolchain: stable
       - run: cargo fmt --check
-        continue-on-error: true
-      - run: cargo clippy -- -D warnings
-        continue-on-error: true
+      - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
       - run: cargo build --release
       - name: Smoke test (unix)

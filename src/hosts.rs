@@ -201,11 +201,8 @@ impl Registry {
         if let Some(parent) = self.path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let tmp = self
-            .path
-            .with_file_name("hosts.json.tmp");
-        let data = serde_json::to_vec_pretty(&self.hosts)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let tmp = self.path.with_file_name("hosts.json.tmp");
+        let data = serde_json::to_vec_pretty(&self.hosts).map_err(std::io::Error::other)?;
         let mut f = fs::File::create(&tmp)?;
         f.write_all(&data)?;
         f.sync_all()?;
@@ -340,7 +337,9 @@ pub fn dispatch(
         "PATCH" => ureq::patch(&url),
         _ => return Err(format!("unsupported method: {}", method)),
     };
-    let req = req.timeout(Duration::from_secs(60)).set("x-roamway-token", &h.token);
+    let req = req
+        .timeout(Duration::from_secs(60))
+        .set("x-roamway-token", &h.token);
     let res = match body {
         Some(b) => req.send_string(b),
         None => req.call(),
@@ -365,22 +364,43 @@ mod tests {
 
     #[test]
     fn client_base_maps_wildcard_bind_to_loopback() {
-        assert_eq!(client_base_from_bind("0.0.0.0:8796"), "http://127.0.0.1:8796");
-        assert_eq!(client_base_from_bind("0.0.0.0:8796\n"), "http://127.0.0.1:8796");
+        assert_eq!(
+            client_base_from_bind("0.0.0.0:8796"),
+            "http://127.0.0.1:8796"
+        );
+        assert_eq!(
+            client_base_from_bind("0.0.0.0:8796\n"),
+            "http://127.0.0.1:8796"
+        );
         assert_eq!(client_base_from_bind(":8796"), "http://127.0.0.1:8796");
         assert_eq!(client_base_from_bind("[::]:8796"), "http://127.0.0.1:8796");
         assert_eq!(client_base_from_bind("::"), "http://127.0.0.1");
         assert_eq!(client_base_from_bind("*:9100"), "http://127.0.0.1:9100");
-        assert_eq!(client_base_from_bind("tcp://0.0.0.0:8896"), "http://127.0.0.1:8896");
+        assert_eq!(
+            client_base_from_bind("tcp://0.0.0.0:8896"),
+            "http://127.0.0.1:8896"
+        );
     }
 
     #[test]
     fn client_base_keeps_concrete_bind() {
-        assert_eq!(client_base_from_bind("127.0.0.1:8896"), "http://127.0.0.1:8896");
-        assert_eq!(client_base_from_bind("192.0.2.10:8796"), "http://192.0.2.10:8796");
-        assert_eq!(client_base_from_bind("localhost:8796"), "http://localhost:8796");
+        assert_eq!(
+            client_base_from_bind("127.0.0.1:8896"),
+            "http://127.0.0.1:8896"
+        );
+        assert_eq!(
+            client_base_from_bind("192.0.2.10:8796"),
+            "http://192.0.2.10:8796"
+        );
+        assert_eq!(
+            client_base_from_bind("localhost:8796"),
+            "http://localhost:8796"
+        );
         assert_eq!(client_base_from_bind("[::1]:8796"), "http://[::1]:8796");
-        assert_eq!(client_base_from_bind("https://nas.example:8443"), "https://nas.example:8443");
+        assert_eq!(
+            client_base_from_bind("https://nas.example:8443"),
+            "https://nas.example:8443"
+        );
     }
 
     #[test]
@@ -408,16 +428,29 @@ mod tests {
 
     #[test]
     fn endpoint_normalize_accepts_three_forms() {
-        assert_eq!(endpoint_normalize("192.0.2.10:8796"), "http://192.0.2.10:8796");
-        assert_eq!(endpoint_normalize("tcp://192.0.2.10:8796"), "http://192.0.2.10:8796");
-        assert_eq!(endpoint_normalize("http://192.0.2.10:8796/"), "http://192.0.2.10:8796");
+        assert_eq!(
+            endpoint_normalize("192.0.2.10:8796"),
+            "http://192.0.2.10:8796"
+        );
+        assert_eq!(
+            endpoint_normalize("tcp://192.0.2.10:8796"),
+            "http://192.0.2.10:8796"
+        );
+        assert_eq!(
+            endpoint_normalize("http://192.0.2.10:8796/"),
+            "http://192.0.2.10:8796"
+        );
     }
 
     #[test]
     fn registry_roundtrip() {
-        let dir = std::env::temp_dir().join(format!("roamway-hosts-roundtrip-{}", crate::types::now()));
+        let dir =
+            std::env::temp_dir().join(format!("roamway-hosts-roundtrip-{}", crate::types::now()));
         let mut reg = Registry::load(&dir);
-        let h = reg.add("nas", "192.0.2.10:8796", "secret-token").unwrap().clone();
+        let h = reg
+            .add("nas", "192.0.2.10:8796", "secret-token")
+            .unwrap()
+            .clone();
         assert_eq!(h.endpoint, "http://192.0.2.10:8796");
         reg.save().unwrap();
         let loaded = Registry::load(&dir);
@@ -426,14 +459,15 @@ mod tests {
         assert_eq!(got.name, "nas");
         assert_eq!(got.endpoint, "http://192.0.2.10:8796");
         assert_eq!(got.token, "secret-token");
-        assert_eq!(got.enabled, true);
+        assert!(got.enabled);
         assert_eq!(got.failures, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn registry_corrupt_recovers() {
-        let dir = std::env::temp_dir().join(format!("roamway-hosts-corrupt-{}", crate::types::now()));
+        let dir =
+            std::env::temp_dir().join(format!("roamway-hosts-corrupt-{}", crate::types::now()));
         let _ = std::fs::create_dir_all(&dir);
         std::fs::write(dir.join("hosts.json"), "{ bad json").unwrap();
         let reg = Registry::load(&dir);
@@ -441,7 +475,11 @@ mod tests {
         let corrupt_exists = std::fs::read_dir(&dir)
             .unwrap()
             .filter_map(|e| e.ok())
-            .any(|e| e.file_name().to_string_lossy().starts_with("hosts.json.corrupt-"));
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("hosts.json.corrupt-")
+            });
         assert!(corrupt_exists);
         let _ = std::fs::remove_dir_all(&dir);
     }
