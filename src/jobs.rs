@@ -1,3 +1,4 @@
+use crate::config;
 use crate::runner;
 use crate::types::*;
 use std::collections::BTreeMap;
@@ -204,7 +205,7 @@ pub fn spawn_from_job(app: Arc<App>, job_id: &str) {
         if let Some(jj) = st.state.jobs.iter_mut().find(|x| x.id == job_id) {
             jj.last_run = Some(iso(t));
         }
-        prune(&mut st);
+        prune(&mut st, app.keep_runs);
         st.save();
     };
     drain_queued(&app);
@@ -242,26 +243,58 @@ pub fn drain_queued(app: &Arc<App>) {
     }
 }
 
-/// 只保留最近 800 条运行记录，日志同步清理，避免长跑无限膨胀
-pub fn prune(st: &mut Store) {
-    const MAX_RUNS: usize = 800;
-    if st.state.runs.len() <= MAX_RUNS {
-        return;
+/// 与启动期同一套阈值：keep_runs=0 表示不修剪。删除 terminal run 时同步删日志文件。
+/// 返回"是否有删除"。
+pub fn prune(st: &mut Store, keep_runs: usize) -> bool {
+    // 只删 terminal：threshold 与"是否可删"的判定全部收敛到 config::trim_runs_plan，
+    // 日志文件删除后再由 config::trim_runs 处理向量，不引入第二套阈值。
+    let removed = config::trim_runs_plan(&st.state.runs, keep_runs);
+    if removed.is_empty() {
+        return false;
     }
-    let mut terminal_idx: Vec<usize> = st
-        .state
-        .runs
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| r.status.terminal())
-        .map(|(i, _)| i)
-        .collect();
-    let excess = st.state.runs.len() - MAX_RUNS;
-    terminal_idx.truncate(excess.min(terminal_idx.len()));
-    for i in terminal_idx.into_iter().rev() {
-        let r = st.state.runs.remove(i);
-        let _ = std::fs::remove_file(st.log_path(&r.id));
+    for id in &removed {
+        let _ = std::fs::remove_file(st.log_path(id));
     }
+    config::trim_runs(&mut st.state.runs, keep_runs)
+}
+
+/// 一次修剪动作的统计结果，供 `prune --dry-run` 与 `/v1/prune` 使用。
+pub struct PruneStats {
+    pub runs_removed: usize,
+    pub logs_removed: usize,
+    pub bytes_freed: usize,
+}
+
+/// 计算并（dry_run=false 时）执行修剪。dry_run=true 只统计，不删 run、不删日志、不 save。
+pub fn prune_stats(st: &mut Store, keep_runs: usize, dry_run: bool) -> PruneStats {
+    let removed = config::trim_runs_plan(&st.state.runs, keep_runs);
+    let mut stats = PruneStats {
+        runs_removed: removed.len(),
+        logs_removed: 0,
+        bytes_freed: 0,
+    };
+    if dry_run {
+        for id in &removed {
+            let path = st.log_path(id);
+            if let Ok(meta) = std::fs::metadata(&path) {
+                stats.bytes_freed += meta.len() as usize;
+                stats.logs_removed += 1;
+            }
+        }
+        return stats;
+    }
+    let removed_set: std::collections::HashSet<String> = removed.iter().cloned().collect();
+    st.state.runs.retain(|r| !removed_set.contains(&r.id));
+    for id in &removed {
+        let path = st.log_path(id);
+        if let Ok(meta) = std::fs::metadata(&path) {
+            stats.bytes_freed += meta.len() as usize;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            stats.logs_removed += 1;
+        }
+    }
+    stats
 }
 
 #[cfg(test)]
@@ -414,17 +447,16 @@ mod tests {
         assert_eq!(picked, vec!["b".to_string(), "c".to_string(), "d".to_string(), "e".to_string()]);
     }
 
-    #[test]
-    fn prune_trims_terminal_runs() {
-        let mk = |i: usize| Run {
-            id: format!("run_{:06}", i),
+    fn mk_run(id: &str, status: RunStatus, created_at: i64) -> Run {
+        Run {
+            id: id.to_string(),
             title: String::new(),
             agent: "shell".into(),
             model: None,
             workspace: String::new(),
             prompt: String::new(),
-            status: RunStatus::Done,
-            created_at: 0,
+            status,
+            created_at,
             started_at: None,
             ended_at: None,
             exit_code: None,
@@ -444,21 +476,85 @@ mod tests {
             options: BTreeMap::new(),
             images: Vec::new(),
             worktree: None,
-        };
-        let dir = std::env::temp_dir().join(format!("roamway-prune-{}", now()));
-        let _ = std::fs::create_dir_all(&dir);
-        let mut store = Store {
+        }
+    }
+
+    fn store_with(dir: std::path::PathBuf, runs: Vec<Run>) -> Store {
+        Store {
             dir,
             state: State {
-                runs: (0..805).map(mk).collect(),
+                runs,
                 jobs: vec![],
                 agents: vec![],
                 seq: 0,
             },
             loaded_ok: true,
-        };
-        prune(&mut store);
-        assert_eq!(store.state.runs.len(), 800);
+        }
+    }
+
+    #[test]
+    fn prune_uses_keep_runs_not_hardcoded() {
+        let dir = std::env::temp_dir().join(format!("roamway-prune-keep-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let runs = (0..900)
+            .map(|i| mk_run(&format!("run_{:06}", i), RunStatus::Done, 0))
+            .collect();
+        let mut st = store_with(dir.clone(), runs);
+        assert!(prune(&mut st, 100));
+        assert_eq!(st.state.runs.len(), 100);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_zero_keeps_everything() {
+        let dir = std::env::temp_dir().join(format!("roamway-prune-zero-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let runs = (0..900)
+            .map(|i| mk_run(&format!("run_{:06}", i), RunStatus::Done, 0))
+            .collect();
+        let mut st = store_with(dir.clone(), runs);
+        assert!(!prune(&mut st, 0));
+        assert_eq!(st.state.runs.len(), 900);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_never_drops_running_or_queued() {
+        let dir = std::env::temp_dir().join(format!("roamway-prune-active-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut runs: Vec<Run> = (0..900)
+            .map(|i| mk_run(&format!("run_{:06}", i), RunStatus::Done, i as i64))
+            .collect();
+        runs.push(mk_run("run_running", RunStatus::Running, 0));
+        runs.push(mk_run("run_queued", RunStatus::Queued, 0));
+        let mut st = store_with(dir.clone(), runs);
+        assert!(prune(&mut st, 10));
+        assert_eq!(st.state.runs.len(), 10);
+        assert!(st.state.runs.iter().any(|r| r.id == "run_running"));
+        assert!(st.state.runs.iter().any(|r| r.id == "run_queued"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_removes_log_files_of_dropped_runs() {
+        let dir = std::env::temp_dir().join(format!("roamway-prune-logs-{}", now()));
+        let _ = std::fs::create_dir_all(dir.join("logs"));
+        let runs = vec![
+            mk_run("run_old_1", RunStatus::Done, 1),
+            mk_run("run_old_2", RunStatus::Done, 2),
+            mk_run("run_keep", RunStatus::Done, 3),
+        ];
+        let mut st = store_with(dir.clone(), runs);
+        for id in ["run_old_1", "run_old_2", "run_keep"] {
+            std::fs::write(st.log_path(id), b"x").unwrap();
+        }
+        assert!(prune(&mut st, 1));
+        assert_eq!(st.state.runs.len(), 1);
+        assert_eq!(st.state.runs[0].id, "run_keep");
+        assert!(!st.log_path("run_old_1").exists());
+        assert!(!st.log_path("run_old_2").exists());
+        assert!(st.log_path("run_keep").exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

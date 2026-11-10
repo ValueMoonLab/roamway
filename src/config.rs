@@ -26,6 +26,7 @@ pub const CONFIG_KEYS: &[&str] = &[
     "require_approval",
     "token_env",
     "keep_runs",
+    "max_log_bytes",
 ];
 
 const FORBIDDEN_KEYS: &[&str] = &["token", "password", "secret", "api_key"];
@@ -57,6 +58,8 @@ pub struct Config {
     pub token_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_runs: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_log_bytes: Option<usize>,
 }
 
 /// 解析后的生效配置：每个 key 都已收敛为具体值，并记录来源。
@@ -74,6 +77,7 @@ pub struct EffectiveConfig {
     pub require_approval: Vec<String>,
     pub token_env: String,
     pub keep_runs: usize,
+    pub max_log_bytes: usize,
     pub sources: BTreeMap<String, String>,
 }
 
@@ -103,6 +107,7 @@ impl EffectiveConfig {
             "require_approval": self.require_approval_enabled(),
             "token_env": self.token_env.clone(),
             "keep_runs": self.keep_runs,
+            "max_log_bytes": self.max_log_bytes,
         })
     }
 
@@ -124,6 +129,7 @@ impl EffectiveConfig {
             "require_approval" => self.require_approval_enabled().to_string(),
             "token_env" => self.token_env.clone(),
             "keep_runs" => self.keep_runs.to_string(),
+            "max_log_bytes" => self.max_log_bytes.to_string(),
             _ => String::new(),
         }
     }
@@ -301,6 +307,12 @@ pub fn apply_set(cfg: &mut Config, key: &str, value: &str) -> Result<(), String>
                 .parse::<usize>()
                 .map_err(|_| invalid(key, value.trim()))?,
         ),
+        "max_log_bytes" => cfg.max_log_bytes = Some(
+            value
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| invalid(key, value.trim()))?,
+        ),
         _ => return Err(format!("unknown config key '{}'", key)),
     }
     Ok(())
@@ -324,6 +336,7 @@ pub fn apply_unset(cfg: &mut Config, key: &str) -> Result<(), String> {
         "require_approval" => cfg.require_approval = None,
         "token_env" => cfg.token_env = None,
         "keep_runs" => cfg.keep_runs = None,
+        "max_log_bytes" => cfg.max_log_bytes = None,
         _ => return Err(format!("unknown config key '{}'", key)),
     }
     Ok(())
@@ -511,6 +524,15 @@ pub fn resolve_config(
         sources.insert("keep_runs".into(), "default".into());
     }
 
+    // max_log_bytes（无 flag / env）：0 表示不限。
+    if let Some(v) = file.max_log_bytes {
+        c.max_log_bytes = v;
+        sources.insert("max_log_bytes".into(), "file".into());
+    } else {
+        c.max_log_bytes = 4_194_304;
+        sources.insert("max_log_bytes".into(), "default".into());
+    }
+
     c.sources = sources;
     Ok(c)
 }
@@ -544,11 +566,12 @@ fn resolve_optional_string(
     }
 }
 
-/// 修剪历史 run：keep_runs=0 不修剪；只删 terminal（done/failed/...）记录，
-/// 绝不误删 running/queued。把总数压到 keep_runs 以内时，优先删除最旧的 terminal。
-pub fn trim_runs(runs: &mut Vec<Run>, keep_runs: usize) -> bool {
+/// 计算本轮需要删除的 terminal run id（只删最旧的 terminal；running/queued 永久保留）。
+/// keep_runs=0 或未超出阈值时返回空列表。这是保留策略的唯一真源：
+/// 启动期 trim_runs 与运行期 jobs::prune 都走这里，不存在第二套阈值。
+pub fn trim_runs_plan(runs: &[Run], keep_runs: usize) -> Vec<String> {
     if keep_runs == 0 || runs.len() <= keep_runs {
-        return false;
+        return Vec::new();
     }
     let mut terminal: Vec<usize> = runs
         .iter()
@@ -557,25 +580,29 @@ pub fn trim_runs(runs: &mut Vec<Run>, keep_runs: usize) -> bool {
         .map(|(i, _)| i)
         .collect();
     if terminal.is_empty() {
-        return false;
+        return Vec::new();
     }
     let excess = runs.len() - keep_runs;
     let drop_count = excess.min(terminal.len());
     if drop_count == 0 {
-        return false;
+        return Vec::new();
     }
     terminal.sort_by(|&a, &b| runs[a].created_at.cmp(&runs[b].created_at));
-    let drop: std::collections::HashSet<usize> = terminal[..drop_count].iter().copied().collect();
-    let mut changed = false;
-    let mut i = runs.len();
-    while i > 0 {
-        i -= 1;
-        if drop.contains(&i) {
-            runs.remove(i);
-            changed = true;
-        }
+    terminal.truncate(drop_count);
+    terminal.iter().map(|&i| runs[i].id.clone()).collect()
+}
+
+/// 修剪历史 run：keep_runs=0 不修剪；只删 terminal（done/failed/...）记录，
+/// 绝不误删 running/queued。把总数压到 keep_runs 以内时，优先删除最旧的 terminal。
+pub fn trim_runs(runs: &mut Vec<Run>, keep_runs: usize) -> bool {
+    let removed = trim_runs_plan(runs, keep_runs);
+    if removed.is_empty() {
+        return false;
     }
-    changed
+    let removed: std::collections::HashSet<String> = removed.into_iter().collect();
+    let before = runs.len();
+    runs.retain(|r| !removed.contains(&r.id));
+    runs.len() < before
 }
 
 #[cfg(test)]
@@ -765,5 +792,28 @@ mod tests {
         assert!(runs.iter().any(|r| r.id == "running"));
         assert!(runs.iter().any(|r| r.id == "new"));
         assert!(!runs.iter().any(|r| r.id == "old"));
+    }
+
+    #[test]
+    fn config_keys_include_max_log_bytes() {
+        assert!(CONFIG_KEYS.contains(&"max_log_bytes"));
+    }
+
+    #[test]
+    fn max_log_bytes_defaults_to_4mib() {
+        let c = resolve_config(&HashMap::new(), &HashMap::new(), &Config::default()).unwrap();
+        assert_eq!(c.max_log_bytes, 4_194_304);
+        assert_eq!(c.source_of("max_log_bytes"), "default");
+    }
+
+    #[test]
+    fn max_log_bytes_set_validates_values() {
+        let mut cfg = Config::default();
+        apply_set(&mut cfg, "max_log_bytes", "0").unwrap();
+        assert_eq!(cfg.max_log_bytes, Some(0));
+        apply_set(&mut cfg, "max_log_bytes", "8388608").unwrap();
+        assert_eq!(cfg.max_log_bytes, Some(8_388_608));
+        assert!(apply_set(&mut cfg, "max_log_bytes", "-1").is_err());
+        assert!(apply_set(&mut cfg, "max_log_bytes", "lots").is_err());
     }
 }

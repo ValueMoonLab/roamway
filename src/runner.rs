@@ -3,11 +3,11 @@ use crate::types::*;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
-use std::path::Path;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -76,31 +76,26 @@ fn execute(app: Arc<App>, id: String) {
     );
 
     {
-        let mut f = match File::create(&log_path) {
-            Ok(f) => f,
-            Err(e) => {
-                finalize(&app, &id, RunStatus::Failed, None, Some(format!("log: {}", e)), None);
-                return;
-            }
-        };
-        let _ = writeln!(
-            f,
-            "# {} run={} agent={} model={:?} dir={}",
+        if let Err(e) = File::create(&log_path) {
+            finalize(&app, &id, RunStatus::Failed, None, Some(format!("log: {}", e)), None);
+            return;
+        }
+        let option_keys = run.options.keys().map(String::as_str).collect::<Vec<_>>().join(",");
+        let header = format!(
+            "# {} run={} agent={} model={:?} dir={}\n[runopts] agent={} keys={} images={}\n",
             iso(now()),
             id,
             run.agent,
             run.model,
-            run.workspace
-        );
-        let option_keys = run.options.keys().map(String::as_str).collect::<Vec<_>>().join(",");
-        let _ = writeln!(
-            f,
-            "[runopts] agent={} keys={} images={}",
+            run.workspace,
             run.agent,
             option_keys,
             run.images.len()
         );
-        let _ = f.flush();
+        if let Err(e) = append_capped(&log_path, header.as_bytes(), app.max_log_bytes) {
+            finalize(&app, &id, RunStatus::Failed, None, Some(format!("log: {}", e)), None);
+            return;
+        }
     }
 
     let (agent_kind, mut session, history) = agent_ctx;
@@ -126,7 +121,7 @@ fn execute(app: Arc<App>, id: String) {
     }
 
     let outcome = if run.agent.starts_with("api:") {
-        let (status, code, err, text, usage) = run_api(&run, &log_path, &cancel, &history);
+        let (status, code, err, text, usage) = run_api(&run, &log_path, &cancel, &history, app.max_log_bytes);
         (status, code, err, text, usage)
     } else {
         let session_for_run = if matches!(agent_kind.as_str(), "codex" | "claude") {
@@ -146,9 +141,8 @@ fn execute(app: Arc<App>, id: String) {
         usage = Some(RunUsage::Note("unavailable".into()));
     }
 
-    if let Ok(mut f) = OpenOptions::new().append(true).open(&log_path) {
-        let _ = writeln!(f, "\n# end {} status={:?} exit={:?}", iso(now()), status, code);
-    }
+    let end = format!("\n# end {} status={:?} exit={:?}\n", iso(now()), status, code);
+    let _ = append_capped(&log_path, end.as_bytes(), app.max_log_bytes);
 
     if status == RunStatus::Done && agent_kind == "codex" {
         if session.is_empty() {
@@ -598,6 +592,68 @@ fn proc_start_epoch(pid: u32) -> Option<i64> {
     Some(btime + start / 100)
 }
 
+/// 把单 run 日志控制在 `limit` 字节以内：`limit == 0` 表示不限。
+/// 写入前检查文件末尾是否已有 truncate 标记，已标记则直接返回；
+/// 已存在内容不重写、不截断，只按 UTF-8 边界截断新 chunk 后停止后续写入。
+pub fn append_capped(path: &Path, chunk: &[u8], limit: usize) -> std::io::Result<()> {
+    let mut f = OpenOptions::new().append(true).create(true).open(path)?;
+    if limit == 0 {
+        f.write_all(chunk)?;
+        return Ok(());
+    }
+    let marker = format!("\n[roamway: log truncated; max_log_bytes={} reached]\n", limit);
+    let len = f.metadata()?.len();
+    if len >= marker.len() as u64 && log_ends_with_marker(path, marker.as_bytes())? {
+        return Ok(());
+    }
+    if chunk.is_empty() || len.saturating_add(chunk.len() as u64) <= limit as u64 {
+        f.write_all(chunk)?;
+        return Ok(());
+    }
+    let room = (limit as u64).saturating_sub(len);
+    let mut end = (room as usize).min(chunk.len());
+    while end > 0 && end < chunk.len() && (chunk[end] & 0xC0) == 0x80 {
+        end -= 1;
+    }
+    f.write_all(&chunk[..end])?;
+    f.write_all(marker.as_bytes())?;
+    f.flush()?;
+    Ok(())
+}
+
+/// 只读文件末尾 200 字节，检查是否已以固定标记收尾。
+fn log_ends_with_marker(path: &Path, marker: &[u8]) -> std::io::Result<bool> {
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let len = f.metadata()?.len();
+    if len < marker.len() as u64 {
+        return Ok(false);
+    }
+    f.seek(SeekFrom::Start(len.saturating_sub(200)))?;
+    let mut tail = Vec::new();
+    f.read_to_end(&mut tail)?;
+    Ok(tail.ends_with(marker))
+}
+
+/// 把子进程的一路输出持续追加到日志，写完由外部锁串行化，避免 stdout/stderr 交错。
+fn pump_to_log<R: Read>(mut src: R, log_path: PathBuf, limit: usize, lock: Arc<Mutex<()>>) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match src.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Ok(_g) = lock.lock() {
+                    let _ = append_capped(&log_path, &buf[..n], limit);
+                }
+            }
+            Err(_) => break,
+        }
+    }
+}
+
 fn run_cli(
     app: &Arc<App>,
     run: &Run,
@@ -613,16 +669,8 @@ fn run_cli(
     for (key, value) in &run.env {
         cmd.env(key, value);
     }
-    let out = match File::create(log_path) {
-        Ok(f) => f,
-        Err(e) => return (RunStatus::Failed, None, Some(format!("log: {}", e))),
-    };
-    let out2 = match out.try_clone() {
-        Ok(f) => f,
-        Err(e) => return (RunStatus::Failed, None, Some(format!("log: {}", e))),
-    };
-    cmd.stdout(Stdio::from(out))
-        .stderr(Stdio::from(out2))
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .stdin(Stdio::null());
 
     if cancel.load(Ordering::Relaxed) {
@@ -644,35 +692,62 @@ fn run_cli(
         return (RunStatus::Killed, None, None);
     }
 
-    let started = Instant::now();
-    loop {
-        if cancel.load(Ordering::Relaxed) {
+    let stdout = match child.stdout.take() {
+        Some(s) => s,
+        None => {
             kill_tree(&mut child);
-            return (RunStatus::Killed, None, None);
+            return (RunStatus::Failed, None, Some("no stdout pipe".to_string()));
         }
-        if run.timeout_s > 0 && started.elapsed().as_secs() >= run.timeout_s {
+    };
+    let stderr = match child.stderr.take() {
+        Some(s) => s,
+        None => {
             kill_tree(&mut child);
-            return (
-                RunStatus::Timeout,
-                None,
-                Some(format!("timeout {}s", run.timeout_s)),
-            );
+            return (RunStatus::Failed, None, Some("no stderr pipe".to_string()));
         }
-        match child.try_wait() {
-            Ok(Some(st)) => {
-                let code = st.code();
-                if st.success() {
-                    return (RunStatus::Done, code, None);
-                }
-                return (RunStatus::Failed, code, Some(format!("exit {:?}", code)));
-            }
-            Ok(None) => thread::sleep(Duration::from_millis(300)),
-            Err(e) => {
+    };
+    let lock = Arc::new(Mutex::new(()));
+    let out_log = log_path.to_path_buf();
+    let err_log = log_path.to_path_buf();
+    let limit = app.max_log_bytes;
+    let out_lock = Arc::clone(&lock);
+    let out_thread = thread::spawn(move || pump_to_log(stdout, out_log, limit, out_lock));
+    let err_thread = thread::spawn(move || pump_to_log(stderr, err_log, limit, lock));
+
+    let outcome = (|| {
+        let started = Instant::now();
+        loop {
+            if cancel.load(Ordering::Relaxed) {
                 kill_tree(&mut child);
-                return (RunStatus::Failed, None, Some(e.to_string()));
+                return (RunStatus::Killed, None, None);
+            }
+            if run.timeout_s > 0 && started.elapsed().as_secs() >= run.timeout_s {
+                kill_tree(&mut child);
+                return (
+                    RunStatus::Timeout,
+                    None,
+                    Some(format!("timeout {}s", run.timeout_s)),
+                );
+            }
+            match child.try_wait() {
+                Ok(Some(st)) => {
+                    let code = st.code();
+                    if st.success() {
+                        return (RunStatus::Done, code, None);
+                    }
+                    return (RunStatus::Failed, code, Some(format!("exit {:?}", code)));
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(300)),
+                Err(e) => {
+                    kill_tree(&mut child);
+                    return (RunStatus::Failed, None, Some(e.to_string()));
+                }
             }
         }
-    }
+    })();
+    let _ = out_thread.join();
+    let _ = err_thread.join();
+    outcome
 }
 
 fn run_api(
@@ -680,7 +755,8 @@ fn run_api(
     log_path: &Path,
     _cancel: &Arc<AtomicBool>,
     history: &[agents::Msg],
- ) -> (RunStatus, Option<i32>, Option<String>, String, Option<RunUsage>) {
+    max_log_bytes: usize,
+) -> (RunStatus, Option<i32>, Option<String>, String, Option<RunUsage>) {
     let (default_url, key_env, url_env, default_model) = match run.agent.as_str() {
         "api:deepseek" => (
             "https://api.deepseek.com/chat/completions",
@@ -743,10 +819,6 @@ fn run_api(
         .timeout(Duration::from_secs(run.timeout_s.max(30)))
         .send_json(body);
 
-    let mut f = match OpenOptions::new().append(true).create(true).open(log_path) {
-        Ok(f) => f,
-        Err(e) => return (RunStatus::Failed, None, Some(e.to_string()), String::new(), None),
-    };
     match resp {
         Ok(r) => match r.into_json::<serde_json::Value>() {
             Ok(v) => {
@@ -754,8 +826,7 @@ fn run_api(
                     .as_str()
                     .unwrap_or("")
                     .to_string();
-                let _ = writeln!(f, "{}", text);
-                let _ = f.flush();
+                let _ = append_capped(log_path, format!("{}\n", text).as_bytes(), max_log_bytes);
                 if text.is_empty() {
                     return (
                         RunStatus::Failed,
@@ -778,7 +849,7 @@ fn run_api(
         },
         Err(ureq::Error::Status(code, r)) => {
             let body = r.into_string().unwrap_or_default();
-            let _ = writeln!(f, "HTTP {}: {}", code, body);
+            let _ = append_capped(log_path, format!("HTTP {}: {}\n", code, body).as_bytes(), max_log_bytes);
             (
                 RunStatus::Failed,
                 Some(code as i32),
@@ -788,7 +859,7 @@ fn run_api(
             )
         }
         Err(e) => {
-            let _ = writeln!(f, "request error: {}", e);
+            let _ = append_capped(log_path, format!("request error: {}\n", e).as_bytes(), max_log_bytes);
             (RunStatus::Failed, None, Some(e.to_string()), String::new(), None)
         }
     }
@@ -995,5 +1066,41 @@ mod tests {
             provider_args("shell", &opts, &[], None).unwrap_err(),
             "run --thinking: not supported for agent shell"
         );
+    }
+
+    #[test]
+    fn append_capped_stops_at_limit_and_marks_once() {
+        let path = std::env::temp_dir().join(format!(
+            "roamway_p22_append_capped_{}.log",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let limit = 24usize;
+        let marker = format!("\n[roamway: log truncated; max_log_bytes={} reached]\n", limit);
+        // 先写一个小于 limit 的 chunk，后续两次追加会触发封顶与"标记只写一次"。
+        assert!(append_capped(&path, b"hello \xe4\xbd\xa0", limit).is_ok());
+        assert!(append_capped(&path, "世界一二三四五六七八九".as_bytes(), limit).is_ok());
+        assert!(append_capped(&path, b"again", limit).is_ok());
+        let data = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let text = String::from_utf8_lossy(&data);
+        assert!(text.ends_with(marker.as_str()), "log must end with truncate marker");
+        assert_eq!(text.matches(marker.trim()).count(), 1, "marker must appear exactly once");
+        assert!(data.len() <= limit + marker.len(), "log must stay within limit + marker");
+    }
+
+    #[test]
+    fn append_capped_zero_means_unlimited() {
+        let path = std::env::temp_dir().join(format!(
+            "roamway_p22_append_unlimited_{}.log",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let chunk = b"0123456789".repeat(64);
+        assert!(append_capped(&path, &chunk, 0).is_ok());
+        let data = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(data, chunk);
+        assert!(!String::from_utf8_lossy(&data).contains("log truncated"));
     }
 }

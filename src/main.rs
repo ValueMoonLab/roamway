@@ -30,7 +30,7 @@ use std::time::Duration;
 use types::*;
 use crate::workspaces::WorktreeSpec;
 
-const BOOLS: &[&str] = &["print", "board", "no-wait", "quiet", "json", "allow-overlap", "disabled", "help", "force", "probe", "all", "worktree", "keep-worktree", "run-now", "overlap", "enabled", "enter", "no-enter", "stdin", "no-browser", "no-headers", "no-color", "runs", "background", "global", "resume", "continue", "version"];
+const BOOLS: &[&str] = &["print", "board", "no-wait", "quiet", "json", "allow-overlap", "disabled", "help", "force", "probe", "all", "worktree", "keep-worktree", "run-now", "overlap", "enabled", "enter", "no-enter", "stdin", "no-browser", "no-headers", "no-color", "runs", "background", "global", "resume", "continue", "version", "dry-run", "yes"];
 
 static FAIL_CODE: AtomicI32 = AtomicI32::new(0);
 
@@ -78,6 +78,7 @@ fn usage() {
   roamway workspace ls | create <name> --path DIR | archive <name> | setup <name> | rm <name>
   roamway terminal create|ls|capture|send-keys|kill
   roamway script ls|add|rm|start|stop
+  roamway prune [--dry-run] [--keep N] [--yes]
   注：受管终端无 TTY，TUI 程序（vim/top 交互界面）不支持
 
 生态扩展：
@@ -978,6 +979,7 @@ fn print_command_help(cmd: &str) -> bool {
         "logs" => "roamway logs ID [--tail 80] [--host H]",
         "stop" => "roamway stop ID [--host H]",
         "rm" => "roamway rm ID",
+        "prune" => "roamway prune [--dry-run] [--keep N] [--yes]",
         "jobs" => "roamway jobs",
         "jobs-add" => "roamway jobs-add --agent shell --every 3600 | --daily 08:30 [--model M] [--workspace DIR] [--max-retries 2] [--after JOB]... \"prompt\"",
         "jobs-run" => "roamway jobs-run ID",
@@ -1103,6 +1105,7 @@ fn dispatch(argv: &[String]) -> i32 {
         "logs" => cmd_logs(&flags, &cmd_pos),
         "stop" => cmd_stop(&flags, &cmd_pos),
         "rm" => cmd_rm(&flags, &cmd_pos),
+        "prune" => cmd_prune(&flags, &cmd_pos),
         "jobs" => cmd_jobs(&flags),
         "jobs-add" => cmd_jobs_add(&flags, &cmd_pos),
         "jobs-run" => cmd_jobs_run(&flags, &cmd_pos),
@@ -1223,7 +1226,7 @@ fn cmd_serve(flags: &HashMap<String, String>) {
     }
 
     let mut store = Store::load(&data);
-    if config::trim_runs(&mut store.state.runs, cfg.keep_runs) {
+    if jobs::prune(&mut store, cfg.keep_runs) {
         store.save();
     }
     let loaded_ok = store.loaded_ok;
@@ -1243,6 +1246,8 @@ fn cmd_serve(flags: &HashMap<String, String>) {
         cancels: Mutex::new(HashMap::new()),
         tz_offset_hours: tz,
         max_concurrent,
+        keep_runs: cfg.keep_runs,
+        max_log_bytes: cfg.max_log_bytes,
         max_conn,
         conns: AtomicUsize::new(0),
         req_total: AtomicU64::new(0),
@@ -1739,6 +1744,69 @@ fn cmd_rm(flags: &HashMap<String, String>, pos: &[String]) {
     match c.req("DELETE", &format!("/v1/runs/{}", id), None) {
         Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
         Err(e) => eprintln!("rm failed: {}", e),
+    }
+}
+
+fn prune_keep(flags: &HashMap<String, String>) -> Result<Option<usize>, ()> {
+    match flags.get("keep") {
+        None => Ok(None),
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) => Ok(Some(n)),
+            Err(_) => {
+                usage_error("prune: --keep must be a non-negative integer");
+                Err(())
+            }
+        },
+    }
+}
+
+fn cmd_prune(flags: &HashMap<String, String>, pos: &[String]) {
+    const PRUNE_FLAGS: &[&str] = &[
+        "dry-run", "keep", "yes", "host", "data", "home", "token", "format", "json",
+        "quiet", "no-color", "no-headers",
+    ];
+    for key in flags.keys() {
+        if !PRUNE_FLAGS.contains(&key.as_str()) {
+            usage_error(&format!("prune: unknown flag --{}", key));
+        }
+    }
+    if !pos.is_empty() {
+        usage_error("usage: roamway prune [--dry-run] [--keep N] [--yes]");
+    }
+    if FAIL_CODE.load(Ordering::SeqCst) != 0 {
+        return;
+    }
+    let dry_run = flags.contains_key("dry-run");
+    let keep = match prune_keep(flags) {
+        Ok(k) => k,
+        Err(()) => return,
+    };
+    let mut body = json!({ "dry_run": dry_run });
+    if let Some(k) = keep {
+        body["keep"] = json!(k);
+    }
+    match request(flags, "POST", "/v1/prune", Some(body)) {
+        Ok(v) => {
+            if format_is_json(flags) || format_is_yaml(flags) {
+                print_formatted(flags, &v);
+                return;
+            }
+            if !flags.contains_key("no-headers") {
+                println!("RUNS_REMOVED LOGS_REMOVED BYTES_FREED MODE");
+            }
+            println!(
+                "{} {} {} {}",
+                v["runs_removed"].as_u64().unwrap_or(0),
+                v["logs_removed"].as_u64().unwrap_or(0),
+                v["bytes_freed"].as_u64().unwrap_or(0),
+                if v["dry_run"].as_bool().unwrap_or(false) {
+                    "dry-run"
+                } else {
+                    "apply"
+                }
+            );
+        }
+        Err(e) => eprintln!("prune failed: {}", e),
     }
 }
 
@@ -4943,6 +5011,8 @@ pub mod test_support {
             cancels: Mutex::new(HashMap::new()),
             tz_offset_hours: 8,
             max_concurrent: 4,
+            keep_runs: 500,
+            max_log_bytes: 4_194_304,
             max_conn: 64,
             conns: AtomicUsize::new(0),
             req_total: AtomicU64::new(0),
@@ -5201,6 +5271,22 @@ mod tests {
     fn dispatch_returns_usage_exit_code() {
         assert_eq!(dispatch(&["workspace".to_string(), "setup".to_string()]), 2);
         assert_eq!(dispatch(&["roamway-bogus-command".to_string()]), 2);
+    }
+
+    #[test]
+    fn prune_cli_rejects_bad_keep() {
+        assert_eq!(
+            dispatch(&["prune".to_string(), "--keep".to_string(), "-1".to_string()]),
+            2
+        );
+        assert_eq!(
+            dispatch(&["prune".to_string(), "--keep".to_string(), "abc".to_string()]),
+            2
+        );
+        assert_eq!(
+            dispatch(&["prune".to_string(), "--bogus".to_string()]),
+            2
+        );
     }
 
     #[test]

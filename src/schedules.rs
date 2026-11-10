@@ -506,7 +506,7 @@ pub fn create_run_for_schedule(app: &Arc<App>, schedule_id: &str) {
             images: Vec::new(),
             worktree: None,
         });
-        crate::jobs::prune(&mut st);
+        crate::jobs::prune(&mut st, app.keep_runs);
         st.save();
         id
     };

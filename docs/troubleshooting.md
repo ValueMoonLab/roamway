@@ -28,6 +28,28 @@ roamway daemon status          # 看 pid / bind / offline
 - `wait <id> --timeout 60` 等待进入 idle，超时非零退出。
 - `api:*` 的 run 无法中断（直连 API），`POST /v1/runs/{id}/stop` 返回 409；`queued` 态仍可取消。
 
+## state.json / logs 膨胀
+
+长期无人值守时先看 `/metrics` 三个字节类 gauge：
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" localhost:8796/metrics | grep -E 'roamway_(state|logs)_'
+```
+
+- `roamway_state_bytes`：`state.json` 文件大小（不存在则 0）。
+- `roamway_logs_bytes`：`<data>/logs` 下 `*.log` 合计字节（不递归子目录）。
+- `roamway_logs_count`：`<data>/logs` 下 `*.log` 文件数。
+
+需要手动回收时先跑 dry-run 看统计，再实际修剪：
+
+```bash
+roamway prune --dry-run -o json   # 只统计不改 state、不删日志
+roamway prune                     # 按配置文件里的 keep_runs 修剪并落盘
+roamway prune --keep 5            # 本次临时覆盖阈值，不改配置文件
+```
+
+`prune` 只删 terminal（done/failed/timeout/killed/interrupted）run 及其日志，绝不删 agent、worktree、schedule、job、approval。
+
 ## 帮助与退出码
 
 ```bash

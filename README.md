@@ -468,6 +468,7 @@ docs/architecture.md  设计取舍
 - [x] 并发上限（全局 / 每 agent）
 - [x] `/metrics`（Prometheus 文本格式）
 - [x] 只读 Web 面板
+- [x] 长跑保留策略与日志封顶（P22）
 
 ## License
 

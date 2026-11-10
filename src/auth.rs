@@ -213,6 +213,7 @@ pub fn required_scope(method: &str, segs: &[&str]) -> &'static str {
     if method == "POST" {
         match segs {
             ["v1", "runs"] => return "run",
+            ["v1", "prune"] => return "run",
             ["v1", "agents"] | ["v1", "agents", "import"] => return "run",
             ["v1", "agents", _, "run"] | ["v1", "agents", _, "detach"] => return "run",
             _ => {}

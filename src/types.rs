@@ -389,6 +389,8 @@ pub struct App {
     pub tz_offset_hours: i64,
     pub max_concurrent: usize,
     pub max_conn: usize,
+    pub keep_runs: usize,
+    pub max_log_bytes: usize,
     pub conns: AtomicUsize,
     /// `/metrics` 用的 HTTP 计数（纯内存，不参与 state.json 持久化）。
     /// 每次请求 +1；响应码 >= 400 时 failed +1。
