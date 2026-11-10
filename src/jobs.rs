@@ -495,6 +495,8 @@ mod tests {
                 seq: 0,
             },
             loaded_ok: true,
+            store_health: crate::types::StoreHealth::Ok,
+            preserve_backup: false,
             last_write_hash: 0,
             writes_total: 0,
             writes_skipped: 0,

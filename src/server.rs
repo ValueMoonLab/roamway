@@ -2545,7 +2545,18 @@ fn readyz(app: &Arc<App>) -> (u16, Value) {
         "uptime_s": now() - app.started,
     });
     match app.store.try_lock() {
-        Ok(_guard) => (200, up),
+        Ok(guard) => match guard.store_health {
+            StoreHealth::Fresh | StoreHealth::Ok | StoreHealth::Recovered => {
+                let mut body = up;
+                body["store"] = json!(guard.store_health.as_str());
+                (200, body)
+            }
+            StoreHealth::Unrecoverable => (503, json!({
+                "ok": false,
+                "reason": "state_unreadable",
+                "store": "unrecoverable",
+            })),
+        },
         Err(_) => (503, json!({"ok": false, "reason": "busy"})),
     }
 }
@@ -3660,6 +3671,8 @@ mod tests {
                 seq: 3,
             },
             loaded_ok: true,
+            store_health: StoreHealth::Ok,
+            preserve_backup: false,
             last_write_hash: 0,
             writes_total: 0,
             writes_skipped: 0,
@@ -3757,6 +3770,8 @@ mod tests {
             dir: dir.to_path_buf(),
             state: State { runs: vec![run], jobs: vec![], agents: vec![], seq: 1 },
             loaded_ok: true,
+            store_health: StoreHealth::Ok,
+            preserve_backup: false,
             last_write_hash: 0,
             writes_total: 0,
             writes_skipped: 0,
@@ -4412,6 +4427,33 @@ mod tests {
         let (code, body) = readyz(&app);
         assert_eq!(code, 200);
         assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["version"], json!(env!("CARGO_PKG_VERSION")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn readyz_503_when_state_unreadable() {
+        let dir = std::env::temp_dir().join(format!("roamway-readyz-unreadable-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let app = test_app_with_max(&dir, "shell", RunStatus::Done, 1);
+        app.store.lock().unwrap_or_else(|e| e.into_inner()).store_health = StoreHealth::Unrecoverable;
+        let (code, body) = readyz(&app);
+        assert_eq!(code, 503);
+        assert_eq!(body["ok"], json!(false));
+        assert_eq!(body["reason"], json!("state_unreadable"));
+        assert_eq!(body["store"], json!("unrecoverable"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn readyz_200_carries_store_field() {
+        let dir = std::env::temp_dir().join(format!("roamway-readyz-ok-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let app = test_app_with_max(&dir, "shell", RunStatus::Done, 1);
+        let (code, body) = readyz(&app);
+        assert_eq!(code, 200);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["store"], json!("ok"));
         assert_eq!(body["version"], json!(env!("CARGO_PKG_VERSION")));
         let _ = std::fs::remove_dir_all(&dir);
     }

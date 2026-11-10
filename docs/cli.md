@@ -2,6 +2,14 @@
 
 本文维护 `roamway run` 的参数表与校验规则；权威文本以 `roamway run --help` 输出为准。其余命令面见 `docs/paseo-cli-surface.md`。
 
+## serve
+
+`roamway serve [--bind 127.0.0.1:8796] [--data DIR] [--token T] [--tz 8] [--max-concurrent 4] [--max-conn 64] [--force]`
+
+- 同一 `<data>` 只允许一个写者：已有活体 serve 占用时，第二个实例 exit 3，不覆盖锁，避免双写。
+- `--force`：跳过存活校验直接接管；锁内容换成本进程，并打印「two writers will corrupt state.json」警告。
+- serve 返回（正常退出或启动后失败）都会释放 `<data>/roamway.lock`。
+
 ## run
 
 `roamway run --agent <kind> [options] "<prompt>"`

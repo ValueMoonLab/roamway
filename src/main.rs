@@ -61,7 +61,7 @@ fn usage_text() -> String {
         r#"roamway {} — 迷你多智能体编排器（国内模型 / 长跑友好）
 
 核心：
-  roamway serve  [--bind 127.0.0.1:8796] [--data DIR] [--token T] [--tz 8] [--max-concurrent 4] [--max-conn 64]
+  roamway serve  [--bind 127.0.0.1:8796] [--data DIR] [--token T] [--tz 8] [--max-concurrent 4] [--max-conn 64] [--force]
   roamway start                                  # = daemon start
   roamway run    --agent codex [--model M] [--workspace DIR] [--title T] [--timeout 1800] [--no-wait] [--wait-timeout N] [--new-workspace local|worktree] [--worktree-mode branch-off|checkout-branch|checkout-pr] [--worktree-slug SLUG] [--new-branch B] [--base REF] [--branch B] [--cwd DIR] [--env K=V] [--label k=v] [--image PATH] [-i PATH] [--host H] "prompt"
   roamway send   <agent-id> <prompt...>          # 续跑 agent
@@ -971,7 +971,7 @@ fn main() {
 
 fn print_command_help(cmd: &str) -> bool {
     let text = match cmd {
-        "serve" => "roamway serve [--bind 127.0.0.1:8796] [--data DIR] [--token T] [--tz 8] [--max-concurrent 4] [--max-conn 64]",
+        "serve" => "roamway serve [--bind 127.0.0.1:8796] [--data DIR] [--token T] [--tz 8] [--max-concurrent 4] [--max-conn 64] [--force]",
         "start" => "roamway start [--bind 127.0.0.1:8796] [--data DIR] [--token T]",
         "clone" => "roamway clone <owner/repo | git url> [--dir DIR] [--protocol https|ssh] [--json] [--host H]",
         "workspace" => "roamway workspace ls | create <name> --path DIR | archive <name> | setup <name> | rm <name>",
@@ -1238,6 +1238,20 @@ fn cmd_serve(flags: &HashMap<String, String>) {
     let tls_key = cfg.tls_key.clone().map(PathBuf::from);
     let bind_host = bind_parts(&bind).map(|(h, _)| h).unwrap_or_else(|| bind.clone());
 
+    std::fs::create_dir_all(&data).ok();
+    if flags.contains_key("force") {
+        if let Some((owner_pid, _owner_bind)) = backup::writer_lock_owner(&data) {
+            eprintln!("{}", backup::writer_takeover_message(&data, owner_pid));
+        }
+        if let Err(e) = backup::force_acquire_writer(&data, &bind) {
+            eprintln!("roamway: write writer lock failed: {}", e);
+            std::process::exit(1);
+        }
+    } else if let Err((owner_pid, owner_bind)) = backup::acquire_writer(&data, &bind) {
+        eprintln!("{}", backup::writer_busy_message(&data, owner_pid, &owner_bind));
+        std::process::exit(3);
+    }
+
     // 无 token 且绑定非 loopback 时拒绝启动，避免把任意命令执行暴露给整个网络
     let token_store = auth::TokenStore::load(&data);
     let has_saved_tokens = !token_store.tokens.is_empty();
@@ -1246,6 +1260,7 @@ fn cmd_serve(flags: &HashMap<String, String>) {
             "roamway: refusing to serve without --token on non-loopback bind {}; use 127.0.0.1/::1 or set ROAMWAY_TOKEN",
             bind
         );
+        backup::release_writer(&data);
         std::process::exit(2);
     }
 
@@ -1322,8 +1337,12 @@ fn cmd_serve(flags: &HashMap<String, String>) {
         max_conn
     );
     match server::serve(app, &bind) {
-        Ok(()) => backup::clear_pid_file(&data),
+        Ok(()) => {
+            backup::release_writer(&data);
+            backup::clear_pid_file(&data);
+        }
         Err(e) => {
+            backup::release_writer(&data);
             eprintln!("serve failed: {}", e);
             std::process::exit(1);
         }
@@ -4273,6 +4292,12 @@ fn cmd_daemon_status(flags: &HashMap<String, String>) {
         "config_file": config_file.to_string_lossy(),
         "effective_bind": effective_bind.clone(),
     });
+    let writer = backup::writer_lock_owner(&data);
+    status["store"] = json!(inspect_store_health(&data).as_str());
+    status["writer"] = match &writer {
+        Some((writer_pid, writer_bind)) => json!({"pid": writer_pid, "bind": writer_bind}),
+        None => Value::Null,
+    };
     if let Some((pid, bind)) = read_pid(flags) {
         status["pid"] = json!(pid);
         let c = Client {
@@ -4295,9 +4320,15 @@ fn cmd_daemon_status(flags: &HashMap<String, String>) {
         println!("{}", serde_json::to_string_pretty(&status).unwrap_or_default());
         return;
     }
+    let store_label = status["store"].as_str().unwrap_or("unknown");
+    let writer_text = match &writer {
+        Some((writer_pid, writer_bind)) => format!("writer pid {} bind {}", writer_pid, writer_bind),
+        None => "writer none".to_string(),
+    };
     if status["pid"].is_null() {
         println!("daemon offline | data {}", data.display());
         println!("config {}  effective_bind {}", config_file.display(), effective_bind);
+        println!("store {}  {}", store_label, writer_text);
         return;
     }
     println!(
@@ -4309,6 +4340,7 @@ fn cmd_daemon_status(flags: &HashMap<String, String>) {
         status["data_dir"].as_str().unwrap_or("-")
     );
     println!("config {}  effective_bind {}", config_file.display(), effective_bind);
+    println!("store {}  {}", store_label, writer_text);
 }
 
 fn cmd_daemon_config(flags: &HashMap<String, String>, pos: &[String]) {
@@ -4520,6 +4552,7 @@ fn cmd_daemon_start(flags: &HashMap<String, String>) {
 }
 
 fn cmd_daemon_stop(flags: &HashMap<String, String>) {
+    let data = data_dir_for(flags);
     let (pid, bind) = match read_pid(flags) {
         Some(p) => p,
         None => {
@@ -4555,6 +4588,9 @@ fn cmd_daemon_stop(flags: &HashMap<String, String>) {
     if released {
         let _ = std::fs::remove_file(pid_path(flags));
         println!("daemon stopped (pid {} bind {})", pid, bind);
+        if data.join("roamway.lock").exists() {
+            println!("stale writer lock will be taken over on next start");
+        }
     } else {
         eprintln!("daemon pid {} still listening on {}", pid, bind);
     }

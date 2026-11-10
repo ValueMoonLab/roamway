@@ -232,10 +232,25 @@ pub struct State {
     pub seq: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StoreHealth { Fresh, Ok, Recovered, Unrecoverable }
+
+impl StoreHealth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StoreHealth::Fresh => "fresh",
+            StoreHealth::Ok => "ok",
+            StoreHealth::Recovered => "recovered",
+            StoreHealth::Unrecoverable => "unrecoverable",
+        }
+    }
+}
 pub struct Store {
     pub dir: PathBuf,
     pub state: State,
     pub loaded_ok: bool,
+    pub store_health: StoreHealth,
+    pub preserve_backup: bool,
     /// 上次成功写入 state.json 的内容 FNV-1a 64 哈希；0 表示尚无写入记录。
     pub last_write_hash: u64,
     /// 成功写入 state.json 的次数（内存态，不序列化到 state.json）。
@@ -250,7 +265,9 @@ impl Store {
         let _ = fs::create_dir_all(dir.join("logs"));
         let p = dir.join("state.json");
         let bak = dir.join("state.json.bak");
-        let (mut state, loaded_ok) = load_state(&p, &bak);
+        let (mut state, store_health) = load_state(&p, &bak);
+        let loaded_ok = store_health != StoreHealth::Unrecoverable;
+        let preserve_backup = store_health != StoreHealth::Ok;
         // 重启后，上次遗留的 queued/running 一律标记 interrupted，绝不自动重放
         let mut dirty = false;
         for r in state.runs.iter_mut() {
@@ -288,6 +305,8 @@ impl Store {
             dir: dir.to_path_buf(),
             state,
             loaded_ok,
+            store_health,
+            preserve_backup,
             // 这三个字段仅内存态、不序列化进 state.json；语义是 "since daemon start"。
             last_write_hash: 0,
             writes_total: 0,
@@ -296,6 +315,7 @@ impl Store {
         if dirty {
             store.save();
         }
+        prune_corrupt_snapshots(dir, 5);
         store
     }
 
@@ -321,7 +341,7 @@ impl Store {
             f.write_all(s.as_bytes())?;
             f.sync_all()?;
             drop(f);
-            if p.exists() {
+            if p.exists() && !self.preserve_backup {
                 fs::rename(&p, &bak)?;
             }
             fs::rename(&tmp, &p)?;
@@ -334,6 +354,7 @@ impl Store {
         }
         self.writes_total += 1;
         self.last_write_hash = hash;
+        self.preserve_backup = false;
         true
     }
 
@@ -358,39 +379,115 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn load_state(p: &Path, bak: &Path) -> (State, bool) {
+fn load_state(p: &Path, bak: &Path) -> (State, StoreHealth) {
     match fs::read(p) {
-        Ok(bytes) if bytes.is_empty() => (State::default(), true),
+        Ok(bytes) if bytes.is_empty() => (State::default(), StoreHealth::Ok),
         Ok(bytes) => match serde_json::from_slice::<State>(&bytes) {
-            Ok(st) => (st, true),
+            Ok(st) => (st, StoreHealth::Ok),
             Err(e) => {
                 eprintln!("roamway: state.json parse failed: {}", e);
-                let ts = now();
-                let corrupt = p.with_file_name(format!("state.json.corrupt-{}", ts));
-                let _ = fs::rename(p, &corrupt);
+                quarantine_corrupt_state(p);
                 recover_from_backup(bak)
             }
         },
-        Err(_) => recover_from_backup(bak),
+        Err(_) => {
+            if !p.exists() && !bak.exists() {
+                (State::default(), StoreHealth::Fresh)
+            } else {
+                recover_from_backup(bak)
+            }
+        }
     }
 }
 
-fn recover_from_backup(bak: &Path) -> (State, bool) {
+fn quarantine_corrupt_state(p: &Path) {
+    let mut ts = now();
+    let mut corrupt = p.with_file_name(format!("state.json.corrupt-{}", ts));
+    while corrupt.exists() {
+        ts += 1;
+        corrupt = p.with_file_name(format!("state.json.corrupt-{}", ts));
+    }
+    if let Err(e) = fs::rename(p, &corrupt) {
+        eprintln!("roamway: isolate corrupt state failed: {}", e);
+    }
+}
+
+fn recover_from_backup(bak: &Path) -> (State, StoreHealth) {
     match fs::read(bak) {
         Ok(bytes) => match serde_json::from_slice::<State>(&bytes) {
             Ok(st) => {
                 eprintln!("roamway: recovered state from state.json.bak");
-                (st, true)
+                preserve_known_good_backup(bak);
+                (st, StoreHealth::Recovered)
             }
             Err(e) => {
                 eprintln!("roamway: state.json.bak parse failed: {}", e);
-                (State::default(), false)
+                (State::default(), StoreHealth::Unrecoverable)
             }
         },
         Err(e) => {
             eprintln!("roamway: no usable state ({}); starting empty", e);
-            (State::default(), false)
+            (State::default(), StoreHealth::Unrecoverable)
         }
+    }
+}
+
+fn preserve_known_good_backup(bak: &Path) {
+    let known = bak.with_file_name("state.json.bak.known-good");
+    if known.exists() {
+        return;
+    }
+    if let Err(e) = fs::copy(bak, &known) {
+        eprintln!("roamway: preserve known-good backup failed: {}", e);
+    }
+}
+
+/// 只读体检，不落盘、不隔离坏文件、不触发 interrupted 标记。
+pub fn inspect_store_health(dir: &Path) -> StoreHealth {
+    let p = dir.join("state.json");
+    let bak = dir.join("state.json.bak");
+    let state_exists = p.is_file();
+    let bak_exists = bak.is_file();
+    if !state_exists && !bak_exists {
+        return StoreHealth::Fresh;
+    }
+    if let Ok(bytes) = fs::read(&p) {
+        if bytes.is_empty() {
+            return StoreHealth::Ok;
+        }
+        if serde_json::from_slice::<State>(&bytes).is_ok() {
+            return StoreHealth::Ok;
+        }
+    }
+    if bak_exists {
+        if let Ok(bytes) = fs::read(&bak) {
+            if serde_json::from_slice::<State>(&bytes).is_ok() {
+                return StoreHealth::Recovered;
+            }
+        }
+    }
+    StoreHealth::Unrecoverable
+}
+
+pub fn prune_corrupt_snapshots(dir: &Path, keep: usize) {
+    let mut snaps: Vec<(i64, PathBuf)> = Vec::new();
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some(suffix) = name.strip_prefix("state.json.corrupt-") {
+                if let Ok(epoch) = suffix.parse::<i64>() {
+                    snaps.push((epoch, entry.path()));
+                }
+            }
+        }
+    }
+    if snaps.len() <= keep {
+        return;
+    }
+    snaps.sort_by_key(|(epoch, _)| *epoch);
+    let remove = snaps.len() - keep;
+    for (_, path) in snaps.into_iter().take(remove) {
+        let _ = fs::remove_file(path);
     }
 }
 
@@ -504,8 +601,8 @@ mod tests {
         let bak = dir.join("state.json.bak");
         fs::write(&p, "{ bad json").unwrap();
         fs::write(&bak, r#"{"runs":[],"jobs":[],"seq":0}"#).unwrap();
-        let (state, ok) = load_state(&p, &bak);
-        assert!(ok);
+        let (state, health) = load_state(&p, &bak);
+        assert_eq!(health, StoreHealth::Recovered);
         assert!(state.runs.is_empty());
         assert!(!p.exists());
         let _ = fs::remove_dir_all(&dir);
@@ -518,8 +615,8 @@ mod tests {
         let p = dir.join("state.json");
         let bak = dir.join("state.json.bak");
         fs::write(&p, "{ bad json").unwrap();
-        let (state, ok) = load_state(&p, &bak);
-        assert!(!ok);
+        let (state, health) = load_state(&p, &bak);
+        assert_eq!(health, StoreHealth::Unrecoverable);
         assert!(state.runs.is_empty());
         let corrupt_exists = fs::read_dir(&dir)
             .unwrap()
@@ -540,6 +637,8 @@ mod tests {
                 ..Default::default()
             },
             loaded_ok: true,
+            store_health: StoreHealth::Ok,
+            preserve_backup: false,
             last_write_hash: 0,
             writes_total: 0,
             writes_skipped: 0,
@@ -553,6 +652,8 @@ mod tests {
                 ..Default::default()
             },
             loaded_ok: true,
+            store_health: StoreHealth::Ok,
+            preserve_backup: false,
             last_write_hash: 0,
             writes_total: 0,
             writes_skipped: 0,
@@ -573,6 +674,8 @@ mod tests {
                 ..Default::default()
             },
             loaded_ok: true,
+            store_health: StoreHealth::Ok,
+            preserve_backup: false,
             last_write_hash: 0,
             writes_total: 0,
             writes_skipped: 0,
@@ -647,6 +750,108 @@ mod tests {
         assert_eq!(store.state.runs.len(), 1);
         assert_eq!(store.state.runs[0].status, RunStatus::Interrupted);
         assert!(store.state.runs[0].ended_at.is_some());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_health_fresh_on_empty_dir() {
+        let dir = std::env::temp_dir().join(format!("roamway-health-fresh-{}", now()));
+        let _ = fs::remove_dir_all(&dir);
+        let store = Store::load(&dir);
+        assert_eq!(store.store_health, StoreHealth::Fresh);
+        assert!(store.loaded_ok);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_health_ok_on_good_state() {
+        let dir = std::env::temp_dir().join(format!("roamway-health-ok-{}", now()));
+        let _ = fs::create_dir_all(&dir);
+        let state = State { seq: 7, ..Default::default() };
+        fs::write(dir.join("state.json"), serde_json::to_vec(&state).unwrap()).unwrap();
+        let store = Store::load(&dir);
+        assert_eq!(store.store_health, StoreHealth::Ok);
+        assert!(store.loaded_ok);
+        assert_eq!(store.state.seq, 7);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_health_recovered_from_backup() {
+        let dir = std::env::temp_dir().join(format!("roamway-health-recovered-{}", now()));
+        let _ = fs::create_dir_all(&dir);
+        fs::write(dir.join("state.json"), b"{ bad json").unwrap();
+        let good = State { seq: 9, ..Default::default() };
+        fs::write(dir.join("state.json.bak"), serde_json::to_vec(&good).unwrap()).unwrap();
+        let store = Store::load(&dir);
+        assert_eq!(store.store_health, StoreHealth::Recovered);
+        assert!(store.loaded_ok);
+        assert_eq!(store.state.seq, 9);
+        assert!(dir.join("state.json.bak.known-good").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_health_unrecoverable_when_both_bad() {
+        let dir = std::env::temp_dir().join(format!("roamway-health-unrecoverable-{}", now()));
+        let _ = fs::create_dir_all(&dir);
+        fs::write(dir.join("state.json"), b"{ bad json").unwrap();
+        fs::write(dir.join("state.json.bak"), b"{ also bad").unwrap();
+        let store = Store::load(&dir);
+        assert_eq!(store.store_health, StoreHealth::Unrecoverable);
+        assert!(!store.loaded_ok);
+        assert!(store.state.runs.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_skips_backup_rotation_while_preserving() {
+        let dir = std::env::temp_dir().join(format!("roamway-save-preserve-{}", now()));
+        let _ = fs::create_dir_all(&dir);
+        fs::write(dir.join("state.json.bak"), b"known-good-original").unwrap();
+        let mut store = Store {
+            dir: dir.clone(),
+            state: State { seq: 7, ..Default::default() },
+            loaded_ok: true,
+            store_health: StoreHealth::Recovered,
+            preserve_backup: true,
+            last_write_hash: 0,
+            writes_total: 0,
+            writes_skipped: 0,
+        };
+        assert!(store.save());
+        assert!(dir.join("state.json").exists());
+        assert_eq!(fs::read(dir.join("state.json.bak")).unwrap(), b"known-good-original");
+        assert!(!store.preserve_backup);
+        store.state.seq += 1;
+        assert!(store.save());
+        let rotated = fs::read(dir.join("state.json.bak")).unwrap();
+        assert_ne!(rotated, b"known-good-original");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_snapshots_capped_at_five() {
+        let dir = std::env::temp_dir().join(format!("roamway-snapshots-{}", now()));
+        let _ = fs::create_dir_all(&dir);
+        for epoch in 1..=7 {
+            fs::write(dir.join(format!("state.json.corrupt-{}", epoch)), b"x").unwrap();
+        }
+        prune_corrupt_snapshots(&dir, 5);
+        let mut names: Vec<String> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("state.json.corrupt-"))
+            .collect();
+        names.sort();
+        assert_eq!(names, vec![
+            "state.json.corrupt-3",
+            "state.json.corrupt-4",
+            "state.json.corrupt-5",
+            "state.json.corrupt-6",
+            "state.json.corrupt-7",
+        ]);
         let _ = fs::remove_dir_all(&dir);
     }
 }

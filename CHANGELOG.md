@@ -1,5 +1,25 @@
 # Changelog
 
+## 1.3.0
+
+数据目录单写者与 store 健康可观测（P26）：同一个 `<data>` 只允许一个写者，降级启动对外可见，
+且降级时不覆盖最后一份可用备份。
+
+### Added
+
+- `serve` 单写者锁 `<data>/roamway.lock`：当前进程正服务同一目录时，第二个 `serve` 直接退出
+  码 3；`--force` 显式接管（打印「two writers will corrupt state.json」警告）。
+- `StoreHealth` 四值（`fresh` / `ok` / `recovered` / `unrecoverable`）：`/readyz` 追加 `"store"`
+  字段，`recovered` 仍 200，`unrecoverable` 回 503 `state_unreadable`；`/healthz` 不变。
+- `roamway daemon status` JSON 增加 `"store"` 与 `"writer"`；文本模式多一行
+  `store ... writer pid ... bind ...`，daemon 离线也直接本地体检 `state.json`。
+
+### Changed
+
+- 降级启动时把可用的 `.bak` 复制为 `state.json.bak.known-good`（已存在不覆盖），并让降级后的
+  首笔 `save()` 跳过 `.bak` 轮换，保住最后一份已知良好备份。
+- 坏文件隔离快照 `state.json.corrupt-*` 只保留最近 5 份，避免反复崩溃无限堆积。
+
 ## 1.2.0
 
 探活可分性、版本定版、usage 面收口（P25），叠加无人值守运行面的第二段（P21–P24）：只读 Web 面板、

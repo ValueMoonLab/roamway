@@ -8,6 +8,17 @@ roamway daemon status          # 看 pid / bind / offline
 
 `EADDRINUSE` 时先用 `daemon stop` 释放，或换端口 `--bind 127.0.0.1:8797`。Windows 上 `daemon stop` 用 `taskkill` 并校验端口释放。
 
+## 第二个实例起不来（exit 3）
+
+同一 `<data>` 只能有一个写者。第二个 `roamway serve --data <同目录>` 会 exit 3，提示
+`already served by pid <N> (bind <B>)`，而不是静默双写 `state.json`。
+
+- 确认是谁在跑：`roamway daemon status` 看 `pid`/`bind`，或直接读 `<data>/roamway.lock`。
+- 正常迁移：先 `roamway daemon stop`（旧进程退出、端口释放），再启动新实例。
+- 确认旧进程已死但锁还在：下一次 `serve` 会走 stale 接管路径自动删除重试，不必手动删。
+- 没有旧实例也要立刻接管：`roamway serve --force` 跳过存活校验覆盖锁，并打印
+  `two writers will corrupt state.json` 警告——只在确认无人服务时使用。
+
 ## token 401
 
 - 客户端缺 token：加 `--token T`，或设 `ROAMWAY_TOKEN`，或写入 `<data>/token`。
@@ -69,6 +80,19 @@ roamway prune --keep 5            # 本次临时覆盖阈值，不改配置文�
 - daemon 活体判定按三种证据短路：`<data>/roamway.pid` 对应的进程存活 → `pid ...`；`<data>/heartbeat` 60 秒内有更新 → `heartbeat ...s ago`；`<data>/bind` 指向的端口可连接 → `port ... accepts connections`。任一命中且无 `--force` 时 `restore` 退出码 3 且一个字节都不写。
 - `--force` 只跳过停服检查，不是热合并；在活体上强恢复会丢掉 daemon 内存里尚未落盘的运行记录（其下次 save 会覆盖回去），请先 `kill`（或 `roamway daemon stop`）再 `restore`。
 - 与 `state.json.bak` 的区别：`state.json.bak` 是最后一次写盘前的上一版，会被下一次写覆盖；`roamway-backup-*` 是显式快照，可长期保留。
+
+## `/readyz` 回 503 `state_unreadable`
+
+`state.json` 与 `state.json.bak` 都不可用时，只读探针 `/readyz` 回 503 并带 `"store":"unrecoverable"`，
+但 liveness（`/healthz`）仍是 200：进程活着，只是不能安全承接流量。
+
+- 先停服：`roamway daemon stop`。
+- 可用备份在两处：`<data>/state.json.bak`（最后一次写盘前的上一版）与
+  `<data>/state.json.bak.known-good`（降级启动时留下的已知良好副本）。
+- 有 `backup` 快照时直接回滚：`roamway restore --from <data>/backups/roamway-backup-*`。
+- 没有快照时：停止 daemon 后，用 `state.json.bak.known-good` 或 `state.json.bak` 手动替换
+  `state.json`；替换前先备份现有坏文件。
+- 重建后重新 `serve`，`/readyz` 应回到 200，`daemon status` 的 `store` 回到 `ok`/`recovered`。
 
 ## 帮助与退出码
 

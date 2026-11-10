@@ -296,6 +296,128 @@ pub fn clear_pid_file(data: &Path) {
     }
 }
 
+const WRITER_LOCK_FILE: &str = "roamway.lock";
+
+fn writer_lock_path(data: &Path) -> PathBuf {
+    data.join(WRITER_LOCK_FILE)
+}
+
+/// 解析 `<pid> <bind> <iso>`；解析不出来（0 字节/乱码）视为 stale。
+fn read_writer_lock(lock_path: &Path) -> Option<(u32, String)> {
+    let raw = fs::read_to_string(lock_path).ok()?;
+    let mut fields = raw.splitn(3, ' ');
+    let owner_pid: u32 = fields.next()?.trim().parse().ok()?;
+    let owner_bind = fields.next()?.trim().to_string();
+    if owner_bind.is_empty() {
+        return None;
+    }
+    Some((owner_pid, owner_bind))
+}
+
+/// 只读查看当前锁 owner：`(pid, bind)`，无锁/坏文件返回 `None`。
+pub fn writer_lock_owner(data: &Path) -> Option<(u32, String)> {
+    read_writer_lock(&writer_lock_path(data))
+}
+
+pub fn try_acquire_writer_with(
+    data: &Path,
+    bind: &str,
+    self_pid: u32,
+    alive: &dyn Fn(u32) -> bool,
+) -> Result<u32, (u32, String)> {
+    let lock_path = writer_lock_path(data);
+    for _ in 0..2 {
+        let mut lock_file = match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(_) => match read_writer_lock(&lock_path) {
+                Some((owner_pid, owner_bind)) if alive(owner_pid) && owner_pid != self_pid => {
+                    return Err((owner_pid, owner_bind));
+                }
+                _ => {
+                    let _ = fs::remove_file(&lock_path);
+                    continue;
+                }
+            },
+        };
+        let content = format!(
+            "{} {} {}\n",
+            self_pid,
+            bind,
+            crate::types::iso(crate::types::now())
+        );
+        if let Err(e) = lock_file.write_all(content.as_bytes()) {
+            eprintln!("roamway: write writer lock failed: {}", e);
+            let _ = fs::remove_file(&lock_path);
+            continue;
+        }
+        if let Err(e) = lock_file.sync_all() {
+            eprintln!("roamway: write writer lock failed: {}", e);
+            let _ = fs::remove_file(&lock_path);
+            continue;
+        }
+        return Ok(self_pid);
+    }
+    match read_writer_lock(&lock_path) {
+        Some((owner_pid, owner_bind)) => Err((owner_pid, owner_bind)),
+        None => Err((0, String::new())),
+    }
+}
+
+pub fn acquire_writer(data: &Path, bind: &str) -> Result<u32, (u32, String)> {
+    let alive: &dyn Fn(u32) -> bool = &(process_alive as fn(u32) -> bool);
+    try_acquire_writer_with(data, bind, std::process::id(), alive)
+}
+
+pub fn force_acquire_writer(data: &Path, bind: &str) -> std::io::Result<u32> {
+    let self_pid = std::process::id();
+    let lock_path = writer_lock_path(data);
+    let mut lock_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&lock_path)?;
+    lock_file.write_all(
+        format!(
+            "{} {} {}\n",
+            self_pid,
+            bind,
+            crate::types::iso(crate::types::now())
+        )
+        .as_bytes(),
+    )?;
+    lock_file.sync_all()?;
+    Ok(self_pid)
+}
+
+pub fn release_writer(data: &Path) {
+    let self_pid = std::process::id();
+    if writer_lock_owner(data).map(|(owner_pid, _)| owner_pid) == Some(self_pid) {
+        let _ = fs::remove_file(writer_lock_path(data));
+    }
+}
+
+pub fn writer_busy_message(data: &Path, owner_pid: u32, owner_bind: &str) -> String {
+    format!(
+        "roamway: data dir {} is already served by pid {} (bind {}); stop it first or pass --force",
+        data.display(),
+        owner_pid,
+        owner_bind
+    )
+}
+
+pub fn writer_takeover_message(data: &Path, owner_pid: u32) -> String {
+    format!(
+        "roamway: --force taking over data dir {} from pid {}; two writers will corrupt state.json",
+        data.display(),
+        owner_pid
+    )
+}
+
+
 #[cfg(target_os = "linux")]
 fn process_alive(pid: u32) -> bool {
     Path::new("/proc").join(pid.to_string()).exists()
@@ -855,4 +977,107 @@ mod tests {
         let _ = fs::remove_dir_all(&data);
         let _ = fs::remove_dir_all(&from);
     }
+
+    #[test]
+    fn acquire_writer_creates_lock_with_pid_and_bind() {
+        let data = tmp("writer-create");
+        fs::create_dir_all(&data).unwrap();
+        let owner_pid = 4242;
+        let bind = "127.0.0.1:8796";
+        let got = try_acquire_writer_with(&data, bind, owner_pid, &|_| false).unwrap();
+        assert_eq!(got, owner_pid);
+        let raw = fs::read_to_string(data.join("roamway.lock")).unwrap();
+        let fields: Vec<&str> = raw.split_whitespace().collect();
+        assert_eq!(fields[0], "4242");
+        assert_eq!(fields[1], bind);
+        assert!(fields.len() >= 3, "lock must include an iso timestamp");
+        let _ = fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn second_writer_refused_when_owner_alive() {
+        let data = tmp("writer-busy");
+        fs::create_dir_all(&data).unwrap();
+        let lock = data.join("roamway.lock");
+        fs::write(&lock, "111 10.0.0.1:9000 2020-01-01T00:00:00Z\n").unwrap();
+        let before = fs::read(&lock).unwrap();
+        let err = try_acquire_writer_with(&data, "127.0.0.1:9001", 4242, &|_| true).unwrap_err();
+        assert_eq!(err, (111, "10.0.0.1:9000".to_string()));
+        assert_eq!(fs::read(&lock).unwrap(), before, "lock file must be left untouched");
+        let _ = fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn stale_lock_taken_over_when_owner_dead() {
+        let data = tmp("writer-stale");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("roamway.lock"), "111 10.0.0.1:9000 2020-01-01T00:00:00Z\n").unwrap();
+        let got = try_acquire_writer_with(&data, "127.0.0.1:8796", 4242, &|_| false).unwrap();
+        assert_eq!(got, 4242);
+        let raw = fs::read_to_string(data.join("roamway.lock")).unwrap();
+        let fields: Vec<&str> = raw.split_whitespace().collect();
+        assert_eq!(fields[0], "4242");
+        assert_eq!(fields[1], "127.0.0.1:8796");
+        let _ = fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn stale_lock_taken_over_when_owner_is_self() {
+        let data = tmp("writer-self");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("roamway.lock"), "4242 bind-a 2020-01-01T00:00:00Z\n").unwrap();
+        let got = try_acquire_writer_with(&data, "bind-b", 4242, &|_| true).unwrap();
+        assert_eq!(got, 4242);
+        let raw = fs::read_to_string(data.join("roamway.lock")).unwrap();
+        let fields: Vec<&str> = raw.split_whitespace().collect();
+        assert_eq!(fields[0], "4242");
+        assert_eq!(fields[1], "bind-b");
+        let _ = fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn garbage_lock_file_treated_as_stale() {
+        let data = tmp("writer-garbage");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("roamway.lock"), b"not-a-lock").unwrap();
+        let got = try_acquire_writer_with(&data, "127.0.0.1:8796", 4242, &|_| true).unwrap();
+        assert_eq!(got, 4242);
+        let _ = fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn release_writer_only_when_owner() {
+        let data = tmp("writer-release");
+        fs::create_dir_all(&data).unwrap();
+        let lock = data.join("roamway.lock");
+        fs::write(&lock, "4294967295 some-bind 2020-01-01T00:00:00Z\n").unwrap();
+        release_writer(&data);
+        assert!(lock.exists(), "another writer's lock must not be removed");
+        fs::write(&lock, format!("{} bind 2020-01-01T00:00:00Z\n", std::process::id())).unwrap();
+        release_writer(&data);
+        assert!(!lock.exists());
+        let _ = fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn force_takeover_overwrites_live_lock() {
+        let data = tmp("writer-force");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("roamway.lock"), "111 10.0.0.1:9000 2020-01-01T00:00:00Z\n").unwrap();
+        let got = force_acquire_writer(&data, "127.0.0.1:8796").unwrap();
+        assert_eq!(got, std::process::id());
+        let raw = fs::read_to_string(data.join("roamway.lock")).unwrap();
+        let fields: Vec<&str> = raw.split_whitespace().collect();
+        assert_eq!(fields[0], std::process::id().to_string());
+        assert_eq!(fields[1], "127.0.0.1:8796");
+        let _ = fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn busy_message_mentions_pid_and_bind() {
+        let message = writer_busy_message(Path::new("E:/data"), 4242, "[::1]:8796");
+        assert!(message.contains("4242"));
+        assert!(message.contains("[::1]:8796"));
+    }
+
 }
