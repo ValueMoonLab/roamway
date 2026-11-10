@@ -979,7 +979,7 @@ fn print_command_help(cmd: &str) -> bool {
         "stop" => "roamway stop ID [--host H]",
         "rm" => "roamway rm ID",
         "jobs" => "roamway jobs",
-        "jobs-add" => "roamway jobs-add --agent shell --every 3600 | --daily 08:30 [--model M] [--workspace DIR] [--max-retries 2] \"prompt\"",
+        "jobs-add" => "roamway jobs-add --agent shell --every 3600 | --daily 08:30 [--model M] [--workspace DIR] [--max-retries 2] [--after JOB]... \"prompt\"",
         "jobs-run" => "roamway jobs-run ID",
         "jobs-rm" => "roamway jobs-rm ID",
         "health" => "roamway health",
@@ -1749,8 +1749,8 @@ fn cmd_jobs(flags: &HashMap<String, String>) {
             let empty = vec![];
             let jobs = v["jobs"].as_array().unwrap_or(&empty);
             println!(
-                "{:<10} {:<5} {:<8} {:<10} {:<26} {:<20} {}",
-                "ID", "ON", "AGENT", "EVERY", "NEXT", "LAST", "TITLE"
+                "{:<10} {:<5} {:<8} {:<10} {:<26} {:<20} {:<16} {}",
+                "ID", "ON", "AGENT", "EVERY", "NEXT", "LAST", "AFTER", "TITLE"
             );
             for j in jobs {
                 let every = j["every_secs"]
@@ -1758,15 +1758,32 @@ fn cmd_jobs(flags: &HashMap<String, String>) {
                     .map(|s| format!("{}s", s))
                     .or_else(|| j["daily"].as_str().map(|d| format!("@{}", d)))
                     .unwrap_or_else(|| "-".into());
+                let after = j["depends_on"]
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "-".into());
+                // last_skip 不单独占列，行尾追加，避免破坏既有对齐
+                let suffix = match j["last_skip"].as_str() {
+                    Some(s) if !s.is_empty() => format!("  ! {}", s),
+                    _ => String::new(),
+                };
                 println!(
-                    "{:<10} {:<5} {:<8} {:<10} {:<26} {:<20} {}",
+                    "{:<10} {:<5} {:<8} {:<10} {:<26} {:<20} {:<16} {}{}",
                     j["id"].as_str().unwrap_or(""),
                     if j["enabled"].as_bool().unwrap_or(false) { "yes" } else { "no" },
                     j["agent"].as_str().unwrap_or(""),
                     every,
                     j["next_at"].as_i64().map(iso).unwrap_or_else(|| "-".into()),
                     j["last_run"].as_str().unwrap_or("-"),
-                    trunc(j["title"].as_str().unwrap_or(""), 36)
+                    after,
+                    trunc(j["title"].as_str().unwrap_or(""), 36),
+                    suffix
                 );
             }
         }
@@ -1800,11 +1817,29 @@ fn cmd_jobs_add(flags: &HashMap<String, String>, pos: &[String]) {
     if let Some(tz) = flags.get("tz") {
         body["tz_offset_hours"] = json!(tz.parse::<i64>().ok());
     }
+    // --after 可重复：前置任务，全部成功后才允许触发
+    let after = flag_many(flags, "after");
+    if !after.is_empty() {
+        body["depends_on"] = json!(after);
+    }
     let c = local_client(flags);
     match c.req("POST", "/v1/jobs", Some(body)) {
         Ok(v) => println!("{}", serde_json::to_string_pretty(&v["job"]).unwrap_or_default()),
-        Err(e) => eprintln!("jobs-add failed: {}", e),
+        Err(e) => eprintln!("{}", api_error_text("jobs-add", &e)),
     }
+}
+
+/// 把 `HTTP 400: {"error":"jobs-add --after: ..."}` 收敛成裸文案，
+/// 让 CLI 打印的文案与服务端校验完全一致（脚本可直接 grep）。
+fn api_error_text(cmd: &str, raw: &str) -> String {
+    if let Some(pos) = raw.find('{') {
+        if let Ok(v) = serde_json::from_str::<Value>(&raw[pos..]) {
+            if let Some(msg) = v["error"].as_str() {
+                return msg.to_string();
+            }
+        }
+    }
+    format!("{} failed: {}", cmd, raw)
 }
 
 fn cmd_jobs_run(flags: &HashMap<String, String>, pos: &[String]) {
@@ -1814,7 +1849,12 @@ fn cmd_jobs_run(flags: &HashMap<String, String>, pos: &[String]) {
     };
     let c = local_client(flags);
     match c.req("POST", &format!("/v1/jobs/{}/run", id), Some(json!({}))) {
-        Ok(v) => println!("{}", serde_json::to_string(&v).unwrap_or_default()),
+        Ok(v) => {
+            println!("{}", serde_json::to_string(&v).unwrap_or_default());
+            if v["deps_bypassed"].as_bool().unwrap_or(false) && !format_is_json(flags) {
+                eprintln!("note: dependencies not satisfied, running anyway");
+            }
+        }
         Err(e) => eprintln!("jobs-run failed: {}", e),
     }
 }

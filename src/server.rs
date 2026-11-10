@@ -602,6 +602,7 @@ fn handle<C: Conn>(app: Arc<App>, mut s: C) -> std::io::Result<()> {
                 return respond_static(&mut s, code, ct, body.as_bytes(), &[]);
             }
             UiResponse::NotFound => {
+                count_failed(&app, 404);
                 return respond_static(&mut s, 404, "text/plain; charset=utf-8", b"not found", &[]);
             }
         }
@@ -1038,6 +1039,9 @@ struct NewJob {
     allow_overlap: Option<bool>,
     #[serde(default)]
     enabled: Option<bool>,
+    /// 前置任务 id 列表（CLI `--after`，可重复）
+    #[serde(default)]
+    depends_on: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -1310,15 +1314,20 @@ fn route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         }
         ("POST", ["v1", "jobs"]) => create_job(app, req),
         ("POST", ["v1", "jobs", id, "run"]) => {
-            let exists = {
+            // 手工触发显式绕过依赖；依赖未满足时在响应里标注，便于脚本/CLI 提示
+            let blocked = {
                 let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
-                st.state.jobs.iter().any(|j| j.id == *id)
+                match st.state.jobs.iter().find(|j| j.id == *id) {
+                    None => return (404, json!({"error": "no such job"})),
+                    Some(j) => jobs::dep_block(&st.state, j),
+                }
             };
-            if !exists {
-                return (404, json!({"error": "no such job"}));
-            }
             jobs::spawn_from_job(app.clone(), id);
-            (200, json!({"ok": true, "triggered": id}))
+            let mut out = json!({"ok": true, "triggered": id});
+            if blocked.is_some() {
+                out["deps_bypassed"] = json!(true);
+            }
+            (200, out)
         }
         ("POST", ["v1", "jobs", id, "enable"]) => set_job_enabled(app, id, true),
         ("POST", ["v1", "jobs", id, "disable"]) => set_job_enabled(app, id, false),
@@ -2802,6 +2811,75 @@ fn delete_run(app: &Arc<App>, id: &str) -> (u16, Value) {
     (200, json!({"ok": true, "removed": id}))
 }
 
+/// 依赖校验（服务端权威）：空串/不存在、自引用、成环。返回规范化后的依赖列表。
+/// 错误文案与 CLI 侧严格一致，便于脚本 grep。
+fn validate_job_deps(existing: &[Job], new_id: &str, deps: &[String]) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for d in deps {
+        if d.is_empty() {
+            return Err(format!("jobs-add --after: no such job: {}", d));
+        }
+        if d == new_id {
+            return Err("jobs-add --after: self reference".to_string());
+        }
+        if !existing.iter().any(|j| j.id == *d) {
+            return Err(format!("jobs-add --after: no such job: {}", d));
+        }
+        if !out.contains(d) {
+            out.push(d.clone());
+        }
+    }
+    if out.is_empty() {
+        return Ok(out);
+    }
+    // 环检测：从待建节点出发 DFS，遇到回边即报，路径按访问顺序拼接
+    let mut adj: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for j in existing {
+        adj.insert(j.id.clone(), j.depends_on.clone());
+    }
+    adj.insert(new_id.to_string(), out.clone());
+    if let Some(path) = dep_cycle_path(&adj, new_id) {
+        return Err(format!(
+            "jobs-add --after: dependency cycle: {}",
+            path.join(" -> ")
+        ));
+    }
+    Ok(out)
+}
+
+/// 从 origin 出发找回到 origin 的依赖路径（`a -> b -> a`）。
+fn dep_cycle_path(
+    adj: &std::collections::BTreeMap<String, Vec<String>>,
+    origin: &str,
+) -> Option<Vec<String>> {
+    fn walk(
+        adj: &std::collections::BTreeMap<String, Vec<String>>,
+        cur: &str,
+        origin: &str,
+        stack: &mut Vec<String>,
+    ) -> Option<Vec<String>> {
+        for next in adj.get(cur).map(|v| v.as_slice()).unwrap_or(&[]) {
+            if next == origin {
+                let mut path = stack.clone();
+                path.push(next.clone());
+                return Some(path);
+            }
+            if stack.iter().any(|s| s == next) {
+                continue; // 与 origin 无关的环，不在此报
+            }
+            stack.push(next.clone());
+            if let Some(p) = walk(adj, next, origin, stack) {
+                return Some(p);
+            }
+            stack.pop();
+        }
+        None
+    }
+    let mut stack = vec![origin.to_string()];
+    walk(adj, origin, origin, &mut stack)
+}
+
 fn create_job(app: &Arc<App>, req: &Req) -> (u16, Value) {
     let spec: NewJob = match serde_json::from_slice(&req.body) {
         Ok(v) => v,
@@ -2843,8 +2921,14 @@ fn create_job(app: &Arc<App>, req: &Req) -> (u16, Value) {
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| ".".into()),
     };
+    let spec_deps = spec.depends_on.unwrap_or_default();
     let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+    // next_id 只动内存里的 seq；校验失败直接返回，不落库（seq 不持久化）
     let id = st.next_id("job");
+    let deps = match validate_job_deps(&st.state.jobs, &id, &spec_deps) {
+        Ok(v) => v,
+        Err(msg) => return (400, json!({ "error": msg })),
+    };
     let j = Job {
         id: id.clone(),
         title: spec.title.unwrap_or_else(|| String::new()),
@@ -2863,6 +2947,8 @@ fn create_job(app: &Arc<App>, req: &Req) -> (u16, Value) {
         last_run: None,
         last_error: None,
         attempts: 0,
+        depends_on: deps,
+        last_skip: None,
     };
     st.state.jobs.push(j.clone());
     st.save();
@@ -3880,6 +3966,23 @@ mod tests {
             post.lines().next().unwrap_or("")
         );
 
+        // 404 也走响应码 >= 400 的统一计数（UI 静态资源缺失）
+        let failed_before = app.req_failed.load(Ordering::Relaxed);
+        let miss = http_roundtrip(
+            app.clone(),
+            "GET /ui/missing.js HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        );
+        assert!(
+            miss.starts_with("HTTP/1.1 404"),
+            "expected 404, got {}",
+            miss.lines().next().unwrap_or("")
+        );
+        assert_eq!(
+            app.req_failed.load(Ordering::Relaxed),
+            failed_before + 1,
+            "404 must be counted exactly once"
+        );
+
         assert!(
             app.req_total.load(Ordering::Relaxed) >= 4,
             "req_total must count every request"
@@ -3889,5 +3992,90 @@ mod tests {
             "req_failed must count 401/405"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn mk_job(id: &str, deps: &[&str]) -> Job {
+        Job {
+            id: id.into(),
+            title: String::new(),
+            agent: "shell".into(),
+            model: None,
+            workspace: String::new(),
+            prompt: "echo hi".into(),
+            every_secs: Some(60),
+            daily: None,
+            tz_offset_hours: 8,
+            timeout_s: 60,
+            max_retries: 0,
+            enabled: true,
+            allow_overlap: false,
+            next_at: 0,
+            last_run: None,
+            last_error: None,
+            attempts: 0,
+            depends_on: deps.iter().map(|s| s.to_string()).collect(),
+            last_skip: None,
+        }
+    }
+
+    #[test]
+    fn after_rejects_unknown_and_empty() {
+        let existing = vec![mk_job("job_000001", &[])];
+        assert_eq!(
+            validate_job_deps(&existing, "job_000002", &["job_999999"].map(String::from)),
+            Err("jobs-add --after: no such job: job_999999".to_string())
+        );
+        assert_eq!(
+            validate_job_deps(&existing, "job_000002", &["".to_string()]),
+            Err("jobs-add --after: no such job: ".to_string())
+        );
+    }
+
+    #[test]
+    fn after_rejects_self_reference() {
+        let existing = vec![mk_job("job_000001", &[])];
+        assert_eq!(
+            validate_job_deps(&existing, "job_000002", &["job_000002".to_string()]),
+            Err("jobs-add --after: self reference".to_string())
+        );
+    }
+
+    #[test]
+    fn after_rejects_direct_cycle() {
+        // 已有 A 依赖待建的 B；现在建 B 并让 B 依赖 A -> b -> a -> b
+        let existing = vec![mk_job("job_000001", &["job_000002"])];
+        assert_eq!(
+            validate_job_deps(&existing, "job_000002", &["job_000001".to_string()]),
+            Err("jobs-add --after: dependency cycle: job_000002 -> job_000001 -> job_000002"
+                .to_string())
+        );
+    }
+
+    #[test]
+    fn after_rejects_indirect_cycle() {
+        // A -> C -> B(待建) -> A
+        let existing = vec![
+            mk_job("job_000001", &["job_000003"]),
+            mk_job("job_000003", &["job_000002"]),
+        ];
+        assert_eq!(
+            validate_job_deps(&existing, "job_000002", &["job_000001".to_string()]),
+            Err("jobs-add --after: dependency cycle: job_000002 -> job_000001 -> job_000003 -> job_000002"
+                .to_string())
+        );
+    }
+
+    #[test]
+    fn after_accepts_acyclic_and_dedupes() {
+        let existing = vec![mk_job("job_000001", &[]), mk_job("job_000002", &[])];
+        let got = validate_job_deps(
+            &existing,
+            "job_000003",
+            &["job_000001".to_string(), "job_000002".to_string(), "job_000001".to_string()],
+        );
+        assert_eq!(
+            got,
+            Ok(vec!["job_000001".to_string(), "job_000002".to_string()])
+        );
     }
 }

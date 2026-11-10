@@ -205,6 +205,12 @@ pub struct Job {
     pub last_error: Option<String>,
     #[serde(default)]
     pub attempts: u32,
+    /// 前置任务 id：只有它们各自最近一次运行成功（done）时才允许触发本任务
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<String>,
+    /// 最近一次因依赖未满足而跳过的原因；成功触发时清空
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_skip: Option<String>,
 }
 
 fn default_tz() -> i64 {

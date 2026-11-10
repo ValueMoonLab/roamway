@@ -730,6 +730,8 @@ mod tests {
                 last_run: None,
                 last_error: None,
                 attempts: 0,
+                depends_on: Vec::new(),
+                last_skip: None,
             },
             Job {
                 id: "job_000002".into(),
@@ -749,6 +751,8 @@ mod tests {
                 last_run: None,
                 last_error: None,
                 attempts: 0,
+                depends_on: Vec::new(),
+                last_skip: None,
             },
         ];
         let out = migrate_jobs(jobs, 1_000_000);

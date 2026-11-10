@@ -51,11 +51,67 @@ pub fn start_scheduler(app: Arc<App>) {
     });
 }
 
-fn collect_due(app: &Arc<App>) -> Vec<String> {
-    let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
-    let t = now();
-    let busy: Vec<String> = st
-        .state
+/// 依赖判定的纯逻辑：None = 全部满足；Some(reason) = 某前置最近一次运行未成功。
+/// 「已满足」＝该前置最新一条 run（created_at 最大）存在且 status == done。
+pub fn dep_block(state: &State, j: &Job) -> Option<String> {
+    for dep in &j.depends_on {
+        match latest_job_run(state, dep) {
+            Some(r) if r.status == RunStatus::Done => {}
+            Some(r) => return Some(format!("waiting for {} ({})", dep, status_word(r.status))),
+            None => return Some(format!("waiting for {} (no runs)", dep)),
+        }
+    }
+    None
+}
+
+/// 某任务最新的一条 run（按 created_at 取最大），用于依赖判定。
+pub fn latest_job_run<'a>(state: &'a State, job_id: &str) -> Option<&'a Run> {
+    state
+        .runs
+        .iter()
+        .filter(|r| r.job_id.as_deref() == Some(job_id))
+        .max_by_key(|r| r.created_at)
+}
+
+/// RunStatus 的小写名（与 serde rename_all="lowercase" 保持一致），
+/// 用于 last_skip 的原因文案。
+pub fn status_word(s: RunStatus) -> &'static str {
+    match s {
+        RunStatus::Queued => "queued",
+        RunStatus::Running => "running",
+        RunStatus::Done => "done",
+        RunStatus::Failed => "failed",
+        RunStatus::Timeout => "timeout",
+        RunStatus::Killed => "killed",
+        RunStatus::Interrupted => "interrupted",
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum DueAction {
+    /// 依赖已满足、无并发冲突 -> 触发
+    Trigger,
+    /// 同 id 有未终结 run 且不允许重叠 -> 5 秒后再看
+    Busy,
+    /// 依赖未满足 -> 推进到下一周期并记录原因（不做 5s 重试，避免空转）
+    Skip(String),
+}
+
+/// 单个 job 本轮该怎么处置（纯函数，collect_due 与单测共用）。
+pub fn due_action(state: &State, j: &Job, busy: bool) -> DueAction {
+    if let Some(reason) = dep_block(state, j) {
+        return DueAction::Skip(reason);
+    }
+    if busy && !j.allow_overlap {
+        return DueAction::Busy;
+    }
+    DueAction::Trigger
+}
+
+/// 纯逻辑：算出本轮要触发的 job id，并把 next_at / last_skip 写好。
+/// 返回 (due, changed)：changed 表示 state 被改过（调用方据此决定是否落盘）。
+pub fn plan_and_apply(state: &mut State, t: i64) -> (Vec<String>, bool) {
+    let busy: Vec<String> = state
         .runs
         .iter()
         .filter(|r| !r.status.terminal())
@@ -63,22 +119,41 @@ fn collect_due(app: &Arc<App>) -> Vec<String> {
         .collect();
 
     let mut due = Vec::new();
-    let mut updates: Vec<(usize, i64)> = Vec::new();
-    for (i, j) in st.state.jobs.iter().enumerate() {
-        if !j.enabled || j.next_at > t {
+    let mut changed = false;
+    let n = state.jobs.len();
+    for i in 0..n {
+        if !state.jobs[i].enabled || state.jobs[i].next_at > t {
             continue;
         }
-        if busy.contains(&j.id) && !j.allow_overlap {
-            updates.push((i, t + 5));
-            continue;
+        // 依赖判定要看全局 runs，先把 job 拷出来，避免同时持有 jobs 的可变借用
+        let j = state.jobs[i].clone();
+        match due_action(state, &j, busy.contains(&j.id)) {
+            DueAction::Trigger => {
+                state.jobs[i].next_at = next_after(&j, t, j.tz_offset_hours);
+                state.jobs[i].last_skip = None;
+                due.push(j.id.clone());
+                changed = true;
+            }
+            DueAction::Busy => {
+                state.jobs[i].next_at = t + 5;
+                state.jobs[i].last_skip = None;
+                changed = true;
+            }
+            DueAction::Skip(reason) => {
+                state.jobs[i].next_at = next_after(&j, t, j.tz_offset_hours);
+                state.jobs[i].last_skip = Some(reason);
+                changed = true;
+            }
         }
-        updates.push((i, next_after(j, t, j.tz_offset_hours)));
-        due.push(j.id.clone());
     }
-    if !due.is_empty() {
-        for (i, na) in updates {
-            st.state.jobs[i].next_at = na;
-        }
+    (due, changed)
+}
+
+fn collect_due(app: &Arc<App>) -> Vec<String> {
+    let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+    let t = now();
+    let (due, changed) = plan_and_apply(&mut st.state, t);
+    if changed {
         st.save();
     }
     due
@@ -220,6 +295,47 @@ mod tests {
             last_run: None,
             last_error: None,
             attempts: 0,
+            depends_on: Vec::new(),
+            last_skip: None,
+        }
+    }
+
+    fn job_with(id: &str, deps: &[&str]) -> Job {
+        let mut j = sample_job(0);
+        j.id = id.into();
+        j.depends_on = deps.iter().map(|s| s.to_string()).collect();
+        j
+    }
+
+    fn run_for(job_id: &str, status: RunStatus, created_at: i64) -> Run {
+        Run {
+            id: format!("run_{}", created_at),
+            title: String::new(),
+            agent: "shell".into(),
+            model: None,
+            workspace: String::new(),
+            prompt: String::new(),
+            status,
+            created_at,
+            started_at: None,
+            ended_at: None,
+            exit_code: None,
+            error: None,
+            resumed: false,
+            resume_note: None,
+            timeout_s: 60,
+            job_id: Some(job_id.into()),
+            pid: None,
+            attempts: 0,
+            agent_id: None,
+            trigger_id: None,
+            usage: None,
+            labels: BTreeMap::new(),
+            env: Vec::new(),
+            cwd: None,
+            options: BTreeMap::new(),
+            images: Vec::new(),
+            worktree: None,
         }
     }
 
@@ -343,5 +459,115 @@ mod tests {
         };
         prune(&mut store);
         assert_eq!(store.state.runs.len(), 800);
+    }
+
+    #[test]
+    fn dep_without_runs_skips_and_advances() {
+        let b = job_with("job_B", &["job_A"]);
+        let mut state = State {
+            runs: vec![],
+            jobs: vec![b],
+            agents: vec![],
+            seq: 0,
+        };
+        let (due, changed) = plan_and_apply(&mut state, 1000);
+        assert!(due.is_empty(), "dep 无 run 时不能触发");
+        assert!(changed);
+        assert_eq!(state.jobs[0].next_at, 1000 + 3600, "next_at 照常推进，不做 5s 空转");
+        assert_eq!(
+            state.jobs[0].last_skip.as_deref(),
+            Some("waiting for job_A (no runs)")
+        );
+    }
+
+    #[test]
+    fn dep_last_done_triggers_and_clears_skip() {
+        let mut b = job_with("job_B", &["job_A"]);
+        b.last_skip = Some("waiting for job_A (failed)".into());
+        let mut state = State {
+            runs: vec![run_for("job_A", RunStatus::Done, 900)],
+            jobs: vec![b],
+            agents: vec![],
+            seq: 0,
+        };
+        let (due, _) = plan_and_apply(&mut state, 1000);
+        assert_eq!(due, vec!["job_B".to_string()]);
+        assert!(state.jobs[0].last_skip.is_none(), "满足后必须清空 last_skip");
+        assert_eq!(state.jobs[0].next_at, 1000 + 3600);
+    }
+
+    #[test]
+    fn dep_last_failed_blocks_even_if_earlier_done() {
+        let mut b = job_with("job_B", &["job_A"]);
+        b.last_skip = None;
+        let mut state = State {
+            runs: vec![
+                run_for("job_A", RunStatus::Done, 900),
+                run_for("job_A", RunStatus::Failed, 950),
+            ],
+            jobs: vec![b],
+            agents: vec![],
+            seq: 0,
+        };
+        let (due, _) = plan_and_apply(&mut state, 1000);
+        assert!(due.is_empty());
+        assert_eq!(
+            state.jobs[0].last_skip.as_deref(),
+            Some("waiting for job_A (failed)")
+        );
+    }
+
+    #[test]
+    fn all_deps_must_be_done() {
+        let b = job_with("job_B", &["job_A", "job_C"]);
+        let mut state = State {
+            runs: vec![run_for("job_A", RunStatus::Done, 900)],
+            jobs: vec![b],
+            agents: vec![],
+            seq: 0,
+        };
+        let (due, _) = plan_and_apply(&mut state, 1000);
+        assert!(due.is_empty(), "两条依赖只满足一条不能触发");
+        assert_eq!(
+            state.jobs[0].last_skip.as_deref(),
+            Some("waiting for job_C (no runs)")
+        );
+    }
+
+    #[test]
+    fn dep_block_reports_reason_per_status() {
+        let j = job_with("job_B", &["job_A"]);
+        let mut state = State {
+            runs: vec![run_for("job_A", RunStatus::Running, 900)],
+            jobs: vec![j.clone()],
+            agents: vec![],
+            seq: 0,
+        };
+        assert_eq!(
+            dep_block(&state, &j).as_deref(),
+            Some("waiting for job_A (running)")
+        );
+        state.runs[0].status = RunStatus::Timeout;
+        assert_eq!(
+            dep_block(&state, &j).as_deref(),
+            Some("waiting for job_A (timeout)")
+        );
+        state.runs[0].status = RunStatus::Done;
+        assert!(dep_block(&state, &j).is_none());
+        // 没有依赖的 job 永远放行
+        let plain = job_with("job_Z", &[]);
+        assert!(dep_block(&state, &plain).is_none());
+    }
+
+    #[test]
+    fn old_state_without_depends_on_still_loads() {
+        let raw = r#"{"id":"job_000009","title":"legacy","agent":"shell",
+            "workspace":"","prompt":"echo hi","every_secs":60,"tz_offset_hours":8,
+            "timeout_s":60,"next_at":1000,"enabled":true}"#;
+        let j: Job = serde_json::from_str(raw).expect("旧 state.json 必须能反序列化");
+        assert!(j.depends_on.is_empty());
+        assert!(j.last_skip.is_none());
+        assert_eq!(j.title, "legacy");
+        assert_eq!(j.next_at, 1000);
     }
 }
