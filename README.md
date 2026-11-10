@@ -377,6 +377,7 @@ roamway serve --bind 127.0.0.1:8796 --token mysecret   # 启动后打开 http://
 - 鉴权分三层：无鉴权配置时开放模式；配置后无 token/无效 token 返回 `401`；scope 不足返回 `403`（`read`/`run`/`admin`，admin 包含全部）。
 - 多 token 落在 `<data>/tokens.json`，只存 sha256；密码只存 PBKDF2-HMAC-SHA256（`password.json`），配对码 6 位数字 60s、一次性消费。
 - `--allow-host` 可多次，配了 Host 白名单后不匹配返回 `421`；未配置时只允许 loopback 与显式 bind 地址。
+- 本地 CLI 不带 `--host` 时永远连 `127.0.0.1:<port>`：daemon 绑 wildcard（`0.0.0.0`/`::`/`*`）时由 `hosts::client_base_from_bind` 把监听地址映射成 loopback，避免把 `Host: 0.0.0.0` 发出去吃 `421`；具体地址（`127.0.0.1`/`localhost`/`[::1]`/`https://…`）原样使用。
 - CORS：只有配 `--allow-origin` 才发 `Access-Control-Allow-Origin`，并正确处理 `OPTIONS` 预检；所有响应带 `X-Content-Type-Options`/`X-Frame-Options`/`Referrer-Policy` 安全头。
 - `--require-approval run|admin`：命中 scope 的写请求先返回 `202` 入审批队列；`approve` 后用 `X-Approval: <id>` 重放且 body hash 一致才放行，改 body 返回 `409`；审批记录保留 7 天。
 - `tokens.json`/`password.json`/`approvals.json` 以 0600 落盘（Windows 忽略该位）；日志与 `token ls` 不输出明文 token 与密码。

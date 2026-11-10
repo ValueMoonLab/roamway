@@ -1,5 +1,44 @@
 # Changelog
 
+## Unreleased
+
+无人值守运行面的第二段（P21–P24）与收尾修复：只读 Web 面板、时间维度保留、本地快照
+`backup`/`restore`、写盘去重与写计数单一真源、pid 文件生命周期，以及本地 CLI 的 421 修复。
+
+### Added
+
+- `keep_days`（第 14 个 daemon 配置键，默认 `0`=不限）与 `prune --max-age-days N`：
+  保留判定仍是 `config::retention_plan_full` 一处，按条数（`keep_runs`）与按时间（`keep_days`）
+  两条规则共用同一份"只删 terminal run"的逻辑；`prune` 的报告分列 `removed` 与 `age_removed`。
+- `roamway backup [--out DIR] [--keep N]`：把 `state.json`/`config.json`/`schedules.json`
+  复制成 `roamway-backup-<YYYYmmdd-HHMMSS>/` 并写 `manifest.json`（逐文件 `bytes` + `sha256`）；
+  token/pairing/passwords 等凭据文件永不进快照。
+- `roamway restore --from DIR [--data DIR] [--force] [--yes]`：先校验 `format` 与每个文件的
+  大小/哈希，任一不符则一个字节都不写；写前把现有文件轮换为 `*.pre-restore-<时间戳>`。
+- daemon 存活检测三证据：`<data>/roamway.pid` 的进程存活、`<data>/heartbeat` 60 秒内有更新、
+  `<data>/bind` 指向的端口可连接；任一命中且未 `--force` 时 `restore` 返回 exit 3。
+- `/metrics` 新增 `roamway_state_writes_skipped_total`（内容未变而跳过的落盘次数）与
+  `roamway_data_bytes`（`<data>` 顶层文件 + `logs/*.log` 字节数）。
+- `<data>/roamway.pid` 由 serve 自己维护：启动时写、退出时仅在 owner 仍是本进程时删。
+
+### Changed
+
+- `Store::save` 在序列化字节与上一次写入完全相同时跳过落盘（`last_write_hash`），只累加
+  `writes_skipped`，NAS 上的无谓写放大与 mtime 抖动随之消失。
+- 写计数改为 `Store` 内单一真源（`writes_total`/`writes_skipped`），`/metrics` 在已持 store 锁的
+  代码块内读取，不再依赖调用点手动累加；计数仅内存态，重新 `load` 归零。
+- `roamway --version` 与 `/health` 的 version 仍为 `1.1.0`；统一升到 `1.2.0` 留给下一批。
+
+### Fixed
+
+- **本地 CLI 的 `421 Misdirected Request`**：daemon 绑 wildcard 地址（`0.0.0.0`/`::`/`*`/空 host）时，
+  不带 `--host` 的命令会把 `Host: 0.0.0.0` 发给服务端，被 Host 白名单判 421。新增
+  `hosts::client_base_from_bind` 把 wildcard 监听地址映射为 `127.0.0.1`（保留 scheme/port/path，
+  IPv6 方括号正确解析），具体的 `127.0.0.1`/`localhost`/`[::1]`/`https://…` 原样保留；
+  `main::local_base` 改走它。
+- `restore` 的 usage 串补上 `[--data DIR]`（帮助文本与 dispatch 两处），此前照 help 传参会 exit 2。
+- Windows CI：auth TTL 断言放宽到 60s、`tasklist` 输出改按 CSV 字段匹配 pid（本地化列名无关）。
+
 ## 1.1.0
 
 运行面、参数面与运维面对齐 Paseo 的第二轮（P12–P20）：`ls`/`run` 语义、provider 会话续跑、

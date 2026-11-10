@@ -199,3 +199,29 @@ P22 关键不变量（后续阶段不得回退）：
 - 保留阈值只有 `config::trim_runs_plan` 一处判定，`keep_runs=0` 表示不修剪；`jobs`/`schedules`/`POST /v1/runs` 三个调用点都传 `App.keep_runs`，不得再出现硬编码常量。
 - `prune` 只删 terminal run 及其 `<data>/logs/<run_id>.log`，绝不删 agent、worktree、schedule、job、approval；`--dry-run` 必须零写入。
 - 单 run 日志受 `max_log_bytes`（默认 4 MiB，0=不限）封顶，超限只停写并追加一次 truncate 标记，不重写既有内容。
+
+## 九、P23–P24 交付事实（无人值守纵深 + 运维自证）
+
+| 阶段 | 交付 | 证据（代码锚点） |
+|---|---|---|
+| P23 | 时间维度保留 `keep_days`（默认 0=不限），与条数阈值共用同一份保留判定 | `src/config.rs:29 CONFIG_KEYS`（14 键）、`src/config.rs:616 fn retention_plan_full`、`src/config.rs:665 fn trim_runs_plan`（薄封装）、`prune --max-age-days N` |
+| P23 | `backup` / `restore` 本地快照命令 | `src/backup.rs:205 fn backup`、`src/backup.rs:426 fn restore`、`src/main.rs:fn cmd_backup`、`src/main.rs:fn cmd_restore`；`manifest.json` 逐文件 `bytes`+`sha256` 校验，校验失败零写入 |
+| P23 | 写盘去重：内容哈希相同则跳过落盘，并单列跳过计数 | `src/types.rs:fn Store::save`（`last_write_hash` 判定）、`/metrics` 的 `roamway_state_writes_skipped_total` |
+| P23 | 数据目录字节 gauge | `/metrics` 的 `roamway_data_bytes`（`<data>` 顶层文件 + `logs/*.log` 求和，`src/server.rs:520` 锁块内取值） |
+| P24 | 写计数单一真源：`Store` 内累加，`/metrics` 在已持 store 锁的段内读取 | `src/types.rs:242 pub writes_total`、`src/types.rs:335 self.writes_total += 1`、`src/server.rs:500–521`（锁块内取值后输出） |
+| P24 | `<data>/roamway.pid` 由 serve 自己维护（启动写、退出按 owner 校验后删） | `src/backup.rs:278 fn write_pid_file`、`src/backup.rs:293 fn clear_pid_file`、`src/main.rs:1241`（serve 启动处调用） |
+| P24 | `restore` 活体判定三证据（pid 进程存活 / heartbeat 60s 内 / bind 端口可连），任一命中即 exit 3 | `src/backup.rs:401 fn daemon_alive`（+ `alive_error_message`）；测试：`daemon_probe_prefers_live_pid`、`daemon_probe_ignores_stale_pid_and_old_heartbeat`、`restore_refuses_when_only_heartbeat_is_fresh`、`restore_refuses_alive_daemon_without_force`、`clear_pid_file_only_when_owner` |
+| 收尾 | CLI 421 缺陷：daemon 绑 wildcard（`0.0.0.0`/`::`/`*`/空 host）时，本地无 `--host` 的命令把 `Host: 0.0.0.0` 发给服务端，被 Host 白名单判 421 | `src/hosts.rs:87 fn client_base_from_bind`（+ 私有 `split_authority`）、`src/main.rs:741 fn local_base`；测试 `client_base_maps_wildcard_bind_to_loopback`、`client_base_keeps_concrete_bind`、`local_base_wildcard_bind_becomes_loopback` |
+
+生产实测（NAS，P24 二进制 1.1.0）：
+
+- `roamway health` rc=0、`roamway ls` rc=0、`roamway run --agent shell "echo p25"` → `run_000109 done 2s`，输出 `p25`，exit 0 —— 三命令均**不带 `--host`**，421 已消失。
+- `roamway_state_writes_total 6`（daemon 启动后随真实写入增长）、`roamway_state_writes_skipped_total 0`。
+- `roamway restore --from <备份> --data <副本>`（不带 `--force`）RC=0，落盘 `state.json` sha256 与 manifest 的 `bytes:37480` 条目逐字节一致。
+
+P24 关键不变量（P22 不变量继续有效，另加以下四条）：
+
+- 写计数只在 `Store::save` 的落盘分支里加，且只在内存态；`Store::load` 必须把 `writes_total`/`writes_skipped` 置 0。禁止再引入 `AtomicU64` 计数，禁止调用点累加。
+- `/metrics` 里的计数只能取自 `app.store.lock()` 那个代码块内的局部变量；不得在锁外补读。
+- `<data>/roamway.pid` 只允许 `backup::write_pid_file` 写、`backup::clear_pid_file` 删（后者必须校验 owner 是本进程）；其他路径不得直接读写成"重启保护"。
+- `daemon_alive` 只可**增加**证据，不可删除既有三条中的任何一条；每条证据都要能被 `restore` 的 exit 3 文案点名（`pid` / `heartbeat` / `port`）。

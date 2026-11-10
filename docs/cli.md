@@ -50,7 +50,7 @@ HTTP 侧 `POST /v1/agents` / `POST /v1/runs` 接受 `"worktree": true|false` 或
 
 ## restore
 
-`roamway restore --from DIR [--force] [--yes]`
+`roamway restore --from DIR [--data DIR] [--force] [--yes]`
 
 - 仅本地执行：显式带 `--host` → exit 2；`--data`/`--home` 生效。
 - `DIR` 必须含 `manifest.json` 且 `format == "roamway-backup/1"`；逐文件校验存在、`bytes`、`sha256`，任一不符 → exit 1 且一个字节都不写。

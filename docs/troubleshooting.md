@@ -18,6 +18,17 @@ roamway daemon status          # 看 pid / bind / offline
 
 `host ls --probe` 或 `host probe <name>` 看状态。探测失败后按退避窗口重试，窗口内再探测返回 `skipped`；网络恢复后自动转回 `online`。
 
+## 421 Misdirected Request
+
+本地命令（不带 `--host`）报 `HTTP 421` 时，是请求把监听地址当成了 `Host` 头：daemon 绑的是
+wildcard（`0.0.0.0` / `::` / `*` / 空 host）而 Host 白名单里没有这个字面量。
+
+- 已在 `hosts::client_base_from_bind` 中把 wildcard 监听地址映射为 `127.0.0.1`（保留 scheme/port/path），
+  `local_base` 走它；升级到含该修复的版本即可消除。
+- 远端访问（`--host name`）不吃这条规则：名字来自 `hosts.json` 的 endpoint，若那里写的是
+  `http://0.0.0.0:8796`，同样会被判 421 —— 把 endpoint 改成实际可路由的主机名/IP，或在
+  `--allow-host` 里显式加上该字面量。
+
 ## GBK 乱码
 
 仓库内所有 `.rs`/`.md`/`.toml` 一律 UTF-8 无 BOM、LF 行尾。若终端把中文显示成乱码，先确认文件编码是 UTF-8，不要在 GBK/GB18030 编辑器里保存。

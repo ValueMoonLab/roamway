@@ -81,7 +81,7 @@ fn usage() {
   roamway script ls|add|rm|start|stop
   roamway prune [--dry-run] [--keep N] [--max-age-days N] [--yes]
   roamway backup [--out DIR] [--keep N]                 # 本地状态快照
-  roamway restore --from DIR [--force] [--yes]         # 从快照回滚（仅本地）
+  roamway restore --from DIR [--data DIR] [--force] [--yes]  # 从快照回滚（仅本地）
   注：受管终端无 TTY，TUI 程序（vim/top 交互界面）不支持
 
 生态扩展：
@@ -986,7 +986,7 @@ fn print_command_help(cmd: &str) -> bool {
         "rm" => "roamway rm ID",
         "prune" => "roamway prune [--dry-run] [--keep N] [--max-age-days N] [--yes]",
         "backup" => "roamway backup [--out DIR] [--keep N]",
-        "restore" => "roamway restore --from DIR [--force] [--yes]",
+        "restore" => "roamway restore --from DIR [--data DIR] [--force] [--yes]",
         "jobs" => "roamway jobs",
         "jobs-add" => "roamway jobs-add --agent shell --every 3600 | --daily 08:30 [--model M] [--workspace DIR] [--max-retries 2] [--after JOB]... \"prompt\"",
         "jobs-run" => "roamway jobs-run ID",
