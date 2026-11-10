@@ -313,19 +313,36 @@ fn process_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// 在 `tasklist /FO CSV /NH` 输出里精确匹配 PID 字段。
+///
+/// 独立成纯函数是刻意的：解析坑来自本地化 INFO 行，而 NAS 门禁跑在 Linux 上看不见
+/// `#[cfg(windows)]` 分支——只有纯函数才能在任意平台被单测盯住。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn pid_field_matches(csv: &str, pid: u32) -> bool {
+    let want = pid.to_string();
+    csv.lines().any(|line| match line.split(',').nth(1) {
+        Some(field) => field.trim().trim_matches('"').trim() == want,
+        None => false,
+    })
+}
+
 #[cfg(windows)]
 fn process_alive(pid: u32) -> bool {
+    // 必须用 CSV + 字段精确比较：`tasklist /NH` 在无匹配时会打印一条本地化 INFO 行
+    // （zh-CN：`信息: 没有运行的任务匹配指定标准。`），判 "No tasks" 会让任何合法但已死的 pid
+    // 都被当成活体 —— 中文 Windows 上 restore 因此永远要求 --force。CSV 的 INFO 行只有一个字段。
     let out = match std::process::Command::new("tasklist")
         .arg("/FI")
         .arg(format!("PID eq {}", pid))
+        .arg("/FO")
+        .arg("CSV")
         .arg("/NH")
         .output()
     {
         Ok(o) => o,
         Err(_) => return false,
     };
-    let text = String::from_utf8_lossy(&out.stdout);
-    !text.trim().is_empty() && !text.contains("No tasks")
+    pid_field_matches(&String::from_utf8_lossy(&out.stdout), pid)
 }
 
 /// `<data>/heartbeat` 距今秒数；缺失或时钟异常时无证据。
@@ -566,6 +583,43 @@ mod tests {
             other => panic!("expected live-pid evidence, got {:?}", other),
         }
         let _ = fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn tasklist_csv_pid_parsing() {
+        // 命中行：真实 zh-CN tasklist /FO CSV /NH 输出（内存字段自带逗号）。
+        assert!(pid_field_matches(
+            "\"pythonw.exe\",\"4242\",\"Console\",\"1\",\"18,068 K\"\r\n",
+            4242
+        ));
+        // 未命中行：zh-CN INFO 只有一段文本、没有第二字段 —— 旧实现就是被这一行骗成 alive。
+        assert!(!pid_field_matches(
+            "信息: 没有运行的任务匹配指定标准。\r\n",
+            999999
+        ));
+        // 未命中行：en-US INFO。
+        assert!(!pid_field_matches(
+            "INFO: No tasks are running which match the specified criteria.\r\n",
+            999999
+        ));
+        // pid 数字出现在别的字段（内存 4242 K）不得误命中。
+        assert!(!pid_field_matches("\"a.exe\",\"11\",\"Console\",\"1\",\"4242 K\"\r\n", 4242));
+        // 空输出（tasklist 报错）判死。
+        assert!(!pid_field_matches("", 4242));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn process_alive_false_for_dead_pid_windows() {
+        // 回归：旧实现按 tasklist 输出里是否含 "No tasks" 判定，而 zh-CN Windows 的无匹配 INFO 行是
+        // `信息: 没有运行的任务匹配指定标准。` —— 任何合法但已死的 pid 都会被判成 alive。
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .spawn()
+            .expect("spawn cmd /C exit");
+        let pid = child.id();
+        let _ = child.wait();
+        assert!(!process_alive(pid), "已退出的 pid {} 必须判死", pid);
     }
 
     #[test]

@@ -686,7 +686,9 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("roamway-auth-token-{}", now()));
         let _ = std::fs::create_dir_all(&dir);
         let mut store = TokenStore::load(&dir);
-        let (id, plain) = store.create(Some("n".into()), vec!["run".into()], Some(1));
+        // TTL 给足 60 秒：create 与 resolve 之间若跨秒（并行测试 + 慢 IO 的 CI runner），
+        // 1 秒 TTL 会造成假过期。过期路径下面用手写 expires_at 覆盖，语义不变。
+        let (id, plain) = store.create(Some("n".into()), vec!["run".into()], Some(60));
         assert!(id.starts_with("tok_"));
         assert!(store.resolve(&plain).is_some());
         assert!(store.resolve("wrong").is_none());

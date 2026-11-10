@@ -129,7 +129,10 @@ P23 上线后（commit `4a911b8`，238 passed）在生产上做冒烟，暴露�
 - `cargo build --release` 0 warning；`cargo test` 全绿且总数 ≥ 248（P23 基线 238 + 10）。
 - 手工冒烟（NAS）：
   1. 重启生产 daemon（`/home/GZX/roamway/start.sh` 前先 `pkill -f "roamway serve"` 再起）后，
-     `<data>/roamway.pid` 内容 == `pgrep -f "bin/roamway serve"`；`kill -TERM <pid>` 后 pid 文件消失。
+     `<data>/roamway.pid` 内容 == `pgrep -f "bin/roamway serve"`；`kill -TERM <pid>` 后 pid 文件
+     **允许残留**（§二：零依赖不做信号处理，SIGTERM 下必然留下），但残留不得再被信任：
+     `process_alive` 判死，且 heartbeat 超 60 秒 / bind 端口关闭后 `restore` 放行（不要求 `--force`）。
+     验收看「残留但不再被信任」，不要求「文件消失」。
   2. 生产 `/metrics`：一次 `roamway run --agent shell "echo p24"` 后 `roamway_state_writes_total` 严格 +≥1
      （P23 实测停在 1 不动 —— 这是本阶段的核心回归点）。
   3. 真实 data 目录副本 + 一个合法备份：pid 文件写死 pid、`heartbeat` 新鲜、`bind` 端口可连 →
