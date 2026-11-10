@@ -183,3 +183,19 @@ P14 新增单测（`src/config.rs`）：`resolve_priority_flag_over_env_over_fil
 - `--worktree-slug/--new-branch/--base/--branch` 落地于 `src/workspaces.rs:fn spec_from_parts`、`worktree_add_from`、`worktree_path_named` 与 `src/agents.rs:fn create_agent_and_run`；清理按 `run.worktree` 记录反查（`src/agents.rs:fn archive_agent`）。
 - 新增单测：`worktree_spec_parses_slug_branch_base`、`worktree_add_from_argv_includes_base`、`worktree_path_named_uses_slug_and_falls_back_to_agent_id`、`worktree_remove_uses_recorded_path`（`src/workspaces.rs`）；`run_plan_rejects_slug_without_worktree_workspace`（`src/main.rs`）。
 - PARITY #3 `paseo run` 参数集收口 → ✅；#15 `paseo daemon run` 已对照 `docs/config.md` 核验。
+## 八、P17–P22 交付事实（运行/运维面）
+
+| 阶段 | 交付 | 证据（代码锚点） |
+|---|---|---|
+| P17 | CLI 参数解析硬化：未知短标志一律 usage error，`-i` 别名归一 | `src/main.rs:fn parse_flags`；测试 `parse_flags_rejects_unknown_short_flag` |
+| P18 | `GET /metrics`（Prometheus 文本） | `src/server.rs:fn metrics_route`、`respond_static` |
+| P19 | job 依赖：依赖未完成则跳过并记原因 | `src/jobs.rs:Job.depends_on`（`jobs.rs:58` 判定）、`jobs-add --after` |
+| P20 | Windows 原生产物 + 三平台 CI + Windows 冒烟 | `.github/workflows/release.yml`、`.github/workflows/ci.yml`、`scripts/smoke.ps1` |
+| P21 | 只读 Web 看板 + PARITY 会话续跑收口 | `src/server.rs` webui 路由、`GET /v1/agents/{id}/session` |
+| P22 | 保留阈值单一真源、日志封顶、`prune` 子命令 + `/v1/prune`、字节 gauge | `src/config.rs:fn trim_runs_plan`（唯一阈值判定）、`src/jobs.rs:fn prune(st, keep_runs)`、`src/runner.rs:fn append_capped`、`POST /v1/prune`、`/metrics` 的 `roamway_state_bytes`/`roamway_logs_bytes`/`roamway_logs_count` |
+
+P22 关键不变量（后续阶段不得回退）：
+
+- 保留阈值只有 `config::trim_runs_plan` 一处判定，`keep_runs=0` 表示不修剪；`jobs`/`schedules`/`POST /v1/runs` 三个调用点都传 `App.keep_runs`，不得再出现硬编码常量。
+- `prune` 只删 terminal run 及其 `<data>/logs/<run_id>.log`，绝不删 agent、worktree、schedule、job、approval；`--dry-run` 必须零写入。
+- 单 run 日志受 `max_log_bytes`（默认 4 MiB，0=不限）封顶，超限只停写并追加一次 truncate 标记，不重写既有内容。
