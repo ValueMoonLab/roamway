@@ -57,6 +57,58 @@ pub fn endpoint_normalize(s: &str) -> String {
     s.trim_end_matches('/').to_string()
 }
 
+fn split_authority(auth: &str) -> (String, String) {
+    // IPv6 literal in brackets keeps its colons: [::]:8796
+    if let Some(rest) = auth.strip_prefix('[') {
+        if let Some(idx) = rest.find(']') {
+            let host = format!("[{}]", &rest[..idx]);
+            let after = &rest[idx + 1..];
+            let port = match after.strip_prefix(':') {
+                Some(p) => format!(":{}", p),
+                None => String::new(),
+            };
+            return (host, port);
+        }
+    }
+    match auth.rsplit_once(':') {
+        Some((h, p)) if !p.is_empty() && p.chars().all(|c| c.is_ascii_digit()) => {
+            (h.to_string(), format!(":{}", p))
+        }
+        _ => (auth.to_string(), String::new()),
+    }
+}
+
+/// Client-facing base URL derived from a persisted server `bind` value.
+///
+/// A wildcard bind (`0.0.0.0`, `::`, `[::]`, empty host, `*`) is a listen address,
+/// not a reachable Host header: sending it makes the server answer 421 misdirected
+/// request because the rewritten authority is not in `--allow-host`. Map the wildcard
+/// to loopback while keeping the port and any path.
+pub fn client_base_from_bind(raw: &str) -> String {
+    let norm = endpoint_normalize(raw);
+    let (scheme, rest) = match norm.split_once("://") {
+        Some((s, r)) => (s.to_string(), r.to_string()),
+        None => ("http".to_string(), norm.clone()),
+    };
+    let (authority, tail) = match rest.split_once('/') {
+        Some((a, t)) => (a.to_string(), format!("/{}", t)),
+        None => (rest.clone(), String::new()),
+    };
+    let (host, port) = split_authority(&authority);
+    let wildcard = host.is_empty()
+        || host == "*"
+        || host == "0.0.0.0"
+        || host == "::"
+        || host == "[::]"
+        || host == "::0"
+        || host == "[::0]";
+    if wildcard {
+        format!("{}://127.0.0.1{}{}", scheme, port, tail)
+    } else {
+        format!("{}://{}{}", scheme, authority, tail)
+    }
+}
+
 pub fn mask(token: &str) -> String {
     let chars: Vec<char> = token.chars().collect();
     if chars.len() < 8 {
@@ -293,6 +345,26 @@ pub fn dispatch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn client_base_maps_wildcard_bind_to_loopback() {
+        assert_eq!(client_base_from_bind("0.0.0.0:8796"), "http://127.0.0.1:8796");
+        assert_eq!(client_base_from_bind("0.0.0.0:8796\n"), "http://127.0.0.1:8796");
+        assert_eq!(client_base_from_bind(":8796"), "http://127.0.0.1:8796");
+        assert_eq!(client_base_from_bind("[::]:8796"), "http://127.0.0.1:8796");
+        assert_eq!(client_base_from_bind("::"), "http://127.0.0.1");
+        assert_eq!(client_base_from_bind("*:9100"), "http://127.0.0.1:9100");
+        assert_eq!(client_base_from_bind("tcp://0.0.0.0:8896"), "http://127.0.0.1:8896");
+    }
+
+    #[test]
+    fn client_base_keeps_concrete_bind() {
+        assert_eq!(client_base_from_bind("127.0.0.1:8896"), "http://127.0.0.1:8896");
+        assert_eq!(client_base_from_bind("192.0.2.10:8796"), "http://192.0.2.10:8796");
+        assert_eq!(client_base_from_bind("localhost:8796"), "http://localhost:8796");
+        assert_eq!(client_base_from_bind("[::1]:8796"), "http://[::1]:8796");
+        assert_eq!(client_base_from_bind("https://nas.example:8443"), "https://nas.example:8443");
+    }
 
     #[test]
     fn endpoint_normalize_accepts_three_forms() {

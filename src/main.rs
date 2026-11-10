@@ -742,7 +742,9 @@ fn local_base(flags: &HashMap<String, String>) -> String {
     if let Ok(raw) = std::fs::read_to_string(data_dir_for(flags).join("bind")) {
         let raw = raw.trim().to_string();
         if !raw.is_empty() {
-            return hosts::endpoint_normalize(&raw);
+            // Wildcard binds (0.0.0.0 / ::) are listen addresses: sending them as a Host
+            // header fails the --allow-host check with 421. Map to loopback, keep the port.
+            return hosts::client_base_from_bind(&raw);
         }
     }
     "http://127.0.0.1:8796".to_string()
@@ -1931,7 +1933,7 @@ fn cmd_restore(flags: &HashMap<String, String>, pos: &[String]) {
         }
     }
     if !pos.is_empty() {
-        usage_error("usage: roamway restore --from DIR [--force] [--yes]");
+        usage_error("usage: roamway restore --from DIR [--data DIR] [--force] [--yes]");
     }
     if FAIL_CODE.load(Ordering::SeqCst) != 0 {
         return;
@@ -1939,7 +1941,7 @@ fn cmd_restore(flags: &HashMap<String, String>, pos: &[String]) {
     let from = match flags.get("from").map(PathBuf::from) {
         Some(dir) => dir,
         None => {
-            usage_error("usage: roamway restore --from DIR [--force] [--yes]");
+            usage_error("usage: roamway restore --from DIR [--data DIR] [--force] [--yes]");
             return;
         }
     };
@@ -5281,6 +5283,17 @@ mod tests {
         let mut flags: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         flags.insert("data".to_string(), dir.to_string_lossy().to_string());
         assert_eq!(local_base(&flags), "http://127.0.0.1:8896");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_base_wildcard_bind_becomes_loopback() {
+        let dir = std::env::temp_dir().join(format!("roamway-bind-wild-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        std::fs::write(dir.join("bind"), "0.0.0.0:8796\n").unwrap();
+        let mut flags: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        flags.insert("data".to_string(), dir.to_string_lossy().to_string());
+        assert_eq!(local_base(&flags), "http://127.0.0.1:8796");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
