@@ -999,9 +999,9 @@ fn print_command_help(cmd: &str) -> bool {
         "logs" => "roamway logs ID [--tail 80] [--host H]",
         "stop" => "roamway stop ID [--host H]",
         "rm" => "roamway rm ID",
-        "prune" => "roamway prune [--dry-run] [--keep N] [--max-age-days N] [--yes]",
-        "backup" => "roamway backup [--out DIR] [--keep N]",
-        "restore" => "roamway restore --from DIR [--data DIR] [--force] [--yes]",
+        "prune" => USAGE_PRUNE,
+        "backup" => USAGE_BACKUP,
+        "restore" => USAGE_RESTORE,
         "jobs" => "roamway jobs",
         "jobs-add" => "roamway jobs-add --agent shell --every 3600 | --daily 08:30 [--model M] [--workspace DIR] [--max-retries 2] [--after JOB]... \"prompt\"",
         "jobs-run" => "roamway jobs-run ID",
@@ -1816,7 +1816,7 @@ fn cmd_prune(flags: &HashMap<String, String>, pos: &[String]) {
         }
     }
     if !pos.is_empty() {
-        usage_error("usage: roamway prune [--dry-run] [--keep N] [--max-age-days N] [--yes]");
+        usage_error(&format!("usage: {}", USAGE_PRUNE));
     }
     if FAIL_CODE.load(Ordering::SeqCst) != 0 {
         return;
@@ -1877,7 +1877,7 @@ fn cmd_backup(flags: &HashMap<String, String>, pos: &[String]) {
         }
     }
     if !pos.is_empty() {
-        usage_error("usage: roamway backup [--out DIR] [--keep N]");
+        usage_error(&format!("usage: {}", USAGE_BACKUP));
     }
     if FAIL_CODE.load(Ordering::SeqCst) != 0 {
         return;
@@ -1948,7 +1948,7 @@ fn cmd_restore(flags: &HashMap<String, String>, pos: &[String]) {
         }
     }
     if !pos.is_empty() {
-        usage_error("usage: roamway restore --from DIR [--data DIR] [--force] [--yes]");
+        usage_error(&format!("usage: {}", USAGE_RESTORE));
     }
     if FAIL_CODE.load(Ordering::SeqCst) != 0 {
         return;
@@ -1956,7 +1956,7 @@ fn cmd_restore(flags: &HashMap<String, String>, pos: &[String]) {
     let from = match flags.get("from").map(PathBuf::from) {
         Some(dir) => dir,
         None => {
-            usage_error("usage: roamway restore --from DIR [--data DIR] [--force] [--yes]");
+            usage_error(&format!("usage: {}", USAGE_RESTORE));
             return;
         }
     };

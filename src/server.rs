@@ -3328,8 +3328,12 @@ mod tests {
     }
 
     #[test]
-    fn only_health_is_public() {
+    fn probe_and_login_paths_are_public() {
         assert!(!needs_auth("/health"));
+        assert!(!needs_auth("/healthz"));
+        assert!(!needs_auth("/readyz"));
+        assert!(!needs_auth("/v1/auth/login"));
+        assert!(!needs_auth("/v1/auth/pair"));
         assert!(needs_auth("/v1/health"));
         assert!(needs_auth("/v1/runs"));
         assert!(needs_auth("/"));

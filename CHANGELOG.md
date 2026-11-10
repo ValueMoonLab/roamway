@@ -37,7 +37,8 @@
   `writes_skipped`，NAS 上的无谓写放大与 mtime 抖动随之消失。
 - 写计数改为 `Store` 内单一真源（`writes_total`/`writes_skipped`），`/metrics` 在已持 store 锁的
   代码块内读取，不再依赖调用点手动累加；计数仅内存态，重新 `load` 归零。
-- `roamway --version` 与 `/health` 的 version 仍为 `1.1.0`；统一升到 `1.2.0` 留给下一批。
+- 版本定版为 `1.2.0`：`Cargo.toml` 与 CHANGELOG 同步；`roamway --version`、`/health`、
+  `/v1/health` 继续统一取 `env!("CARGO_PKG_VERSION")`，不引入第二处硬编码版本常量。
 
 ### Fixed
 
@@ -46,7 +47,8 @@
   `hosts::client_base_from_bind` 把 wildcard 监听地址映射为 `127.0.0.1`（保留 scheme/port/path，
   IPv6 方括号正确解析），具体的 `127.0.0.1`/`localhost`/`[::1]`/`https://…` 原样保留；
   `main::local_base` 改走它。
-- `restore` 的 usage 串补上 `[--data DIR]`（帮助文本与 dispatch 两处），此前照 help 传参会 exit 2。
+- `backup`/`prune`/`restore` 的 usage 串统一由 `USAGE_*` 常量出（帮助文本、dispatch、usage_error
+  三处同源），全部带 `[--data DIR]`；此前照 help 传参会 exit 2。
 - Windows CI：auth TTL 断言放宽到 60s、`tasklist` 输出改按 CSV 字段匹配 pid（本地化列名无关）。
 
 ## 1.1.0
