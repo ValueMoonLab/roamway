@@ -497,6 +497,8 @@ fn metrics_text(app: &Arc<App>) -> String {
     let logs_bytes: u64;
     let logs_count: u64;
     let data_bytes: u64;
+    let state_writes_total: u64;
+    let state_writes_skipped: u64;
     {
         let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
         for r in st.state.runs.iter() {
@@ -516,6 +518,8 @@ fn metrics_text(app: &Arc<App>) -> String {
         logs_bytes = lb;
         logs_count = lc;
         data_bytes = data_dir_bytes(&st.dir);
+        state_writes_total = st.writes_total;
+        state_writes_skipped = st.writes_skipped;
     }
     let (sched_total, sched_active, sched_failures) = {
         let sc = app.schedules.lock().unwrap_or_else(|e| e.into_inner());
@@ -570,18 +574,18 @@ fn metrics_text(app: &Arc<App>) -> String {
     out.push_str("# TYPE roamway_data_bytes gauge\n");
     out.push_str(&format!("roamway_data_bytes {}\n", data_bytes));
 
-    out.push_str("# HELP roamway_state_writes_total state.json write count since daemon start.\n");
+    out.push_str("# HELP roamway_state_writes_total state.json writes that reached disk since daemon start.\n");
     out.push_str("# TYPE roamway_state_writes_total counter\n");
     out.push_str(&format!(
         "roamway_state_writes_total {}\n",
-        app.state_writes.load(Ordering::Relaxed)
+        state_writes_total
     ));
 
-    out.push_str("# HELP roamway_state_writes_skipped_total state.json writes skipped because content was unchanged.\n");
+    out.push_str("# HELP roamway_state_writes_skipped_total state.json writes skipped because serialized bytes were identical since daemon start.\n");
     out.push_str("# TYPE roamway_state_writes_skipped_total counter\n");
     out.push_str(&format!(
         "roamway_state_writes_skipped_total {}\n",
-        app.state_writes_skipped.load(Ordering::Relaxed)
+        state_writes_skipped
     ));
 
     out.push_str("# HELP roamway_agents Sub-agent records in state, by state.\n");
@@ -3644,8 +3648,7 @@ mod tests {
             conns: std::sync::atomic::AtomicUsize::new(0),
             req_total: std::sync::atomic::AtomicU64::new(0),
             req_failed: std::sync::atomic::AtomicU64::new(0),
-            state_writes: std::sync::atomic::AtomicU64::new(0),
-            state_writes_skipped: std::sync::atomic::AtomicU64::new(0),
+
             tokens: std::sync::Mutex::new(auth::TokenStore::load(&dir)),
             approvals: std::sync::Mutex::new(auth::ApprovalStore::load(&dir)),
             passwords: std::sync::Mutex::new(auth::PasswordStore::load(&dir)),
@@ -3742,8 +3745,7 @@ mod tests {
             conns: std::sync::atomic::AtomicUsize::new(0),
             req_total: std::sync::atomic::AtomicU64::new(0),
             req_failed: std::sync::atomic::AtomicU64::new(0),
-            state_writes: std::sync::atomic::AtomicU64::new(0),
-            state_writes_skipped: std::sync::atomic::AtomicU64::new(0),
+
             tokens: std::sync::Mutex::new(auth::TokenStore::load(dir)),
             approvals: std::sync::Mutex::new(auth::ApprovalStore::load(dir)),
             passwords: std::sync::Mutex::new(auth::PasswordStore::load(dir)),
@@ -4129,6 +4131,23 @@ mod tests {
 
         app.save();
         app.save();
+        let body = metrics_text(&app);
+        assert!(body.contains("roamway_state_writes_total 1\n"), "{}", body);
+        assert!(body.contains("roamway_state_writes_skipped_total 1\n"), "{}", body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn metrics_write_counters_come_from_store() {
+        let dir = std::env::temp_dir().join(format!("roamway-metrics-store-counters-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let app = test_app(&dir, "shell", RunStatus::Done);
+        {
+            // 直接持锁调用 Store::save，不经过 App::save，验证写计数单一真源。
+            let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(st.save());
+            assert!(!st.save());
+        }
         let body = metrics_text(&app);
         assert!(body.contains("roamway_state_writes_total 1\n"), "{}", body);
         assert!(body.contains("roamway_state_writes_skipped_total 1\n"), "{}", body);

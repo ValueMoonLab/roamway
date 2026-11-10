@@ -288,6 +288,7 @@ impl Store {
             dir: dir.to_path_buf(),
             state,
             loaded_ok,
+            // 这三个字段仅内存态、不序列化进 state.json；语义是 "since daemon start"。
             last_write_hash: 0,
             writes_total: 0,
             writes_skipped: 0,
@@ -426,10 +427,7 @@ pub struct App {
     /// 每次请求 +1；响应码 >= 400 时 failed +1。
     pub req_total: AtomicU64,
     pub req_failed: AtomicU64,
-    /// state.json 累计真实写盘次数（内存态）。
-    pub state_writes: AtomicU64,
-    /// state.json 因内容未变化而被跳过的写入次数（内存态）。
-    pub state_writes_skipped: AtomicU64,
+
     pub tokens: Mutex<auth::TokenStore>,
     pub approvals: Mutex<auth::ApprovalStore>,
     pub passwords: Mutex<auth::PasswordStore>,
@@ -445,15 +443,10 @@ pub struct App {
 }
 
 impl App {
+    /// 仅作为 `Store::save` 的薄封装：计数由 `Store` 自己维护，单一真源。
     pub fn save(&self) {
         let mut st = self.store.lock().unwrap_or_else(|e| e.into_inner());
-        let before_total = st.writes_total;
-        let before_skipped = st.writes_skipped;
         st.save();
-        self.state_writes
-            .fetch_add(st.writes_total - before_total, std::sync::atomic::Ordering::Relaxed);
-        self.state_writes_skipped
-            .fetch_add(st.writes_skipped - before_skipped, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -594,6 +587,19 @@ mod tests {
         let bytes2 = fs::read(dir.join("state.json")).unwrap();
         assert_eq!(bytes1, bytes2);
         assert_eq!(meta1.modified().unwrap(), meta2.modified().unwrap());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn store_counters_reset_on_load() {
+        let dir = std::env::temp_dir().join(format!("roamway-counters-load-{}", now()));
+        let _ = fs::create_dir_all(&dir);
+        let mut store = Store::load(&dir);
+        assert!(store.save());
+        assert_eq!(store.writes_total, 1);
+        let reloaded = Store::load(&dir);
+        assert_eq!(reloaded.writes_total, 0, "写计数只在内存态，重新 load 后应归零");
+        assert_eq!(reloaded.writes_skipped, 0, "跳过计数同样应在重新 load 后归零");
         let _ = fs::remove_dir_all(&dir);
     }
 

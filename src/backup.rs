@@ -4,7 +4,9 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::Write;
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const BACKUP_FORMAT: &str = "roamway-backup/1";
 const BACKUP_FILES: [&str; 3] = ["state.json", "config.json", "schedules.json"];
@@ -258,53 +260,149 @@ fn build_backup_dir(data: &Path, dir: &Path, ts: i64) -> Result<(usize, u64, Man
     Ok((manifest.files.len(), total, manifest))
 }
 
-fn read_pid(data: &Path) -> Option<u32> {
+/// daemon 活体证据：pid / heartbeat / bind 端口，restore 按此区分报错文案。
+#[derive(Debug, Clone)]
+pub enum Alive {
+    Pid(u32),
+    Heartbeat(u64),
+    Bind(String),
+}
+
+/// 读取 `<data>/roamway.pid` 的内容（仅数字与换行），返回所属 pid。
+pub fn pid_file_owner(data: &Path) -> Option<u32> {
     let raw = fs::read_to_string(data.join("roamway.pid")).ok()?;
     raw.trim().parse::<u32>().ok().filter(|p| *p > 0)
 }
 
-#[cfg(target_os = "linux")]
-pub fn daemon_alive(data: &Path) -> Option<u32> {
-    let pid = read_pid(data)?;
-    if Path::new("/proc").join(pid.to_string()).exists() {
-        Some(pid)
-    } else {
-        None
+/// 写 `<pid>\n` 到 `<data>/roamway.pid`：tmp + rename，返回写入的 pid。
+pub fn write_pid_file(data: &Path) -> std::io::Result<u32> {
+    let pid = std::process::id();
+    let p = data.join("roamway.pid");
+    let tmp = data.join("roamway.pid.tmp");
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(format!("{}\n", pid).as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, &p)?;
+    let _ = sync_parent_dir(&p);
+    Ok(pid)
+}
+
+/// 仅当 pid 文件内容仍是本进程 pid 时才删除，避免误删别人（新 daemon）写的文件。
+pub fn clear_pid_file(data: &Path) {
+    if pid_file_owner(data) == Some(std::process::id()) {
+        let _ = fs::remove_file(data.join("roamway.pid"));
     }
 }
 
+#[cfg(target_os = "linux")]
+fn process_alive(pid: u32) -> bool {
+    Path::new("/proc").join(pid.to_string()).exists()
+}
+
 #[cfg(all(unix, not(target_os = "linux")))]
-pub fn daemon_alive(data: &Path) -> Option<u32> {
-    let pid = read_pid(data)?;
-    let ok = std::process::Command::new("ps")
+fn process_alive(pid: u32) -> bool {
+    std::process::Command::new("ps")
         .arg("-p")
         .arg(pid.to_string())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .ok()?
-        .success();
-    if ok {
-        Some(pid)
-    } else {
-        None
-    }
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 #[cfg(windows)]
-pub fn daemon_alive(data: &Path) -> Option<u32> {
-    let pid = read_pid(data)?;
-    let out = std::process::Command::new("tasklist")
+fn process_alive(pid: u32) -> bool {
+    let out = match std::process::Command::new("tasklist")
         .arg("/FI")
         .arg(format!("PID eq {}", pid))
         .arg("/NH")
         .output()
-        .ok()?;
+    {
+        Ok(o) => o,
+        Err(_) => return false,
+    };
     let text = String::from_utf8_lossy(&out.stdout);
-    if text.trim().is_empty() || text.contains("No tasks") {
-        return None;
+    !text.trim().is_empty() && !text.contains("No tasks")
+}
+
+/// `<data>/heartbeat` 距今秒数；缺失或时钟异常时无证据。
+fn heartbeat_age_secs(data: &Path) -> Option<u64> {
+    let modified = fs::metadata(data.join("heartbeat")).ok()?.modified().ok()?;
+    let now = std::time::SystemTime::now();
+    Some(now.duration_since(modified).map(|d| d.as_secs()).unwrap_or(0))
+}
+
+/// 解析 `host:port`；支持 `[::1]:8796`。空 host / wildcard 不在此处归一化。
+fn parse_host_port(bind: &str) -> Option<(String, u16)> {
+    if let Some(rest) = bind.strip_prefix('[') {
+        let (host, port) = rest.split_once("]:")?;
+        return Some((host.to_string(), port.parse::<u16>().ok()?));
     }
-    Some(pid)
+    let (host, port) = bind.rsplit_once(':')?;
+    Some((host.to_string(), port.parse::<u16>().ok()?))
+}
+
+/// `<data>/bind` 格式合法且 150ms 内可连接时返回实际探测地址；无证据则 None。
+fn open_bind_probe(data: &Path) -> Option<String> {
+    let raw = fs::read_to_string(data.join("bind")).ok()?;
+    let (host, port) = parse_host_port(raw.trim())?;
+    let host = if matches!(host.as_str(), "0.0.0.0" | "::" | "") {
+        "127.0.0.1".to_string()
+    } else {
+        host
+    };
+    let addr = format!("{}:{}", host, port);
+    let socket = (host.as_str(), port).to_socket_addrs().ok()?.next()?;
+    match TcpStream::connect_timeout(&socket, Duration::from_millis(150)) {
+        Ok(_) => Some(addr),
+        Err(_) => None,
+    }
+}
+
+/// 唯一判定实现：pid 存活 → 新鲜 heartbeat → bind 端口可连，短路返回首个证据。
+pub fn daemon_probe(data: &Path) -> Option<Alive> {
+    if let Some(pid) = pid_file_owner(data) {
+        if process_alive(pid) {
+            return Some(Alive::Pid(pid));
+        }
+    }
+    if let Some(age) = heartbeat_age_secs(data) {
+        if age <= 60 {
+            return Some(Alive::Heartbeat(age));
+        }
+    }
+    if let Some(addr) = open_bind_probe(data) {
+        return Some(Alive::Bind(addr));
+    }
+    None
+}
+
+/// 兼容薄封装：只有 pid 证据时才返回 pid，行为与旧 `daemon_alive` 一致。
+pub fn daemon_alive(data: &Path) -> Option<u32> {
+    match daemon_probe(data) {
+        Some(Alive::Pid(pid)) => Some(pid),
+        _ => None,
+    }
+}
+
+fn alive_error_message(alive: &Alive) -> String {
+    match alive {
+        Alive::Pid(pid) => {
+            format!("restore: daemon looks alive (pid {}); stop it or pass --force", pid)
+        }
+        Alive::Heartbeat(age) => {
+            format!("restore: daemon looks alive (heartbeat {}s ago); stop it or pass --force", age)
+        }
+        Alive::Bind(addr) => {
+            let port = parse_host_port(addr)
+                .map(|(_, p)| p.to_string())
+                .unwrap_or_else(|| addr.clone());
+            format!("restore: daemon looks alive (port {} accepts connections); stop it or pass --force", port)
+        }
+    }
 }
 
 /// 恢复备份：逐文件校验通过前不写任何字节；daemon 存活且无 --force 时 exit 3 语义。
@@ -340,12 +438,9 @@ pub fn restore(data: &Path, from: &Path, force: bool) -> Result<RestoreResult, B
         validated.push((f.name.clone(), bytes));
     }
 
-    if let Some(pid) = daemon_alive(data) {
-        if !force {
-            return Err(err(
-                3,
-                format!("restore: daemon looks alive (pid {}); stop it or pass --force", pid),
-            ));
+    if !force {
+        if let Some(alive) = daemon_probe(data) {
+            return Err(err(3, alive_error_message(&alive)));
         }
     }
 
@@ -421,6 +516,132 @@ mod tests {
 
     fn tmp(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("roamway-{}-{}", name, crate::types::now()))
+    }
+
+    fn dead_pid_file(data: &Path) {
+        fs::write(data.join("roamway.pid"), b"4294967295\n").unwrap();
+    }
+
+    fn heartbeat_with_age(data: &Path, age_secs: u64) {
+        let p = data.join("heartbeat");
+        fs::write(&p, b"2000-01-01T00:00:00Z\n").unwrap();
+        let f = std::fs::OpenOptions::new().write(true).open(&p).unwrap();
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        f.set_modified(t).unwrap();
+    }
+
+    #[test]
+    fn pid_file_roundtrip_and_owner() {
+        let data = tmp("pid-roundtrip");
+        fs::create_dir_all(&data).unwrap();
+        assert!(pid_file_owner(&data).is_none());
+        let pid = write_pid_file(&data).unwrap();
+        assert_eq!(pid, std::process::id());
+        assert_eq!(pid_file_owner(&data), Some(std::process::id()));
+        let raw = fs::read_to_string(data.join("roamway.pid")).unwrap();
+        assert_eq!(raw.trim().parse::<u32>().ok(), Some(std::process::id()));
+        let _ = fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn clear_pid_file_only_when_owner() {
+        let data = tmp("pid-clear");
+        fs::create_dir_all(&data).unwrap();
+        fs::write(data.join("roamway.pid"), b"4294967295\n").unwrap();
+        clear_pid_file(&data);
+        assert!(data.join("roamway.pid").exists(), "别的 pid 写的文件不能删");
+        write_pid_file(&data).unwrap();
+        clear_pid_file(&data);
+        assert!(!data.join("roamway.pid").exists());
+        let _ = fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn daemon_probe_prefers_live_pid() {
+        let data = tmp("probe-live-pid");
+        fs::create_dir_all(&data).unwrap();
+        write_pid_file(&data).unwrap();
+        match daemon_probe(&data) {
+            Some(Alive::Pid(pid)) => assert_eq!(pid, std::process::id()),
+            other => panic!("expected live-pid evidence, got {:?}", other),
+        }
+        let _ = fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn daemon_probe_falls_back_to_fresh_heartbeat() {
+        let data = tmp("probe-heartbeat");
+        fs::create_dir_all(&data).unwrap();
+        dead_pid_file(&data);
+        fs::write(data.join("heartbeat"), format!("{}\n", crate::types::now())).unwrap();
+        match daemon_probe(&data) {
+            Some(Alive::Heartbeat(age)) => assert!(age <= 60, "heartbeat age {} > 60", age),
+            other => panic!("expected heartbeat evidence, got {:?}", other),
+        }
+        let _ = fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn daemon_probe_falls_back_to_open_bind_port() {
+        let data = tmp("probe-bind");
+        fs::create_dir_all(&data).unwrap();
+        dead_pid_file(&data);
+        heartbeat_with_age(&data, 3600);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        fs::write(data.join("bind"), format!("127.0.0.1:{}\n", port)).unwrap();
+        match daemon_probe(&data) {
+            Some(Alive::Bind(addr)) => assert!(addr.ends_with(&format!(":{}", port)), "{}", addr),
+            other => panic!("expected bind evidence, got {:?}", other),
+        }
+        drop(listener);
+        let _ = fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn daemon_probe_ignores_stale_pid_and_old_heartbeat() {
+        let data = tmp("probe-none");
+        fs::create_dir_all(&data).unwrap();
+        dead_pid_file(&data);
+        heartbeat_with_age(&data, 120);
+        assert!(daemon_probe(&data).is_none(), "三样都陈旧时必须判定为无证据");
+        let _ = fs::remove_dir_all(&data);
+    }
+
+    #[test]
+    fn restore_refuses_when_only_heartbeat_is_fresh() {
+        let data = tmp("restore-heartbeat-data");
+        let from = tmp("restore-heartbeat-from");
+        fs::create_dir_all(&data).unwrap();
+        fs::create_dir_all(&from).unwrap();
+        fs::write(data.join("state.json"), b"original").unwrap();
+        fs::write(from.join("state.json"), b"backup").unwrap();
+        let manifest = Manifest {
+            format: BACKUP_FORMAT.into(),
+            created_at: crate::types::now(),
+            version: env!("CARGO_PKG_VERSION").into(),
+            files: vec![ManifestFile {
+                name: "state.json".into(),
+                bytes: 6,
+                sha256: sha256_hex(b"backup"),
+            }],
+        };
+        fs::write(
+            from.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+        dead_pid_file(&data);
+        fs::write(data.join("heartbeat"), format!("{}\n", crate::types::now())).unwrap();
+
+        let before = fs::read(data.join("state.json")).unwrap();
+        let e = restore(&data, &from, false).unwrap_err();
+        assert_eq!(e.exit_code(), 3, "{}", e.message());
+        assert!(e.message().contains("heartbeat"), "{}", e.message());
+        let after = fs::read(data.join("state.json")).unwrap();
+        assert_eq!(before, after, "活体拒绝时不得改写 state.json");
+        let _ = fs::remove_dir_all(&data);
+        let _ = fs::remove_dir_all(&from);
     }
 
     #[test]

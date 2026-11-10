@@ -54,7 +54,8 @@ HTTP 侧 `POST /v1/agents` / `POST /v1/runs` 接受 `"worktree": true|false` 或
 
 - 仅本地执行：显式带 `--host` → exit 2；`--data`/`--home` 生效。
 - `DIR` 必须含 `manifest.json` 且 `format == "roamway-backup/1"`；逐文件校验存在、`bytes`、`sha256`，任一不符 → exit 1 且一个字节都不写。
-- daemon 存活检测：`<data>/roamway.pid` 的 pid 存活时，无 `--force` → exit 3；`--force` 只跳过停服检查，不做热替换。
+- daemon 存活检测（任一证据命中即拒）：`<data>/roamway.pid` 对应进程存活 → `pid ...`；`<data>/heartbeat` 60 秒内有更新 → `heartbeat ...s ago`；`<data>/bind` 指向端口可连接 → `port ... accepts connections`。
+- 命中检测且无 `--force` → exit 3，且一个字节都不写；`--force` 只跳过停服检查，不是热替换，仍会做 `*.pre-restore-*` 轮换，可能被运行中 daemon 下一次 save 覆盖。
 - 写前把现有 `state.json` 等轮换为 `*.pre-restore-<YYYYmmdd-HHMMSS>`；写入顺序 config → schedules → state。
 - 不删除备份源目录；table 输出 `RESTORED FROM`；`-o json` 输出 `{"ok":true,"files":[...],"from":"..."}`。
 

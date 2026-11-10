@@ -55,6 +55,8 @@ roamway prune --keep 5            # 本次临时覆盖阈值，不改配置文�
 - 定期快照：`roamway backup --keep 7`（默认 `--out <data>/backups`），按目录名保留最近 7 个备份目录。
 - 回滚：先 `roamway daemon stop`，再 `roamway restore --from <data>/backups/roamway-backup-*`；daemon 仍在跑时先收到 exit 3，确认安全后可 `--force`。
 - `restore` 会先把现有 `state.json` 轮换为 `state.json.pre-restore-*`，再从备份目录安装 `config.json`/`schedules.json`/`state.json`；备份源目录不会被删除。
+- daemon 活体判定按三种证据短路：`<data>/roamway.pid` 对应的进程存活 → `pid ...`；`<data>/heartbeat` 60 秒内有更新 → `heartbeat ...s ago`；`<data>/bind` 指向的端口可连接 → `port ... accepts connections`。任一命中且无 `--force` 时 `restore` 退出码 3 且一个字节都不写。
+- `--force` 只跳过停服检查，不是热合并；在活体上强恢复会丢掉 daemon 内存里尚未落盘的运行记录（其下次 save 会覆盖回去），请先 `kill`（或 `roamway daemon stop`）再 `restore`。
 - 与 `state.json.bak` 的区别：`state.json.bak` 是最后一次写盘前的上一版，会被下一次写覆盖；`roamway-backup-*` 是显式快照，可长期保留。
 
 ## 帮助与退出码

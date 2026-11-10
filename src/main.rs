@@ -1236,6 +1236,9 @@ fn cmd_serve(flags: &HashMap<String, String>) {
     if jobs::prune(&mut store, cfg.keep_runs, cfg.keep_days) {
         store.save();
     }
+    if let Err(e) = backup::write_pid_file(&data) {
+        eprintln!("roamway: write pid file failed: {}", e);
+    }
     let loaded_ok = store.loaded_ok;
     let schedule_store = schedules::ScheduleStore::load(&data);
     // 受管终端：元数据落 data/terminals.json，运行态只在内存，重启后标 exited 不复活
@@ -1260,8 +1263,7 @@ fn cmd_serve(flags: &HashMap<String, String>) {
         conns: AtomicUsize::new(0),
         req_total: AtomicU64::new(0),
         req_failed: AtomicU64::new(0),
-        state_writes: AtomicU64::new(0),
-        state_writes_skipped: AtomicU64::new(0),
+
         tokens: Mutex::new(token_store),
         approvals: Mutex::new(approval_store),
         passwords: Mutex::new(password_store),
@@ -1302,9 +1304,12 @@ fn cmd_serve(flags: &HashMap<String, String>) {
         max_concurrent,
         max_conn
     );
-    if let Err(e) = server::serve(app, &bind) {
-        eprintln!("serve failed: {}", e);
-        std::process::exit(1);
+    match server::serve(app, &bind) {
+        Ok(()) => backup::clear_pid_file(&data),
+        Err(e) => {
+            eprintln!("serve failed: {}", e);
+            std::process::exit(1);
+        }
     }
 }
 
@@ -5187,8 +5192,7 @@ pub mod test_support {
             conns: AtomicUsize::new(0),
             req_total: AtomicU64::new(0),
             req_failed: AtomicU64::new(0),
-            state_writes: AtomicU64::new(0),
-            state_writes_skipped: AtomicU64::new(0),
+
             tokens: Mutex::new(auth::TokenStore::load(dir)),
             approvals: Mutex::new(auth::ApprovalStore::load(dir)),
             passwords: Mutex::new(auth::PasswordStore::load(dir)),
@@ -5641,6 +5645,21 @@ mod tests {
         let mut w: HashMap<String, String> = HashMap::new();
         w.insert("worktree-slug".to_string(), "slug".to_string());
         assert!(run_plan(&w).unwrap_err().contains("requires --new-workspace worktree"));
+    }
+
+    #[test]
+    fn serve_pid_file_written_and_cleared() {
+        let dir = std::env::temp_dir().join(format!("roamway-serve-pid-{}", now()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_path = dir.join("roamway.pid");
+        assert!(!pid_path.exists());
+        let pid = crate::backup::write_pid_file(&dir).unwrap();
+        assert_eq!(pid, std::process::id());
+        assert!(pid_path.is_file());
+        assert_eq!(crate::backup::pid_file_owner(&dir), Some(std::process::id()));
+        crate::backup::clear_pid_file(&dir);
+        assert!(!pid_path.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
