@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -384,6 +384,10 @@ pub struct App {
     pub max_concurrent: usize,
     pub max_conn: usize,
     pub conns: AtomicUsize,
+    /// `/metrics` 用的 HTTP 计数（纯内存，不参与 state.json 持久化）。
+    /// 每次请求 +1；响应码 >= 400 时 failed +1。
+    pub req_total: AtomicU64,
+    pub req_failed: AtomicU64,
     pub tokens: Mutex<auth::TokenStore>,
     pub approvals: Mutex<auth::ApprovalStore>,
     pub passwords: Mutex<auth::PasswordStore>,

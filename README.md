@@ -237,6 +237,7 @@ ROAMWAY_DEEPSEEK_URL=http://127.0.0.1:11434/v1/chat/completions \
 | DELETE | `/v1/jobs/{id}` | 删除 |
 | POST | `/v1/auth/login` | `{password}` → 24h 短期 token（需先 `daemon set-password`） |
 | POST | `/v1/auth/pair` | `{code}` → 长期 token（`pair` 生成 6 位码，60s 一次性） |
+| GET | `/metrics` | Prometheus 文本（`text/plain; version=0.0.4`）；需 token，`?token=` 可用 |
 | GET | `/v1/approvals?all=1` | 审批列表（默认仅 pending，`all` 含已决） |
 | POST | `/v1/approvals/{id}/approve` / `deny` | 批准 / 拒绝（需 admin scope） |
 
@@ -372,6 +373,49 @@ roamway serve --bind 127.0.0.1:8796 --token mysecret   # 启动后打开 http://
 - `--token` 会把 token 写进进程命令行（`ps` 可见）。长期部署请用 `ROAMWAY_TOKEN` 环境变量或 `EnvironmentFile=`，`scripts/roamway-start.sh` 已按这种方式处理。
 - 数据目录里有全量日志，按需 `chmod 700`。
 
+## 监控
+
+`GET /metrics` 输出 Prometheus 文本格式（exposition 0.0.4），覆盖构建信息、运行时长、各状态 run 数、agent、job、调度、终端、并发连接与 HTTP 请求计数：
+
+| 指标 | 类型 | 说明 |
+|---|---|---|
+| `roamway_build_info{version}` | gauge | 恒为 1，`version` 是编译时的 crate 版本 |
+| `roamway_uptime_seconds` | gauge | 进程已运行秒数 |
+| `roamway_runs{status}` | gauge | 7 种状态各一行（queued/running/done/failed/timeout/killed/interrupted） |
+| `roamway_agents{state}` | gauge | 按 agent 状态分组；无 agent 时输出 `roamway_agents 0` |
+| `roamway_jobs` / `roamway_jobs_enabled` | gauge | 定时任务总数 / 启用数 |
+| `roamway_schedules` / `roamway_schedules_paused` | gauge | 调度总数 / 已暂停数 |
+| `roamway_schedule_failures_total` | counter | Σ `consecutive_failures`（daemon 内存态，重启归零） |
+| `roamway_terminals` | gauge | 活动终端数 |
+| `roamway_http_concurrent_requests` | gauge | 当前在处理的连接数 |
+| `roamway_http_requests_total` | counter | 累计请求数（内存态，重启归零） |
+| `roamway_http_requests_failed_total` | counter | 累计响应码 ≥ 400 的请求数 |
+
+`/metrics` **不豁免鉴权**（`/health` 仍是唯一免鉴权端点）：`Authorization: Bearer <token>` 或 `?token=<token>` 二选一。给 Prometheus 建一个只读长期 token：
+
+```bash
+roamway token add --name prometheus --scope read --ttl 0   # 打印一次明文，记进 scrape 配置
+```
+
+最小 scrape 配置：
+
+```yaml
+scrape_configs:
+  - job_name: roamway
+    metrics_path: /metrics
+    # 方式一：Bearer（推荐，token 不出现在 URL 与访问日志里）
+    authorization:
+      type: Bearer
+      credentials: "<prometheus token>"
+    # 方式二：查询参数（等价，方便 curl 手查）
+    # params:
+    #   token: ["<prometheus token>"]
+    static_configs:
+      - targets: ["127.0.0.1:8796"]
+```
+
+只读 scope 足够抓取；`/metrics` 只读内存状态，不碰磁盘、不触发任务。曲线建议先盯 `roamway_runs{status="failed"}` 与 `roamway_schedule_failures_total` 的增速。
+
 ## 和 Paseo 的差别
 
 | | Paseo | roamway |
@@ -410,7 +454,7 @@ docs/architecture.md  设计取舍
 - [ ] Windows 原生预编译产物
 - [ ] 任务依赖（A 成功后再跑 B）
 - [x] 并发上限（全局 / 每 agent）
-- [ ] `/metrics`（Prometheus 文本格式）
+- [x] `/metrics`（Prometheus 文本格式）
 - [ ] 只读 Web 面板
 
 ## License

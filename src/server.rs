@@ -370,23 +370,201 @@ fn respond_static<C: Conn>(
     s.flush()
 }
 
+/// 失败请求计数：所有 >= 400 的响应都从 `fail_json` 或 route 出口汇到这一个点，
+/// 避免每加一条错误分支就漏记一次。
+fn count_failed(app: &App, code: u16) {
+    if code >= 400 {
+        app.req_failed.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+fn fail_json<C: Conn>(
+    app: &App,
+    s: &mut C,
+    code: u16,
+    v: &Value,
+    extra: &[(&str, String)],
+) -> std::io::Result<()> {
+    count_failed(app, code);
+    respond_full(s, code, v, extra)
+}
+
+/// Prometheus 标签值转义：`\` → `\\`，`"` → `\"`，换行 → `\n`。
+fn esc_label(v: &str) -> String {
+    let mut out = String::with_capacity(v.len() + 8);
+    for c in v.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn run_status_label(s: RunStatus) -> &'static str {
+    match s {
+        RunStatus::Queued => "queued",
+        RunStatus::Running => "running",
+        RunStatus::Done => "done",
+        RunStatus::Failed => "failed",
+        RunStatus::Timeout => "timeout",
+        RunStatus::Killed => "killed",
+        RunStatus::Interrupted => "interrupted",
+    }
+}
+
+/// `/metrics` 的正文：Prometheus exposition 0.0.4 纯文本。
+/// 只读内存态，临界区逐个短暂持有（store → schedules → terms，不嵌套），
+/// 空 state 也输出合法文本（计数全 0，不含 NaN/Inf）。
+fn metrics_text(app: &Arc<App>) -> String {
+    const STATUSES: [RunStatus; 7] = [
+        RunStatus::Queued,
+        RunStatus::Running,
+        RunStatus::Done,
+        RunStatus::Failed,
+        RunStatus::Timeout,
+        RunStatus::Killed,
+        RunStatus::Interrupted,
+    ];
+    let mut run_counts = [0u64; STATUSES.len()];
+    let mut agents: BTreeMap<String, u64> = BTreeMap::new();
+    let jobs_total: u64;
+    let jobs_enabled: u64;
+    {
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        for r in st.state.runs.iter() {
+            if let Some(i) = STATUSES.iter().position(|s| *s == r.status) {
+                run_counts[i] += 1;
+            }
+        }
+        for a in st.state.agents.iter() {
+            *agents.entry(a.state.clone()).or_insert(0) += 1;
+        }
+        jobs_total = st.state.jobs.len() as u64;
+        jobs_enabled = st.state.jobs.iter().filter(|j| j.enabled).count() as u64;
+    }
+    let (sched_total, sched_active, sched_failures) = {
+        let sc = app.schedules.lock().unwrap_or_else(|e| e.into_inner());
+        let total = sc.schedules.len() as u64;
+        let active = sc.schedules.iter().filter(|s| s.enabled && !s.paused).count() as u64;
+        let failures: u64 = sc
+            .schedules
+            .iter()
+            .map(|s| s.consecutive_failures as u64)
+            .sum();
+        (total, active, failures)
+    };
+    let terminals = {
+        let t = app.terms.lock().unwrap_or_else(|e| e.into_inner());
+        t.terminals.len() as u64
+    };
+    let uptime = now().saturating_sub(app.started).max(0) as u64;
+
+    let mut out = String::with_capacity(2048);
+    out.push_str("# HELP roamway_build_info Build information; value is always 1.\n");
+    out.push_str("# TYPE roamway_build_info gauge\n");
+    out.push_str(&format!(
+        "roamway_build_info{{version=\"{}\"}} 1\n",
+        esc_label(env!("CARGO_PKG_VERSION"))
+    ));
+
+    out.push_str("# HELP roamway_uptime_seconds Seconds since the daemon started.\n");
+    out.push_str("# TYPE roamway_uptime_seconds gauge\n");
+    out.push_str(&format!("roamway_uptime_seconds {}\n", uptime));
+
+    out.push_str("# HELP roamway_runs Runs currently held in state, by status.\n");
+    out.push_str("# TYPE roamway_runs gauge\n");
+    for (i, s) in STATUSES.iter().enumerate() {
+        out.push_str(&format!(
+            "roamway_runs{{status=\"{}\"}} {}\n",
+            run_status_label(*s),
+            run_counts[i]
+        ));
+    }
+
+    out.push_str("# HELP roamway_agents Sub-agent records in state, by state.\n");
+    out.push_str("# TYPE roamway_agents gauge\n");
+    if agents.is_empty() {
+        out.push_str("roamway_agents 0\n");
+    } else {
+        for (state, n) in agents.iter() {
+            out.push_str(&format!(
+                "roamway_agents{{state=\"{}\"}} {}\n",
+                esc_label(state),
+                n
+            ));
+        }
+    }
+
+    out.push_str("# HELP roamway_jobs Jobs currently defined.\n");
+    out.push_str("# TYPE roamway_jobs gauge\n");
+    out.push_str(&format!("roamway_jobs {}\n", jobs_total));
+    out.push_str("# HELP roamway_jobs_enabled Jobs with enabled=true.\n");
+    out.push_str("# TYPE roamway_jobs_enabled gauge\n");
+    out.push_str(&format!("roamway_jobs_enabled {}\n", jobs_enabled));
+
+    out.push_str("# HELP roamway_schedules Schedules currently defined.\n");
+    out.push_str("# TYPE roamway_schedules gauge\n");
+    out.push_str(&format!("roamway_schedules {}\n", sched_total));
+    out.push_str("# HELP roamway_schedules_paused Enabled schedules that are paused.\n");
+    out.push_str("# TYPE roamway_schedules_paused gauge\n");
+    out.push_str(&format!(
+        "roamway_schedules_paused {}\n",
+        sched_total.saturating_sub(sched_active)
+    ));
+
+    out.push_str("# HELP roamway_schedule_failures_total Sum of consecutive_failures across schedules (in-memory daemon state; resets on restart).\n");
+    out.push_str("# TYPE roamway_schedule_failures_total counter\n");
+    out.push_str(&format!("roamway_schedule_failures_total {}\n", sched_failures));
+
+    out.push_str("# HELP roamway_terminals Terminal sessions held in memory.\n");
+    out.push_str("# TYPE roamway_terminals gauge\n");
+    out.push_str(&format!("roamway_terminals {}\n", terminals));
+
+    out.push_str("# HELP roamway_http_concurrent_requests Connections currently open.\n");
+    out.push_str("# TYPE roamway_http_concurrent_requests gauge\n");
+    out.push_str(&format!(
+        "roamway_http_concurrent_requests {}\n",
+        app.conns.load(Ordering::Relaxed)
+    ));
+
+    out.push_str("# HELP roamway_http_requests_total HTTP requests handled since start (in-memory; resets on restart).\n");
+    out.push_str("# TYPE roamway_http_requests_total counter\n");
+    out.push_str(&format!(
+        "roamway_http_requests_total {}\n",
+        app.req_total.load(Ordering::Relaxed)
+    ));
+
+    out.push_str("# HELP roamway_http_requests_failed_total HTTP responses with status >= 400 since start (in-memory; resets on restart).\n");
+    out.push_str("# TYPE roamway_http_requests_failed_total counter\n");
+    out.push_str(&format!(
+        "roamway_http_requests_failed_total {}\n",
+        app.req_failed.load(Ordering::Relaxed)
+    ));
+    out
+}
+
 fn handle<C: Conn>(app: Arc<App>, mut s: C) -> std::io::Result<()> {
     let _ = s.set_read_timeout_opt(Some(Duration::from_secs(30)));
     let _ = s.set_write_timeout_opt(Some(Duration::from_secs(30)));
+    // /metrics 计数器：每进一次 handle 就算一次请求（读失败也算，运维关心的是流量）。
+    app.req_total.fetch_add(1, Ordering::Relaxed);
     let req = match read_req(&mut s)? {
         ReadOutcome::Req(r) => r,
         ReadOutcome::Eof => return Ok(()),
         ReadOutcome::HeaderTimeout => {
-            return respond(&mut s, 408, &json!({"error": "request timeout"}))
+            return fail_json(&app, &mut s, 408, &json!({"error": "request timeout"}), &[])
         }
         ReadOutcome::BodyTooLarge => {
-            return respond(&mut s, 413, &json!({"error": "body too large"}))
+            return fail_json(&app, &mut s, 413, &json!({"error": "body too large"}), &[])
         }
     };
 
     let host = req.headers.get("host").map(|v| v.as_str());
     if !auth::host_allowed(&app.allow_hosts, &app.bind_host, host) {
-        return respond_full(&mut s, 421, &json!({"error": "misdirected request"}), &[]);
+        return fail_json(&app, &mut s, 421, &json!({"error": "misdirected request"}), &[]);
     }
 
     let origin = req.headers.get("origin").map(|v| v.as_str());
@@ -442,7 +620,7 @@ fn handle<C: Conn>(app: Arc<App>, mut s: C) -> std::io::Result<()> {
             .unwrap_or_default();
         match authenticate(&app, Some(&got)) {
             AuthOutcome::Reject => {
-                return respond_full(&mut s, 401, &json!({"error": "unauthorized"}), &[]);
+                return fail_json(&app, &mut s, 401, &json!({"error": "unauthorized"}), &[]);
             }
             AuthOutcome::Open | AuthOutcome::Identity { .. } => {}
         }
@@ -455,19 +633,29 @@ fn handle<C: Conn>(app: Arc<App>, mut s: C) -> std::io::Result<()> {
     let public = !needs_auth(&req.path);
     let mut identity: Option<(String, Vec<String>)> = None;
     if !public {
+        // 普通路径只认 header；`/metrics` 额外接受 `?token=`（Prometheus 的
+        // params 抓取习惯，与 SSE 事件端点保持一致），其余路径行为不变。
         let presented = req.headers
             .get("x-roamway-token")
             .map(|v| v.as_str())
-            .or_else(|| bearer_header(&req));
+            .or_else(|| bearer_header(&req))
+            .or_else(|| {
+                if req.path == "/metrics" {
+                    req.query.get("token").map(|v| v.as_str())
+                } else {
+                    None
+                }
+            });
         match authenticate(&app, presented) {
             AuthOutcome::Reject => {
-                return respond_full(&mut s, 401, &json!({"error": "unauthorized"}), &cors_extra);
+                return fail_json(&app, &mut s, 401, &json!({"error": "unauthorized"}), &cors_extra);
             }
             AuthOutcome::Open => {}
             AuthOutcome::Identity { token_id, scopes } => {
                 let need = auth::required_scope(req.method.as_str(), &segs);
                 if !auth::has_scope(&scopes, need) {
-                    return respond_full(
+                    return fail_json(
+                        &app,
                         &mut s,
                         403,
                         &json!({"error": "insufficient scope", "required": need}),
@@ -487,7 +675,8 @@ fn handle<C: Conn>(app: Arc<App>, mut s: C) -> std::io::Result<()> {
                                 st.verify_replay(aprid, req.method.as_str(), req.path.as_str(), &req.body)
                             };
                             if let Err(e) = check {
-                                return respond_full(
+                                return fail_json(
+                                    &app,
                                     &mut s,
                                     409,
                                     &json!({"error": e}),
@@ -514,6 +703,22 @@ fn handle<C: Conn>(app: Arc<App>, mut s: C) -> std::io::Result<()> {
         }
     }
 
+    // `/metrics`：Prometheus expo 文本。鉴权已在上面完成（未豁免 needs_auth），
+    // 非 GET 一律 405，避免把 POST 当查询用。
+    if req.path == "/metrics" {
+        if req.method != "GET" {
+            return fail_json(&app, &mut s, 405, &json!({"error": "method not allowed"}), &cors_extra);
+        }
+        let body = metrics_text(&app);
+        return respond_static(
+            &mut s,
+            200,
+            "text/plain; version=0.0.4; charset=utf-8",
+            body.as_bytes(),
+            &cors_extra,
+        );
+    }
+
     if req.method == "GET" && req.path == "/v1/auth/whoami" {
         let body = match &identity {
             Some((token_id, scopes)) => json!({ "token_id": token_id, "scopes": scopes }),
@@ -523,6 +728,7 @@ fn handle<C: Conn>(app: Arc<App>, mut s: C) -> std::io::Result<()> {
     }
 
     let (code, body) = route(&app, &req);
+    count_failed(&app, code);
     respond_full(&mut s, code, &body, &cors_extra)
 }
 
@@ -3155,6 +3361,8 @@ mod tests {
             max_concurrent: 4,
             max_conn: 64,
             conns: std::sync::atomic::AtomicUsize::new(0),
+            req_total: std::sync::atomic::AtomicU64::new(0),
+            req_failed: std::sync::atomic::AtomicU64::new(0),
             tokens: std::sync::Mutex::new(auth::TokenStore::load(&dir)),
             approvals: std::sync::Mutex::new(auth::ApprovalStore::load(&dir)),
             passwords: std::sync::Mutex::new(auth::PasswordStore::load(&dir)),
@@ -3243,6 +3451,8 @@ mod tests {
             max_concurrent,
             max_conn: 64,
             conns: std::sync::atomic::AtomicUsize::new(0),
+            req_total: std::sync::atomic::AtomicU64::new(0),
+            req_failed: std::sync::atomic::AtomicU64::new(0),
             tokens: std::sync::Mutex::new(auth::TokenStore::load(dir)),
             approvals: std::sync::Mutex::new(auth::ApprovalStore::load(dir)),
             passwords: std::sync::Mutex::new(auth::PasswordStore::load(dir)),
@@ -3490,6 +3700,194 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn metrics_text_empty_state_is_valid_prometheus() {
+        let dir = std::env::temp_dir().join(format!("roamway-metrics-empty-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let app = test_app_with_max(&dir, "shell", RunStatus::Done, 1);
+        {
+            let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+            st.state.runs.clear();
+        }
+        let body = metrics_text(&app);
+        assert!(body.ends_with('\n'), "body must end with a newline");
+        let names = [
+            "roamway_build_info",
+            "roamway_uptime_seconds",
+            "roamway_runs",
+            "roamway_agents",
+            "roamway_jobs",
+            "roamway_jobs_enabled",
+            "roamway_schedules",
+            "roamway_schedules_paused",
+            "roamway_schedule_failures_total",
+            "roamway_terminals",
+            "roamway_http_concurrent_requests",
+            "roamway_http_requests_total",
+            "roamway_http_requests_failed_total",
+        ];
+        for n in names {
+            assert!(body.contains(n), "missing metric {}", n);
+            assert!(
+                body.contains(&format!("# TYPE {} ", n)),
+                "missing TYPE line for {}",
+                n
+            );
+            assert!(
+                body.contains(&format!("# HELP {} ", n)),
+                "missing HELP line for {}",
+                n
+            );
+        }
+        assert!(!body.contains("NaN"), "must not emit NaN");
+        assert!(!body.contains("+Inf") && !body.contains("-Inf"), "must not emit Inf");
+        assert!(body.contains("roamway_runs{status=\"done\"} 0"));
+        assert!(body.contains("roamway_agents 0"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn metrics_text_counts_runs_jobs_and_schedules() {
+        let dir = std::env::temp_dir().join(format!("roamway-metrics-counts-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let app = test_app_with_max(&dir, "shell", RunStatus::Done, 1);
+        {
+            let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+            let mut running = st.state.runs[0].clone();
+            running.id = "run_running".into();
+            running.status = RunStatus::Running;
+            st.state.runs.push(running);
+            let job: Job = serde_json::from_value(json!({
+                "id": "job_1",
+                "title": "t",
+                "agent": "shell",
+                "workspace": ".",
+                "prompt": "p",
+                "timeout_s": 60,
+                "next_at": 0,
+                "enabled": true,
+            }))
+            .unwrap();
+            st.state.jobs.push(job);
+        }
+        {
+            let mut sc = app.schedules.lock().unwrap_or_else(|e| e.into_inner());
+            let paused: schedules::Schedule = serde_json::from_value(json!({
+                "id": "sch_1",
+                "enabled": true,
+                "paused": true,
+                "consecutive_failures": 2,
+            }))
+            .unwrap();
+            sc.schedules.push(paused);
+        }
+        let body = metrics_text(&app);
+        assert!(body.contains("roamway_runs{status=\"done\"} 1"), "{}", body);
+        assert!(body.contains("roamway_runs{status=\"running\"} 1"));
+        assert!(body.contains("roamway_runs{status=\"queued\"} 0"));
+        assert!(body.contains("roamway_jobs 1"));
+        assert!(body.contains("roamway_jobs_enabled 1"));
+        assert!(body.contains("roamway_schedules 1"));
+        assert!(body.contains("roamway_schedules_paused 1"));
+        assert!(body.contains("roamway_schedule_failures_total 2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn esc_label_escapes_prometheus_reserved_chars() {
+        assert_eq!(esc_label("plain"), "plain");
+        assert_eq!(esc_label("a\"b\\c"), "a\\\"b\\\\c");
+        assert_eq!(esc_label("line1\nline2"), "line1\\nline2");
+    }
+
+    fn http_roundtrip(app: Arc<App>, raw: &str) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv = thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let _ = handle(app, s);
+        });
+        let mut c = TcpStream::connect(addr).unwrap();
+        c.write_all(raw.as_bytes()).unwrap();
+        c.flush().unwrap();
+        let mut buf = Vec::new();
+        let _ = c.read_to_end(&mut buf);
+        srv.join().unwrap();
+        String::from_utf8_lossy(&buf).to_string()
+    }
+
+    #[test]
+    fn metrics_endpoint_requires_token_and_serves_text() {
+        let dir = std::env::temp_dir().join(format!("roamway-metrics-http-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let app = test_app_with_max(&dir, "shell", RunStatus::Done, 1);
+        let tok = {
+            let mut ts = app.tokens.lock().unwrap_or_else(|e| e.into_inner());
+            ts.create(
+                Some("prometheus".into()),
+                vec!["read".into(), "admin".into(), "run".into()],
+                None,
+            )
+            .1
+        };
+
+        let anon = http_roundtrip(
+            app.clone(),
+            "GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        );
+        assert!(
+            anon.starts_with("HTTP/1.1 401"),
+            "expected 401, got {}",
+            anon.lines().next().unwrap_or("")
+        );
+
+        let ok = http_roundtrip(
+            app.clone(),
+            &format!(
+                "GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {}\r\n\r\n",
+                tok
+            ),
+        );
+        assert!(ok.starts_with("HTTP/1.1 200"), "{}", ok.lines().next().unwrap_or(""));
+        assert!(ok.contains("text/plain; version=0.0.4"), "{}", ok);
+        assert!(ok.contains("roamway_build_info"));
+
+        let via_query = http_roundtrip(
+            app.clone(),
+            &format!(
+                "GET /metrics?token={} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+                tok
+            ),
+        );
+        assert!(
+            via_query.starts_with("HTTP/1.1 200"),
+            "query token must be accepted on /metrics"
+        );
+
+        let post = http_roundtrip(
+            app.clone(),
+            &format!(
+                "POST /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {}\r\nContent-Length: 0\r\n\r\n",
+                tok
+            ),
+        );
+        assert!(
+            post.starts_with("HTTP/1.1 405"),
+            "expected 405, got {}",
+            post.lines().next().unwrap_or("")
+        );
+
+        assert!(
+            app.req_total.load(Ordering::Relaxed) >= 4,
+            "req_total must count every request"
+        );
+        assert!(
+            app.req_failed.load(Ordering::Relaxed) >= 2,
+            "req_failed must count 401/405"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

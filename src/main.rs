@@ -23,7 +23,7 @@ use std::io::{BufRead, Write};
 use std::path::PathBuf;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicUsize, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicUsize, AtomicI32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -1245,6 +1245,8 @@ fn cmd_serve(flags: &HashMap<String, String>) {
         max_concurrent,
         max_conn,
         conns: AtomicUsize::new(0),
+        req_total: AtomicU64::new(0),
+        req_failed: AtomicU64::new(0),
         tokens: Mutex::new(token_store),
         approvals: Mutex::new(approval_store),
         passwords: Mutex::new(password_store),
@@ -4880,6 +4882,8 @@ pub mod test_support {
             max_concurrent: 4,
             max_conn: 64,
             conns: AtomicUsize::new(0),
+            req_total: AtomicU64::new(0),
+            req_failed: AtomicU64::new(0),
             tokens: Mutex::new(auth::TokenStore::load(dir)),
             approvals: Mutex::new(auth::ApprovalStore::load(dir)),
             passwords: Mutex::new(auth::PasswordStore::load(dir)),
