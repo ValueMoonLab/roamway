@@ -39,7 +39,7 @@ HTTP 侧 `POST /v1/agents` / `POST /v1/runs` 接受 `"worktree": true|false` 或
 
 ## backup
 
-`roamway backup [--out DIR] [--keep N]`
+`roamway backup [--out DIR] [--keep N] [--data DIR]`
 
 - 仅本地执行：显式带 `--host` → exit 2 `backup/restore are local-only`；`--data`/`--home` 生效。
 - `--out` 缺省 `<data>/backups`；在其下新建 `roamway-backup-<YYYYmmdd-HHMMSS>/`，同秒重复追加 `-2`、`-3`。

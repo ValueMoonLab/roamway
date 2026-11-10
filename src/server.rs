@@ -991,8 +991,10 @@ fn stream_agent_events<C: Conn>(app: &Arc<App>, s: &mut C, id: &str) {
     }
 }
 fn needs_auth(path: &str) -> bool {
-    !matches!(path, "/health" | "/v1/auth/login" | "/v1/auth/pair")
-        && !path.starts_with("/v1/hub/hooks/")
+    !matches!(
+        path,
+        "/health" | "/healthz" | "/readyz" | "/v1/auth/login" | "/v1/auth/pair"
+    ) && !path.starts_with("/v1/hub/hooks/")
 }
 
 /// 常量时间比较，避免按字节提前返回泄露 token 前缀
@@ -1392,6 +1394,10 @@ fn route(app: &Arc<App>, req: &Req) -> (u16, Value) {
     let m = req.method.as_str();
     match (m, segs.as_slice()) {
         ("GET", ["health"]) => (200, health(app)),
+        ("GET", ["healthz"]) => (200, healthz(app)),
+        ("GET", ["readyz"]) => readyz(app),
+        // 探活只读：非 GET 明确 405，别让编排器把 404 误读成"路由不存在"
+        (_, ["healthz"]) | (_, ["readyz"]) => (405, json!({"error": "method not allowed"})),
         ("GET", ["v1", "health"]) => (200, v1_health(app)),
         ("POST", ["v1", "auth", "login"]) => login_route(app, req),
         ("POST", ["v1", "auth", "pair"]) => pair_route(app, req),
@@ -2518,6 +2524,29 @@ fn agent_diff_route(app: &Arc<App>, id: &str) -> (u16, Value) {
         Ok(o) if o.status.success() => (200, json!({ "diff": String::from_utf8_lossy(&o.stdout).to_string() })),
         Ok(o) => (400, json!({ "error": String::from_utf8_lossy(&o.stderr).trim().to_string() })),
         Err(e) => (400, json!({ "error": format!("git diff failed: {}", e) })),
+    }
+}
+
+/// liveness：只读 `app.started` 与编译期版本，**不取 store 锁**。
+/// store 被一次大 state.json 落盘持有时，`/health` 会跟着挂起；探针把"忙"读成"死"会触发无谓重启。
+fn healthz(app: &Arc<App>) -> Value {
+    json!({
+        "ok": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_s": now() - app.started,
+    })
+}
+
+/// readiness：`try_lock` 拿不到锁不算失败，回 503 `busy`，让编排器等而不是重启。
+fn readyz(app: &Arc<App>) -> (u16, Value) {
+    let up = json!({
+        "ok": true,
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_s": now() - app.started,
+    });
+    match app.store.try_lock() {
+        Ok(_guard) => (200, up),
+        Err(_) => (503, json!({"ok": false, "reason": "busy"})),
     }
 }
 
@@ -4307,6 +4336,79 @@ mod tests {
             app.req_failed.load(Ordering::Relaxed) >= 2,
             "req_failed must count 401/405"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn healthz_is_liveness_only_and_public() {
+        let dir = std::env::temp_dir().join(format!("roamway-healthz-http-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let app = test_app_with_max(&dir, "shell", RunStatus::Done, 1);
+
+        // 不带 token 也必须 200：探活是公开面
+        let live = http_roundtrip(
+            app.clone(),
+            "GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        );
+        assert!(
+            live.starts_with("HTTP/1.1 200"),
+            "expected 200, got {}",
+            live.lines().next().unwrap_or("")
+        );
+        assert!(
+            live.contains("\"ok\": true"),
+            "expected ok:true body, got {}",
+            live
+        );
+        assert!(live.contains("\"uptime_s\": "), "{}", live);
+        assert!(live.contains(env!("CARGO_PKG_VERSION")));
+        assert!(
+            !live.contains("\"running\""),
+            "liveness must not read run counters: {}",
+            live
+        );
+
+        // 只读路由：非 GET → 405，不能靠 404 让探针猜
+        for path in ["/healthz", "/readyz"] {
+            let post = http_roundtrip(
+                app.clone(),
+                &format!(
+                    "POST {} HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 0\r\n\r\n",
+                    path
+                ),
+            );
+            assert!(
+                post.starts_with("HTTP/1.1 405"),
+                "{} expected 405, got {}",
+                path,
+                post.lines().next().unwrap_or("")
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn readyz_reports_busy_without_claiming_death() {
+        let dir = std::env::temp_dir().join(format!("roamway-readyz-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let app = test_app_with_max(&dir, "shell", RunStatus::Done, 1);
+
+        // store 锁被占住（模拟一次大 state.json 落盘）时：
+        // liveness 不能挂，readiness 要明确回 503 busy
+        {
+            let _guard = app.store.lock().unwrap_or_else(|e| e.into_inner());
+            let live = healthz(&app);
+            assert_eq!(live["ok"], json!(true));
+            let (code, body) = readyz(&app);
+            assert_eq!(code, 503);
+            assert_eq!(body["ok"], json!(false));
+            assert_eq!(body["reason"], json!("busy"));
+        }
+        // 锁释放后立即恢复 200
+        let (code, body) = readyz(&app);
+        assert_eq!(code, 200);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["version"], json!(env!("CARGO_PKG_VERSION")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -35,6 +35,13 @@ const BOOLS: &[&str] = &["print", "board", "no-wait", "quiet", "json", "allow-ov
 
 static FAIL_CODE: AtomicI32 = AtomicI32::new(0);
 
+/// 本地快照三命令的 usage 单一真源：help 头部、dispatch、usage_error 全取这里。
+/// P24 的教训：同一串写三处，漏一个 `--data` 就让人照着 help 传参 → exit 2 → 误判成功能坏了。
+const USAGE_PRUNE: &str =
+    "roamway prune [--dry-run] [--keep N] [--max-age-days N] [--data DIR] [--yes]";
+const USAGE_BACKUP: &str = "roamway backup [--out DIR] [--keep N] [--data DIR]";
+const USAGE_RESTORE: &str = "roamway restore --from DIR [--data DIR] [--force] [--yes]";
+
 fn fail(code: i32) {
     FAIL_CODE.fetch_max(code, Ordering::SeqCst);
 }
@@ -45,7 +52,12 @@ fn usage_error(msg: &str) {
 }
 
 fn usage() {
-    println!(
+    print!("{}", usage_text());
+}
+
+/// help 文本单独出函数，测试才能逐字校验（usage 面漏参数是本项目复现过的坑）。
+fn usage_text() -> String {
+    format!(
         r#"roamway {} — 迷你多智能体编排器（国内模型 / 长跑友好）
 
 核心：
@@ -79,9 +91,9 @@ fn usage() {
   roamway workspace ls | create <name> --path DIR | archive <name> | setup <name> | rm <name>
   roamway terminal create|ls|capture|send-keys|kill
   roamway script ls|add|rm|start|stop
-  roamway prune [--dry-run] [--keep N] [--max-age-days N] [--yes]
-  roamway backup [--out DIR] [--keep N]                 # 本地状态快照
-  roamway restore --from DIR [--data DIR] [--force] [--yes]  # 从快照回滚（仅本地）
+  {prune_usage}
+  {backup_usage}                 # 本地状态快照
+  {restore_usage}                # 从快照回滚（仅本地）
   注：受管终端无 TTY，TUI 程序（vim/top 交互界面）不支持
 
 生态扩展：
@@ -98,8 +110,11 @@ fn usage() {
           未知短标志 exit 2；prompt 里以 - 开头的词请放在 -- 之后
 环境变量：ROAMWAY_HOST / ROAMWAY_TOKEN / ROAMWAY_DEEPSEEK_KEY / ROAMWAY_QWEN_KEY
 agent 可选：codex | hermes | claude | shell | api:deepseek | api:qwen"#,
-        env!("CARGO_PKG_VERSION")
-    );
+        env!("CARGO_PKG_VERSION"),
+        prune_usage = USAGE_PRUNE,
+        backup_usage = USAGE_BACKUP,
+        restore_usage = USAGE_RESTORE
+    )
 }
 struct ParsedArgs {
     flags: HashMap<String, String>,
@@ -3703,7 +3718,22 @@ fn cmd_host_probe(flags: &HashMap<String, String>, pos: &[String]) {
         reg.hosts[idx].last_probe = Some(p);
     }
     let _ = reg.save();
+    if let Some(note) = wildcard_endpoint_note(&reg.hosts[idx].endpoint) {
+        eprintln!("{}", note);
+    }
     println!("{}", serde_json::to_string_pretty(&host_json(&reg.hosts[idx])).unwrap_or_default());
+}
+
+/// wildcard endpoint 是 listen 地址，probe 本身连不上；文案直接给下一步，
+/// 免得用户照着 troubleshooting 的 421 段反复改 `--host`。
+fn wildcard_endpoint_note(endpoint: &str) -> Option<String> {
+    if !hosts::endpoint_is_wildcard(endpoint) {
+        return None;
+    }
+    Some(format!(
+        "note: endpoint {} 是 wildcard 地址（listen 地址），远端访问请写实际主机名/IP，例如 --host http://<host>:8796",
+        endpoint
+    ))
 }
 
 fn cmd_agent(flags: &HashMap<String, String>, pos: &[String]) {
@@ -5295,6 +5325,56 @@ mod tests {
         flags.insert("data".to_string(), dir.to_string_lossy().to_string());
         assert_eq!(local_base(&flags), "http://127.0.0.1:8796");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remote_host_endpoint_is_never_rewritten() {
+        let dir = std::env::temp_dir().join(format!("roamway-host-wild-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut reg = hosts::Registry::load(&dir);
+        reg.add("wild", "http://0.0.0.0:8796", "t").unwrap();
+        reg.add("real", "http://192.0.2.10:8796", "t").unwrap();
+        reg.save().unwrap();
+
+        let mut flags: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        flags.insert("data".to_string(), dir.to_string_lossy().to_string());
+        flags.insert("host".to_string(), "wild".to_string());
+        // --host name 用 registry 的 endpoint 原样访问：只修本地 bind 推导，不改远端地址
+        let h = resolve_host(&flags).expect("registered host");
+        assert_eq!(hosts::endpoint_normalize(&h.endpoint), "http://0.0.0.0:8796");
+        // wildcard 时 probe 必须给可执行提示，而不是让人反复试 421
+        let note = wildcard_endpoint_note(&h.endpoint).expect("wildcard must be called out");
+        assert!(note.contains("wildcard"), "{}", note);
+        assert!(note.contains("--host"), "{}", note);
+
+        flags.insert("host".to_string(), "real".to_string());
+        let h = resolve_host(&flags).expect("registered host");
+        assert!(wildcard_endpoint_note(&h.endpoint).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn local_snapshot_usage_strings_mention_data_flag() {
+        let help = usage_text();
+        for (name, usage) in [
+            ("prune", USAGE_PRUNE),
+            ("backup", USAGE_BACKUP),
+            ("restore", USAGE_RESTORE),
+        ] {
+            assert!(
+                usage.contains("--data DIR"),
+                "{} usage must document --data DIR: {}",
+                name,
+                usage
+            );
+            assert!(
+                help.contains(usage),
+                "help 头部缺 {} 的 usage 串: {}",
+                name,
+                usage
+            );
+        }
+        assert!(help.contains(env!("CARGO_PKG_VERSION")), "{}", help);
     }
 
     #[test]

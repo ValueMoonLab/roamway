@@ -1,12 +1,22 @@
 # Changelog
 
-## Unreleased
+## 1.2.0
 
-无人值守运行面的第二段（P21–P24）与收尾修复：只读 Web 面板、时间维度保留、本地快照
-`backup`/`restore`、写盘去重与写计数单一真源、pid 文件生命周期，以及本地 CLI 的 421 修复。
+探活可分性、版本定版、usage 面收口（P25），叠加无人值守运行面的第二段（P21–P24）：只读 Web 面板、
+时间维度保留、本地快照 `backup`/`restore`、写盘去重与写计数单一真源、pid 文件生命周期，
+以及本地 CLI 的 421 修复。
 
 ### Added
 
+- `GET /healthz`（liveness）：免鉴权，**不取 store 锁**，只读启动时间与编译期版本，回
+  `{"ok":true,"version":...,"uptime_s":...}` 200。state 锁被一次大 `state.json` 落盘持有时，
+  探针不再把"忙"读成"死"。
+- `GET /readyz`（readiness）：免鉴权，用 `try_lock`；拿不到锁回 `503 {"ok":false,"reason":"busy"}`，
+  拿到锁回 200。忙 ≠ 死是这条的全部意义。
+- `/healthz`、`/readyz` 只接受 GET，其他方法一律 405（不是 404）——编排器能把"方法错了"与
+  "路由不存在"分开。
+- `hosts::endpoint_is_wildcard()` 与 `roamway host probe <name>` 的提示：endpoint 是 `0.0.0.0`/`::`/`*`
+  这类 listen 地址时，probe 之后额外提示"远端访问请写实际主机名/IP"，不再让人照着 421 段反复试。
 - `keep_days`（第 14 个 daemon 配置键，默认 `0`=不限）与 `prune --max-age-days N`：
   保留判定仍是 `config::retention_plan_full` 一处，按条数（`keep_runs`）与按时间（`keep_days`）
   两条规则共用同一份"只删 terminal run"的逻辑；`prune` 的报告分列 `removed` 与 `age_removed`。

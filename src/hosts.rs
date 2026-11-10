@@ -78,12 +78,36 @@ fn split_authority(auth: &str) -> (String, String) {
     }
 }
 
+/// A listen address is never a reachable authority: `0.0.0.0`, `::`, `[::]`, `*`, empty.
+fn wildcard_host(host: &str) -> bool {
+    host.is_empty()
+        || host == "*"
+        || host == "0.0.0.0"
+        || host == "::"
+        || host == "[::]"
+        || host == "::0"
+        || host == "[::0]"
+}
+
+/// True when the endpoint's host part is a listen-only wildcard address.
+/// `--host name` 用 registry 里的 endpoint 原样访问（不偷偷改写远端地址），
+/// 但 wildcard 永远连不上：调用方（如 `host probe`）要据此给出明确提示。
+pub fn endpoint_is_wildcard(raw: &str) -> bool {
+    let norm = endpoint_normalize(raw);
+    let rest = match norm.split_once("://") {
+        Some((_, r)) => r.to_string(),
+        None => norm,
+    };
+    let authority = rest.split('/').next().unwrap_or("");
+    let (host, _) = split_authority(authority);
+    wildcard_host(&host)
+}
+
 /// Client-facing base URL derived from a persisted server `bind` value.
 ///
-/// A wildcard bind (`0.0.0.0`, `::`, `[::]`, empty host, `*`) is a listen address,
-/// not a reachable Host header: sending it makes the server answer 421 misdirected
-/// request because the rewritten authority is not in `--allow-host`. Map the wildcard
-/// to loopback while keeping the port and any path.
+/// A wildcard bind is a listen address, not a reachable Host header: sending it makes
+/// the server answer 421 misdirected request because the rewritten authority is not in
+/// `--allow-host`. Map the wildcard to loopback while keeping the port and any path.
 pub fn client_base_from_bind(raw: &str) -> String {
     let norm = endpoint_normalize(raw);
     let (scheme, rest) = match norm.split_once("://") {
@@ -95,14 +119,7 @@ pub fn client_base_from_bind(raw: &str) -> String {
         None => (rest.clone(), String::new()),
     };
     let (host, port) = split_authority(&authority);
-    let wildcard = host.is_empty()
-        || host == "*"
-        || host == "0.0.0.0"
-        || host == "::"
-        || host == "[::]"
-        || host == "::0"
-        || host == "[::0]";
-    if wildcard {
+    if wildcard_host(&host) {
         format!("{}://127.0.0.1{}{}", scheme, port, tail)
     } else {
         format!("{}://{}{}", scheme, authority, tail)
@@ -364,6 +381,29 @@ mod tests {
         assert_eq!(client_base_from_bind("localhost:8796"), "http://localhost:8796");
         assert_eq!(client_base_from_bind("[::1]:8796"), "http://[::1]:8796");
         assert_eq!(client_base_from_bind("https://nas.example:8443"), "https://nas.example:8443");
+    }
+
+    #[test]
+    fn endpoint_is_wildcard_detects_listen_addresses() {
+        for raw in [
+            "0.0.0.0:8796",
+            "http://0.0.0.0:8796",
+            "[::]:8796",
+            "::",
+            "*:9100",
+            "tcp://0.0.0.0:8896",
+            ":8796",
+        ] {
+            assert!(endpoint_is_wildcard(raw), "{} should be wildcard", raw);
+        }
+        for raw in [
+            "127.0.0.1:8896",
+            "192.0.2.10:8796",
+            "https://nas.example:8443",
+            "[::1]:8796",
+        ] {
+            assert!(!endpoint_is_wildcard(raw), "{} is reachable", raw);
+        }
     }
 
     #[test]

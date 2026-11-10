@@ -58,6 +58,9 @@ runner thread ──spawn──▶ codex/hermes/claude/sh (新进程组)
 - run 并发上限 `--max-concurrent`（默认 4）：新建 run 一律先落为 `queued`；低于上限时立即启动，否则由调度器每轮按空闲槽位拾取。
 - 手动 run 与 job 触发的 run 走同一条排队路径（`drain_queued`），保证"同时提交 6 个只跑 2 个"。
 - `/health`（免鉴权）与 `/v1/health`（需鉴权）返回 `running` / `queued` 计数。
+- 探活三档：`/healthz`（liveness，免鉴权、不取 store 锁，只回 `ok`/`version`/`uptime_s`）、
+  `/readyz`（readiness，`try_lock` 拿不到锁回 `503 {"ok":false,"reason":"busy"}`，忙 ≠ 死）、
+  `/health`（业务计数）。三者均只接受 GET，其他方法 405。
 
 ## 重启语义
 

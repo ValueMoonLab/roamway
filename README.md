@@ -472,6 +472,7 @@ docs/architecture.md  设计取舍
 - [x] 长跑保留策略与日志封顶（P22）
 - [x] 按时间保留 + backup/restore（P23）
 - [x] 写计数单一真源 + pid/活体判定（P24）
+- [x] 探活可分性 + 版本定版 + usage 收口（P25）
 
 ## License
 
