@@ -205,7 +205,7 @@ pub fn spawn_from_job(app: Arc<App>, job_id: &str) {
         if let Some(jj) = st.state.jobs.iter_mut().find(|x| x.id == job_id) {
             jj.last_run = Some(iso(t));
         }
-        prune(&mut st, app.keep_runs);
+        prune(&mut st, app.keep_runs, app.keep_days);
         st.save();
     };
     drain_queued(&app);
@@ -245,17 +245,20 @@ pub fn drain_queued(app: &Arc<App>) {
 
 /// 与启动期同一套阈值：keep_runs=0 表示不修剪。删除 terminal run 时同步删日志文件。
 /// 返回"是否有删除"。
-pub fn prune(st: &mut Store, keep_runs: usize) -> bool {
-    // 只删 terminal：threshold 与"是否可删"的判定全部收敛到 config::trim_runs_plan，
-    // 日志文件删除后再由 config::trim_runs 处理向量，不引入第二套阈值。
-    let removed = config::trim_runs_plan(&st.state.runs, keep_runs);
-    if removed.is_empty() {
+pub fn prune(st: &mut Store, keep_runs: usize, keep_days: u64) -> bool {
+    // 只删 terminal：阈值与"是否可删"的判定全部收敛到 config::retention_plan，
+    // 日志文件删除后直接在同一套删除集上收敛，不引入第二套阈值。
+    let remove = config::retention_plan(&st.state.runs, keep_runs, keep_days, now());
+    if remove.is_empty() {
         return false;
     }
-    for id in &removed {
+    for id in &remove {
         let _ = std::fs::remove_file(st.log_path(id));
     }
-    config::trim_runs(&mut st.state.runs, keep_runs)
+    let removed: std::collections::HashSet<String> = remove.into_iter().collect();
+    let before = st.state.runs.len();
+    st.state.runs.retain(|r| !removed.contains(&r.id));
+    st.state.runs.len() < before
 }
 
 /// 一次修剪动作的统计结果，供 `prune --dry-run` 与 `/v1/prune` 使用。
@@ -263,15 +266,18 @@ pub struct PruneStats {
     pub runs_removed: usize,
     pub logs_removed: usize,
     pub bytes_freed: usize,
+    pub age_removed: usize,
 }
 
 /// 计算并（dry_run=false 时）执行修剪。dry_run=true 只统计，不删 run、不删日志、不 save。
-pub fn prune_stats(st: &mut Store, keep_runs: usize, dry_run: bool) -> PruneStats {
-    let removed = config::trim_runs_plan(&st.state.runs, keep_runs);
+pub fn prune_stats(st: &mut Store, keep_runs: usize, keep_days: u64, dry_run: bool) -> PruneStats {
+    let plan = config::retention_plan_full(&st.state.runs, keep_runs, keep_days, now());
+    let removed = plan.remove;
     let mut stats = PruneStats {
         runs_removed: removed.len(),
         logs_removed: 0,
         bytes_freed: 0,
+        age_removed: plan.age_removed,
     };
     if dry_run {
         for id in &removed {
@@ -489,6 +495,9 @@ mod tests {
                 seq: 0,
             },
             loaded_ok: true,
+            last_write_hash: 0,
+            writes_total: 0,
+            writes_skipped: 0,
         }
     }
 
@@ -500,7 +509,7 @@ mod tests {
             .map(|i| mk_run(&format!("run_{:06}", i), RunStatus::Done, 0))
             .collect();
         let mut st = store_with(dir.clone(), runs);
-        assert!(prune(&mut st, 100));
+        assert!(prune(&mut st, 100, 0));
         assert_eq!(st.state.runs.len(), 100);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -513,7 +522,7 @@ mod tests {
             .map(|i| mk_run(&format!("run_{:06}", i), RunStatus::Done, 0))
             .collect();
         let mut st = store_with(dir.clone(), runs);
-        assert!(!prune(&mut st, 0));
+        assert!(!prune(&mut st, 0, 0));
         assert_eq!(st.state.runs.len(), 900);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -528,7 +537,7 @@ mod tests {
         runs.push(mk_run("run_running", RunStatus::Running, 0));
         runs.push(mk_run("run_queued", RunStatus::Queued, 0));
         let mut st = store_with(dir.clone(), runs);
-        assert!(prune(&mut st, 10));
+        assert!(prune(&mut st, 10, 0));
         assert_eq!(st.state.runs.len(), 10);
         assert!(st.state.runs.iter().any(|r| r.id == "run_running"));
         assert!(st.state.runs.iter().any(|r| r.id == "run_queued"));
@@ -548,7 +557,7 @@ mod tests {
         for id in ["run_old_1", "run_old_2", "run_keep"] {
             std::fs::write(st.log_path(id), b"x").unwrap();
         }
-        assert!(prune(&mut st, 1));
+        assert!(prune(&mut st, 1, 0));
         assert_eq!(st.state.runs.len(), 1);
         assert_eq!(st.state.runs[0].id, "run_keep");
         assert!(!st.log_path("run_old_1").exists());

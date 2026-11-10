@@ -418,6 +418,45 @@ fn run_status_label(s: RunStatus) -> &'static str {
     }
 }
 
+/// 统计 `<data>` 顶层普通文件字节 + `logs/*.log` 字节；不递归子目录、不跟随符号链接、失败记 0。
+fn data_dir_bytes(dir: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let path = e.path();
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_file() {
+                total += meta.len();
+            }
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir(dir.join("logs")) {
+        for e in entries.flatten() {
+            let path = e.path();
+            if path.extension().and_then(|x| x.to_str()) != Some("log") {
+                continue;
+            }
+            let meta = match std::fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
+            if meta.is_file() {
+                total += meta.len();
+            }
+        }
+    }
+    total
+}
+
 /// 统计 `<data>/logs` 下 `*.log` 的合计字节与文件数；读目录失败一律记 0，绝不 panic。
 fn logs_dir_stats(dir: &std::path::Path) -> (u64, u64) {
     let entries = match std::fs::read_dir(dir.join("logs")) {
@@ -457,6 +496,7 @@ fn metrics_text(app: &Arc<App>) -> String {
     let state_bytes: u64;
     let logs_bytes: u64;
     let logs_count: u64;
+    let data_bytes: u64;
     {
         let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
         for r in st.state.runs.iter() {
@@ -475,6 +515,7 @@ fn metrics_text(app: &Arc<App>) -> String {
         let (lb, lc) = logs_dir_stats(&st.dir);
         logs_bytes = lb;
         logs_count = lc;
+        data_bytes = data_dir_bytes(&st.dir);
     }
     let (sched_total, sched_active, sched_failures) = {
         let sc = app.schedules.lock().unwrap_or_else(|e| e.into_inner());
@@ -524,6 +565,24 @@ fn metrics_text(app: &Arc<App>) -> String {
     out.push_str("# HELP roamway_logs_count Number of *.log files under <data>/logs.\n");
     out.push_str("# TYPE roamway_logs_count gauge\n");
     out.push_str(&format!("roamway_logs_count {}\n", logs_count));
+
+    out.push_str("# HELP roamway_data_bytes Total bytes of top-level files plus logs/*.log under <data>.\n");
+    out.push_str("# TYPE roamway_data_bytes gauge\n");
+    out.push_str(&format!("roamway_data_bytes {}\n", data_bytes));
+
+    out.push_str("# HELP roamway_state_writes_total state.json write count since daemon start.\n");
+    out.push_str("# TYPE roamway_state_writes_total counter\n");
+    out.push_str(&format!(
+        "roamway_state_writes_total {}\n",
+        app.state_writes.load(Ordering::Relaxed)
+    ));
+
+    out.push_str("# HELP roamway_state_writes_skipped_total state.json writes skipped because content was unchanged.\n");
+    out.push_str("# TYPE roamway_state_writes_skipped_total counter\n");
+    out.push_str(&format!(
+        "roamway_state_writes_skipped_total {}\n",
+        app.state_writes_skipped.load(Ordering::Relaxed)
+    ));
 
     out.push_str("# HELP roamway_agents Sub-agent records in state, by state.\n");
     out.push_str("# TYPE roamway_agents gauge\n");
@@ -1111,6 +1170,8 @@ struct PruneReq {
     dry_run: bool,
     #[serde(default)]
     keep: Option<usize>,
+    #[serde(default)]
+    max_age_days: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -2746,7 +2807,7 @@ fn create_run(app: &Arc<App>, req: &Req) -> (u16, Value) {
             worktree: None,
         };
         st.state.runs.push(r.clone());
-        jobs::prune(&mut st, app.keep_runs);
+        jobs::prune(&mut st, app.keep_runs, app.keep_days);
         st.save();
         r
     };
@@ -2852,6 +2913,7 @@ fn prune_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         PruneReq {
             dry_run: false,
             keep: None,
+            max_age_days: None,
         }
     } else {
         let raw: Value = match serde_json::from_slice(&req.body) {
@@ -2862,6 +2924,7 @@ fn prune_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
             PruneReq {
                 dry_run: false,
                 keep: None,
+                max_age_days: None,
             }
         } else {
             match serde_json::from_value(raw) {
@@ -2871,9 +2934,10 @@ fn prune_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         }
     };
     let keep_runs = spec.keep.unwrap_or(app.keep_runs);
+    let keep_days = spec.max_age_days.unwrap_or(app.keep_days);
     let stats = {
         let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
-        let stats = jobs::prune_stats(&mut st, keep_runs, spec.dry_run);
+        let stats = jobs::prune_stats(&mut st, keep_runs, keep_days, spec.dry_run);
         if !spec.dry_run {
             st.save();
         }
@@ -2886,6 +2950,7 @@ fn prune_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
             "runs_removed": stats.runs_removed,
             "logs_removed": stats.logs_removed,
             "bytes_freed": stats.bytes_freed,
+            "age_removed": stats.age_removed,
             "dry_run": spec.dry_run,
         }),
     )
@@ -3558,6 +3623,9 @@ mod tests {
                 seq: 3,
             },
             loaded_ok: true,
+            last_write_hash: 0,
+            writes_total: 0,
+            writes_skipped: 0,
         };
         let app = Arc::new(App {
             store: std::sync::Mutex::new(store),
@@ -3570,11 +3638,14 @@ mod tests {
             tz_offset_hours: 8,
             max_concurrent: 4,
             keep_runs: 500,
+            keep_days: 0,
             max_log_bytes: 4_194_304,
             max_conn: 64,
             conns: std::sync::atomic::AtomicUsize::new(0),
             req_total: std::sync::atomic::AtomicU64::new(0),
             req_failed: std::sync::atomic::AtomicU64::new(0),
+            state_writes: std::sync::atomic::AtomicU64::new(0),
+            state_writes_skipped: std::sync::atomic::AtomicU64::new(0),
             tokens: std::sync::Mutex::new(auth::TokenStore::load(&dir)),
             approvals: std::sync::Mutex::new(auth::ApprovalStore::load(&dir)),
             passwords: std::sync::Mutex::new(auth::PasswordStore::load(&dir)),
@@ -3650,6 +3721,9 @@ mod tests {
             dir: dir.to_path_buf(),
             state: State { runs: vec![run], jobs: vec![], agents: vec![], seq: 1 },
             loaded_ok: true,
+            last_write_hash: 0,
+            writes_total: 0,
+            writes_skipped: 0,
         };
         Arc::new(App {
             store: std::sync::Mutex::new(store),
@@ -3662,11 +3736,14 @@ mod tests {
             tz_offset_hours: 8,
             max_concurrent,
             keep_runs: 500,
+            keep_days: 0,
             max_log_bytes: 4_194_304,
             max_conn: 64,
             conns: std::sync::atomic::AtomicUsize::new(0),
             req_total: std::sync::atomic::AtomicU64::new(0),
             req_failed: std::sync::atomic::AtomicU64::new(0),
+            state_writes: std::sync::atomic::AtomicU64::new(0),
+            state_writes_skipped: std::sync::atomic::AtomicU64::new(0),
             tokens: std::sync::Mutex::new(auth::TokenStore::load(dir)),
             approvals: std::sync::Mutex::new(auth::ApprovalStore::load(dir)),
             passwords: std::sync::Mutex::new(auth::PasswordStore::load(dir)),
@@ -3945,6 +4022,9 @@ mod tests {
             "roamway_http_concurrent_requests",
             "roamway_http_requests_total",
             "roamway_http_requests_failed_total",
+            "roamway_data_bytes",
+            "roamway_state_writes_total",
+            "roamway_state_writes_skipped_total",
         ];
         for n in names {
             assert!(body.contains(n), "missing metric {}", n);
@@ -4028,6 +4108,30 @@ mod tests {
         assert!(body.contains("roamway_state_bytes 7\n"), "{}", body);
         assert!(body.contains("roamway_logs_bytes 8\n"), "{}", body);
         assert!(body.contains("roamway_logs_count 2\n"), "{}", body);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn metrics_include_data_bytes_and_write_counters() {
+        let dir = std::env::temp_dir().join(format!("roamway-metrics-data-{}", now()));
+        let _ = std::fs::create_dir_all(dir.join("logs"));
+        let _ = std::fs::create_dir_all(dir.join("logs").join("sub"));
+        std::fs::write(dir.join("state.json"), b"0123456789").unwrap();
+        std::fs::write(dir.join("config.json"), b"12345").unwrap();
+        std::fs::write(dir.join("logs").join("a.log"), b"1234567").unwrap();
+        std::fs::write(dir.join("logs").join("sub").join("nested.log"), b"ignored").unwrap();
+        std::fs::write(dir.join("logs").join("a.txt"), b"ignored").unwrap();
+        let app = test_app_with_max(&dir, "shell", RunStatus::Done, 1);
+        let body = metrics_text(&app);
+        assert!(body.contains("roamway_data_bytes 22\n"), "{}", body);
+        assert!(body.contains("roamway_state_writes_total 0\n"), "{}", body);
+        assert!(body.contains("roamway_state_writes_skipped_total 0\n"), "{}", body);
+
+        app.save();
+        app.save();
+        let body = metrics_text(&app);
+        assert!(body.contains("roamway_state_writes_total 1\n"), "{}", body);
+        assert!(body.contains("roamway_state_writes_skipped_total 1\n"), "{}", body);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

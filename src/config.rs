@@ -26,6 +26,7 @@ pub const CONFIG_KEYS: &[&str] = &[
     "require_approval",
     "token_env",
     "keep_runs",
+    "keep_days",
     "max_log_bytes",
 ];
 
@@ -59,6 +60,8 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_runs: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_days: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_log_bytes: Option<usize>,
 }
 
@@ -77,6 +80,7 @@ pub struct EffectiveConfig {
     pub require_approval: Vec<String>,
     pub token_env: String,
     pub keep_runs: usize,
+    pub keep_days: u64,
     pub max_log_bytes: usize,
     pub sources: BTreeMap<String, String>,
 }
@@ -107,6 +111,7 @@ impl EffectiveConfig {
             "require_approval": self.require_approval_enabled(),
             "token_env": self.token_env.clone(),
             "keep_runs": self.keep_runs,
+            "keep_days": self.keep_days,
             "max_log_bytes": self.max_log_bytes,
         })
     }
@@ -129,6 +134,7 @@ impl EffectiveConfig {
             "require_approval" => self.require_approval_enabled().to_string(),
             "token_env" => self.token_env.clone(),
             "keep_runs" => self.keep_runs.to_string(),
+            "keep_days" => self.keep_days.to_string(),
             "max_log_bytes" => self.max_log_bytes.to_string(),
             _ => String::new(),
         }
@@ -307,6 +313,12 @@ pub fn apply_set(cfg: &mut Config, key: &str, value: &str) -> Result<(), String>
                 .parse::<usize>()
                 .map_err(|_| invalid(key, value.trim()))?,
         ),
+        "keep_days" => cfg.keep_days = Some(
+            value
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| invalid(key, value.trim()))?,
+        ),
         "max_log_bytes" => cfg.max_log_bytes = Some(
             value
                 .trim()
@@ -336,6 +348,7 @@ pub fn apply_unset(cfg: &mut Config, key: &str) -> Result<(), String> {
         "require_approval" => cfg.require_approval = None,
         "token_env" => cfg.token_env = None,
         "keep_runs" => cfg.keep_runs = None,
+        "keep_days" => cfg.keep_days = None,
         "max_log_bytes" => cfg.max_log_bytes = None,
         _ => return Err(format!("unknown config key '{}'", key)),
     }
@@ -524,6 +537,15 @@ pub fn resolve_config(
         sources.insert("keep_runs".into(), "default".into());
     }
 
+    // keep_days（无 flag / env）：0 表示不限。
+    if let Some(v) = file.keep_days {
+        c.keep_days = v;
+        sources.insert("keep_days".into(), "file".into());
+    } else {
+        c.keep_days = 0;
+        sources.insert("keep_days".into(), "default".into());
+    }
+
     // max_log_bytes（无 flag / env）：0 表示不限。
     if let Some(v) = file.max_log_bytes {
         c.max_log_bytes = v;
@@ -566,34 +588,87 @@ fn resolve_optional_string(
     }
 }
 
-/// 计算本轮需要删除的 terminal run id（只删最旧的 terminal；running/queued 永久保留）。
-/// keep_runs=0 或未超出阈值时返回空列表。这是保留策略的唯一真源：
-/// 启动期 trim_runs 与运行期 jobs::prune 都走这里，不存在第二套阈值。
-pub fn trim_runs_plan(runs: &[Run], keep_runs: usize) -> Vec<String> {
-    if keep_runs == 0 || runs.len() <= keep_runs {
-        return Vec::new();
-    }
-    let mut terminal: Vec<usize> = runs
+/// 一次保留判定的完整结果：`remove` 是稳定、去重后的删除顺序，
+/// `age_removed` 是其中由时间规则（keep_days）产生的条数。
+pub struct RetentionPlan {
+    pub remove: Vec<String>,
+    pub age_removed: usize,
+}
+
+fn terminal_sorted(runs: &[Run]) -> Vec<usize> {
+    let mut idx: Vec<usize> = runs
         .iter()
         .enumerate()
         .filter(|(_, r)| r.status.terminal())
         .map(|(i, _)| i)
         .collect();
-    if terminal.is_empty() {
-        return Vec::new();
+    idx.sort_by(|&a, &b| {
+        runs[a]
+            .created_at
+            .cmp(&runs[b].created_at)
+            .then_with(|| runs[a].id.cmp(&runs[b].id))
+    });
+    idx
+}
+
+/// 保留策略的唯一判定入口：候选集只含 terminal run，running/queued 永久保留。
+/// 时间规则优先，条数规则兜底；结果按 created_at 升序、同时间按 id 字典序去重。
+pub fn retention_plan_full(
+    runs: &[Run],
+    keep_runs: usize,
+    keep_days: u64,
+    now: i64,
+) -> RetentionPlan {
+    let mut remove_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut remove_order = Vec::new();
+    let mut age_removed = 0usize;
+    let sorted = terminal_sorted(runs);
+
+    if keep_days > 0 {
+        let keep_days_i = i64::try_from(keep_days).unwrap_or(i64::MAX);
+        let cutoff = now.saturating_sub(keep_days_i.saturating_mul(86400));
+        for &i in &sorted {
+            if runs[i].created_at < cutoff && remove_ids.insert(runs[i].id.clone()) {
+                remove_order.push(runs[i].id.clone());
+                age_removed += 1;
+            }
+        }
     }
-    let excess = runs.len() - keep_runs;
-    let drop_count = excess.min(terminal.len());
-    if drop_count == 0 {
-        return Vec::new();
+
+    if keep_runs > 0 && runs.len() > keep_runs {
+        let excess = runs.len() - keep_runs;
+        let mut needed = excess.saturating_sub(remove_ids.len());
+        for &i in &sorted {
+            if needed == 0 {
+                break;
+            }
+            if remove_ids.insert(runs[i].id.clone()) {
+                remove_order.push(runs[i].id.clone());
+                needed -= 1;
+            }
+        }
     }
-    terminal.sort_by(|&a, &b| runs[a].created_at.cmp(&runs[b].created_at));
-    terminal.truncate(drop_count);
-    terminal.iter().map(|&i| runs[i].id.clone()).collect()
+
+    RetentionPlan {
+        remove: remove_order,
+        age_removed,
+    }
+}
+
+/// keep_runs=0 表示不按条数修剪；keep_days=0 表示不按时间修剪。now 为 unix 秒。
+pub fn retention_plan(runs: &[Run], keep_runs: usize, keep_days: u64, now: i64) -> Vec<String> {
+    retention_plan_full(runs, keep_runs, keep_days, now).remove
+}
+
+/// 兼容旧签名：只按条数修剪。运行期 jobs::prune 与 prune_stats 都改走 retention_plan / _full。
+#[allow(dead_code)] // 既有调用方与测试的兼容入口，运行期不再使用
+pub fn trim_runs_plan(runs: &[Run], keep_runs: usize) -> Vec<String> {
+    retention_plan(runs, keep_runs, 0, 0)
 }
 
 /// 修剪历史 run：keep_runs=0 不修剪；只删 terminal（done/failed/...）记录，
 /// 绝不误删 running/queued。把总数压到 keep_runs 以内时，优先删除最旧的 terminal。
+#[allow(dead_code)] // 兼容入口，运行期走 jobs::prune
 pub fn trim_runs(runs: &mut Vec<Run>, keep_runs: usize) -> bool {
     let removed = trim_runs_plan(runs, keep_runs);
     if removed.is_empty() {
@@ -815,5 +890,75 @@ mod tests {
         assert_eq!(cfg.max_log_bytes, Some(8_388_608));
         assert!(apply_set(&mut cfg, "max_log_bytes", "-1").is_err());
         assert!(apply_set(&mut cfg, "max_log_bytes", "lots").is_err());
+    }
+
+    #[test]
+    fn config_keys_include_keep_days() {
+        assert!(CONFIG_KEYS.contains(&"keep_days"));
+    }
+
+    #[test]
+    fn keep_days_defaults_to_zero() {
+        let c = resolve_config(&HashMap::new(), &HashMap::new(), &Config::default()).unwrap();
+        assert_eq!(c.keep_days, 0);
+        assert_eq!(c.source_of("keep_days"), "default");
+    }
+
+    #[test]
+    fn keep_days_rejects_negative_and_garbage() {
+        let mut cfg = Config::default();
+        assert!(apply_set(&mut cfg, "keep_days", "-1").is_err());
+        assert!(apply_set(&mut cfg, "keep_days", "lots").is_err());
+        assert!(apply_set(&mut cfg, "keep_days", "").is_err());
+        apply_set(&mut cfg, "keep_days", "0").unwrap();
+        assert_eq!(cfg.keep_days, Some(0));
+    }
+
+    #[test]
+    fn retention_plan_age_drops_only_terminal() {
+        let runs = vec![
+            run("old-done", RunStatus::Done, 1),
+            run("old-running", RunStatus::Running, 1),
+            run("old-queued", RunStatus::Queued, 2),
+            run("fresh-done", RunStatus::Done, 10_000_000),
+        ];
+        let plan = retention_plan_full(&runs, 0, 1, 10_000_100);
+        assert_eq!(plan.remove, vec!["old-done".to_string()]);
+        assert_eq!(plan.age_removed, 1);
+    }
+
+    #[test]
+    fn retention_plan_age_and_count_union_no_duplicates() {
+        // 时间规则先删 a；条数规则（keep_runs=1）再按最旧终端补足，a 不重复。
+        let runs = vec![
+            run("a", RunStatus::Done, 1),
+            run("b", RunStatus::Done, 2_000_000),
+            run("c", RunStatus::Done, 3_000_000),
+            run("d", RunStatus::Done, 4_000_000),
+        ];
+        let plan = retention_plan_full(&runs, 1, 100, 10_000_000);
+        assert_eq!(plan.remove, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(plan.age_removed, 1);
+    }
+
+    #[test]
+    fn retention_plan_zero_zero_is_noop() {
+        let runs = vec![
+            run("a", RunStatus::Done, 1),
+            run("running", RunStatus::Running, 2),
+        ];
+        let plan = retention_plan_full(&runs, 0, 0, 100);
+        assert!(plan.remove.is_empty());
+        assert_eq!(plan.age_removed, 0);
+    }
+
+    #[test]
+    fn trim_runs_plan_still_wraps_retention_plan() {
+        let runs = vec![
+            run("old", RunStatus::Done, 1),
+            run("running", RunStatus::Running, 2),
+            run("new", RunStatus::Done, 3),
+        ];
+        assert_eq!(trim_runs_plan(&runs, 2), vec!["old".to_string()]);
     }
 }

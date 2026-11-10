@@ -36,3 +36,28 @@
 - `--branch` 与 `--new-branch` / `--base` 同时给 → exit 2 `run --branch conflicts with --new-branch/--base`；分支不存在 → exit 2 `run --branch: no such branch: <name>`。
 
 HTTP 侧 `POST /v1/agents` / `POST /v1/runs` 接受 `"worktree": true|false` 或 `"worktree": {"slug"|"branch"|"new_branch"|"base"}`，校验失败返回 400 且错误文本逐字一致。
+
+## backup
+
+`roamway backup [--out DIR] [--keep N]`
+
+- 仅本地执行：显式带 `--host` → exit 2 `backup/restore are local-only`；`--data`/`--home` 生效。
+- `--out` 缺省 `<data>/backups`；在其下新建 `roamway-backup-<YYYYmmdd-HHMMSS>/`，同秒重复追加 `-2`、`-3`。
+- 只复制存在的 `state.json`、`config.json`、`schedules.json`，外加 `manifest.json`；绝不打包 token/pairing/passwords 等凭据。
+- `manifest.json` 格式：`{"format":"roamway-backup/1","created_at":<unix>,"version":"<crate 版本>","files":[{"name":"state.json","bytes":123,"sha256":"..."}]}`。
+- `--keep N`：备份成功后按目录名保留最新 N 个 `roamway-backup-*`，`0`=不清理；`N` 非法 → exit 2。
+- table 输出 `BACKUP_DIR FILES BYTES`；`-o json` 输出 `{"ok":true,"dir":"...","files":3,"bytes":N,"pruned":N}`。
+
+## restore
+
+`roamway restore --from DIR [--force] [--yes]`
+
+- 仅本地执行：显式带 `--host` → exit 2；`--data`/`--home` 生效。
+- `DIR` 必须含 `manifest.json` 且 `format == "roamway-backup/1"`；逐文件校验存在、`bytes`、`sha256`，任一不符 → exit 1 且一个字节都不写。
+- daemon 存活检测：`<data>/roamway.pid` 的 pid 存活时，无 `--force` → exit 3；`--force` 只跳过停服检查，不做热替换。
+- 写前把现有 `state.json` 等轮换为 `*.pre-restore-<YYYYmmdd-HHMMSS>`；写入顺序 config → schedules → state。
+- 不删除备份源目录；table 输出 `RESTORED FROM`；`-o json` 输出 `{"ok":true,"files":[...],"from":"..."}`。
+
+## 退出码补充
+
+`backup`/`restore`：`0` 成功；`1` 目录不可写、复制失败、校验失败或远端失败；`2` 未知参数、非法 `--keep`、显式 `--host`；`3` restore 检测到 daemon 存活且未 `--force`。

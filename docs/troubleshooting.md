@@ -50,6 +50,13 @@ roamway prune --keep 5            # 本次临时覆盖阈值，不改配置文�
 
 `prune` 只删 terminal（done/failed/timeout/killed/interrupted）run 及其日志，绝不删 agent、worktree、schedule、job、approval。
 
+## 状态损坏 / 回滚
+
+- 定期快照：`roamway backup --keep 7`（默认 `--out <data>/backups`），按目录名保留最近 7 个备份目录。
+- 回滚：先 `roamway daemon stop`，再 `roamway restore --from <data>/backups/roamway-backup-*`；daemon 仍在跑时先收到 exit 3，确认安全后可 `--force`。
+- `restore` 会先把现有 `state.json` 轮换为 `state.json.pre-restore-*`，再从备份目录安装 `config.json`/`schedules.json`/`state.json`；备份源目录不会被删除。
+- 与 `state.json.bak` 的区别：`state.json.bak` 是最后一次写盘前的上一版，会被下一次写覆盖；`roamway-backup-*` 是显式快照，可长期保留。
+
 ## 帮助与退出码
 
 ```bash

@@ -1,5 +1,6 @@
 mod agents;
 mod auth;
+mod backup;
 mod config;
 mod cron;
 mod hosts;
@@ -78,7 +79,9 @@ fn usage() {
   roamway workspace ls | create <name> --path DIR | archive <name> | setup <name> | rm <name>
   roamway terminal create|ls|capture|send-keys|kill
   roamway script ls|add|rm|start|stop
-  roamway prune [--dry-run] [--keep N] [--yes]
+  roamway prune [--dry-run] [--keep N] [--max-age-days N] [--yes]
+  roamway backup [--out DIR] [--keep N]                 # 本地状态快照
+  roamway restore --from DIR [--force] [--yes]         # 从快照回滚（仅本地）
   注：受管终端无 TTY，TUI 程序（vim/top 交互界面）不支持
 
 生态扩展：
@@ -979,7 +982,9 @@ fn print_command_help(cmd: &str) -> bool {
         "logs" => "roamway logs ID [--tail 80] [--host H]",
         "stop" => "roamway stop ID [--host H]",
         "rm" => "roamway rm ID",
-        "prune" => "roamway prune [--dry-run] [--keep N] [--yes]",
+        "prune" => "roamway prune [--dry-run] [--keep N] [--max-age-days N] [--yes]",
+        "backup" => "roamway backup [--out DIR] [--keep N]",
+        "restore" => "roamway restore --from DIR [--force] [--yes]",
         "jobs" => "roamway jobs",
         "jobs-add" => "roamway jobs-add --agent shell --every 3600 | --daily 08:30 [--model M] [--workspace DIR] [--max-retries 2] [--after JOB]... \"prompt\"",
         "jobs-run" => "roamway jobs-run ID",
@@ -1106,6 +1111,8 @@ fn dispatch(argv: &[String]) -> i32 {
         "stop" => cmd_stop(&flags, &cmd_pos),
         "rm" => cmd_rm(&flags, &cmd_pos),
         "prune" => cmd_prune(&flags, &cmd_pos),
+        "backup" => cmd_backup(&flags, &cmd_pos),
+        "restore" => cmd_restore(&flags, &cmd_pos),
         "jobs" => cmd_jobs(&flags),
         "jobs-add" => cmd_jobs_add(&flags, &cmd_pos),
         "jobs-run" => cmd_jobs_run(&flags, &cmd_pos),
@@ -1226,7 +1233,7 @@ fn cmd_serve(flags: &HashMap<String, String>) {
     }
 
     let mut store = Store::load(&data);
-    if jobs::prune(&mut store, cfg.keep_runs) {
+    if jobs::prune(&mut store, cfg.keep_runs, cfg.keep_days) {
         store.save();
     }
     let loaded_ok = store.loaded_ok;
@@ -1247,11 +1254,14 @@ fn cmd_serve(flags: &HashMap<String, String>) {
         tz_offset_hours: tz,
         max_concurrent,
         keep_runs: cfg.keep_runs,
+        keep_days: cfg.keep_days,
         max_log_bytes: cfg.max_log_bytes,
         max_conn,
         conns: AtomicUsize::new(0),
         req_total: AtomicU64::new(0),
         req_failed: AtomicU64::new(0),
+        state_writes: AtomicU64::new(0),
+        state_writes_skipped: AtomicU64::new(0),
         tokens: Mutex::new(token_store),
         approvals: Mutex::new(approval_store),
         passwords: Mutex::new(password_store),
@@ -1760,9 +1770,22 @@ fn prune_keep(flags: &HashMap<String, String>) -> Result<Option<usize>, ()> {
     }
 }
 
+fn prune_max_age_days(flags: &HashMap<String, String>) -> Result<Option<u64>, ()> {
+    match flags.get("max-age-days") {
+        None => Ok(None),
+        Some(v) => match v.parse::<u64>() {
+            Ok(n) => Ok(Some(n)),
+            Err(_) => {
+                usage_error("prune: --max-age-days must be a non-negative integer");
+                Err(())
+            }
+        },
+    }
+}
+
 fn cmd_prune(flags: &HashMap<String, String>, pos: &[String]) {
     const PRUNE_FLAGS: &[&str] = &[
-        "dry-run", "keep", "yes", "host", "data", "home", "token", "format", "json",
+        "dry-run", "keep", "max-age-days", "yes", "host", "data", "home", "token", "format", "json",
         "quiet", "no-color", "no-headers",
     ];
     for key in flags.keys() {
@@ -1771,7 +1794,7 @@ fn cmd_prune(flags: &HashMap<String, String>, pos: &[String]) {
         }
     }
     if !pos.is_empty() {
-        usage_error("usage: roamway prune [--dry-run] [--keep N] [--yes]");
+        usage_error("usage: roamway prune [--dry-run] [--keep N] [--max-age-days N] [--yes]");
     }
     if FAIL_CODE.load(Ordering::SeqCst) != 0 {
         return;
@@ -1781,9 +1804,16 @@ fn cmd_prune(flags: &HashMap<String, String>, pos: &[String]) {
         Ok(k) => k,
         Err(()) => return,
     };
+    let max_age_days = match prune_max_age_days(flags) {
+        Ok(v) => v,
+        Err(()) => return,
+    };
     let mut body = json!({ "dry_run": dry_run });
     if let Some(k) = keep {
         body["keep"] = json!(k);
+    }
+    if let Some(v) = max_age_days {
+        body["max_age_days"] = json!(v);
     }
     match request(flags, "POST", "/v1/prune", Some(body)) {
         Ok(v) => {
@@ -1808,6 +1838,145 @@ fn cmd_prune(flags: &HashMap<String, String>, pos: &[String]) {
         }
         Err(e) => eprintln!("prune failed: {}", e),
     }
+}
+
+fn cmd_backup(flags: &HashMap<String, String>, pos: &[String]) {
+    const BACKUP_FLAGS: &[&str] = &[
+        "out", "keep", "data", "home", "token", "format", "json", "quiet",
+        "no-color", "no-headers",
+    ];
+    for key in flags.keys() {
+        if !BACKUP_FLAGS.contains(&key.as_str()) {
+            if key == "host" {
+                usage_error("backup/restore are local-only");
+                return;
+            }
+            usage_error(&format!("backup: unknown flag --{}", key));
+        }
+    }
+    if !pos.is_empty() {
+        usage_error("usage: roamway backup [--out DIR] [--keep N]");
+    }
+    if FAIL_CODE.load(Ordering::SeqCst) != 0 {
+        return;
+    }
+    let keep = match flags.get("keep") {
+        None => 0,
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => {
+                usage_error("backup: --keep must be a non-negative integer");
+                return;
+            }
+        },
+    };
+    let data = data_dir_for(flags);
+    let out = flags
+        .get("out")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| data.join("backups"));
+    let tz = match resolved_config(flags) {
+        Ok(c) => c.tz_offset_hours,
+        Err(e) => {
+            eprintln!("{}", e);
+            fail(2);
+            return;
+        }
+    };
+    maybe_flush_daemon_state(flags, &data);
+    match backup::backup(&data, &out, keep, tz) {
+        Ok(res) => {
+            if format_is_json(flags) || format_is_yaml(flags) {
+                print_formatted(
+                    flags,
+                    &json!({
+                        "ok": true,
+                        "dir": res.dir.display().to_string(),
+                        "files": res.files,
+                        "bytes": res.bytes,
+                        "pruned": res.pruned,
+                    }),
+                );
+                return;
+            }
+            if !flags.contains_key("no-headers") {
+                println!("BACKUP_DIR FILES BYTES");
+            }
+            println!("{} {} {}", res.dir.display(), res.files, res.bytes);
+        }
+        Err(e) => {
+            eprintln!("{}", e.message());
+            fail(e.exit_code());
+        }
+    }
+}
+
+fn cmd_restore(flags: &HashMap<String, String>, pos: &[String]) {
+    const RESTORE_FLAGS: &[&str] = &[
+        "from", "force", "yes", "data", "home", "token", "format", "json", "quiet",
+        "no-color", "no-headers",
+    ];
+    for key in flags.keys() {
+        if !RESTORE_FLAGS.contains(&key.as_str()) {
+            if key == "host" {
+                usage_error("backup/restore are local-only");
+                return;
+            }
+            usage_error(&format!("restore: unknown flag --{}", key));
+        }
+    }
+    if !pos.is_empty() {
+        usage_error("usage: roamway restore --from DIR [--force] [--yes]");
+    }
+    if FAIL_CODE.load(Ordering::SeqCst) != 0 {
+        return;
+    }
+    let from = match flags.get("from").map(PathBuf::from) {
+        Some(dir) => dir,
+        None => {
+            usage_error("usage: roamway restore --from DIR [--force] [--yes]");
+            return;
+        }
+    };
+    let data = data_dir_for(flags);
+    let force = flags.contains_key("force");
+    match backup::restore(&data, &from, force) {
+        Ok(res) => {
+            if format_is_json(flags) || format_is_yaml(flags) {
+                print_formatted(
+                    flags,
+                    &json!({
+                        "ok": true,
+                        "files": res.files,
+                        "from": res.from,
+                    }),
+                );
+                return;
+            }
+            if !flags.contains_key("no-headers") {
+                println!("RESTORED FROM");
+            }
+            println!("{}", res.from);
+        }
+        Err(e) => {
+            eprintln!("{}", e.message());
+            fail(e.exit_code());
+        }
+    }
+}
+
+/// 备份前尽量让 daemon 把内存态刷到 state.json：复用既有 /v1/prune 保存路径。
+/// keep=usize::MAX 保证不删 run，just 触发一次落盘；daemon 不可达时静默回退为复制现有文件。
+fn maybe_flush_daemon_state(flags: &HashMap<String, String>, data: &std::path::Path) {
+    if backup::daemon_alive(data).is_none() {
+        return;
+    }
+    let _ = local_only_client(flags).req(
+        "POST",
+        "/v1/prune",
+        Some(json!({"dry_run": false, "keep": usize::MAX, "max_age_days": 0})),
+    );
+    FAIL_CODE.store(0, Ordering::SeqCst);
 }
 
 fn cmd_jobs(flags: &HashMap<String, String>) {
@@ -5012,11 +5181,14 @@ pub mod test_support {
             tz_offset_hours: 8,
             max_concurrent: 4,
             keep_runs: 500,
+            keep_days: 0,
             max_log_bytes: 4_194_304,
             max_conn: 64,
             conns: AtomicUsize::new(0),
             req_total: AtomicU64::new(0),
             req_failed: AtomicU64::new(0),
+            state_writes: AtomicU64::new(0),
+            state_writes_skipped: AtomicU64::new(0),
             tokens: Mutex::new(auth::TokenStore::load(dir)),
             approvals: Mutex::new(auth::ApprovalStore::load(dir)),
             passwords: Mutex::new(auth::PasswordStore::load(dir)),
@@ -5469,5 +5641,35 @@ mod tests {
         let mut w: HashMap<String, String> = HashMap::new();
         w.insert("worktree-slug".to_string(), "slug".to_string());
         assert!(run_plan(&w).unwrap_err().contains("requires --new-workspace worktree"));
+    }
+
+    #[test]
+    fn backup_restore_reject_remote_host_and_bad_flags() {
+        FAIL_CODE.store(0, std::sync::atomic::Ordering::SeqCst);
+        let host_flags = HashMap::from([("host".to_string(), "http://remote".to_string())]);
+        cmd_backup(&host_flags, &[]);
+        assert_eq!(
+            FAIL_CODE.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "backup --host must be rejected with exit 2"
+        );
+
+        FAIL_CODE.store(0, std::sync::atomic::Ordering::SeqCst);
+        cmd_restore(&host_flags, &[]);
+        assert_eq!(
+            FAIL_CODE.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "restore --host must be rejected with exit 2"
+        );
+
+        FAIL_CODE.store(0, std::sync::atomic::Ordering::SeqCst);
+        let bad_keep = HashMap::from([("keep".to_string(), "-1".to_string())]);
+        cmd_backup(&bad_keep, &[]);
+        assert_eq!(
+            FAIL_CODE.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "backup --keep -1 must be rejected with exit 2"
+        );
+        FAIL_CODE.store(0, std::sync::atomic::Ordering::SeqCst);
     }
 }

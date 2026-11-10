@@ -236,6 +236,12 @@ pub struct Store {
     pub dir: PathBuf,
     pub state: State,
     pub loaded_ok: bool,
+    /// 上次成功写入 state.json 的内容 FNV-1a 64 哈希；0 表示尚无写入记录。
+    pub last_write_hash: u64,
+    /// 成功写入 state.json 的次数（内存态，不序列化到 state.json）。
+    pub writes_total: u64,
+    /// 因内容与上次完全相同而跳过的写入次数（内存态，不序列化）。
+    pub writes_skipped: u64,
 }
 
 impl Store {
@@ -278,10 +284,13 @@ impl Store {
                 }
             }
         }
-        let store = Store {
+        let mut store = Store {
             dir: dir.to_path_buf(),
             state,
             loaded_ok,
+            last_write_hash: 0,
+            writes_total: 0,
+            writes_skipped: 0,
         };
         if dirty {
             store.save();
@@ -289,7 +298,7 @@ impl Store {
         store
     }
 
-    pub fn save(&self) {
+    pub fn save(&mut self) -> bool {
         let p = self.dir.join("state.json");
         let bak = self.dir.join("state.json.bak");
         let tmp = self.dir.join("state.json.tmp");
@@ -297,9 +306,14 @@ impl Store {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("roamway: serialize state failed: {}", e);
-                return;
+                return false;
             }
         };
+        let hash = fnv1a64(s.as_bytes());
+        if hash == self.last_write_hash && p.exists() {
+            self.writes_skipped += 1;
+            return false;
+        }
         // 先写 tmp 并刷盘；成功后滚旧文件为 .bak，再原子替换正式文件。
         let result = (|| -> std::io::Result<()> {
             let mut f = fs::File::create(&tmp)?;
@@ -315,7 +329,11 @@ impl Store {
         })();
         if let Err(e) = result {
             eprintln!("roamway: save state failed: {}", e);
+            return false;
         }
+        self.writes_total += 1;
+        self.last_write_hash = hash;
+        true
     }
 
     pub fn log_path(&self, id: &str) -> PathBuf {
@@ -326,6 +344,17 @@ impl Store {
         self.state.seq += 1;
         format!("{}_{:06}", prefix, self.state.seq)
     }
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET_BASIS;
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
 }
 
 fn load_state(p: &Path, bak: &Path) -> (State, bool) {
@@ -390,12 +419,17 @@ pub struct App {
     pub max_concurrent: usize,
     pub max_conn: usize,
     pub keep_runs: usize,
+    pub keep_days: u64,
     pub max_log_bytes: usize,
     pub conns: AtomicUsize,
     /// `/metrics` 用的 HTTP 计数（纯内存，不参与 state.json 持久化）。
     /// 每次请求 +1；响应码 >= 400 时 failed +1。
     pub req_total: AtomicU64,
     pub req_failed: AtomicU64,
+    /// state.json 累计真实写盘次数（内存态）。
+    pub state_writes: AtomicU64,
+    /// state.json 因内容未变化而被跳过的写入次数（内存态）。
+    pub state_writes_skipped: AtomicU64,
     pub tokens: Mutex<auth::TokenStore>,
     pub approvals: Mutex<auth::ApprovalStore>,
     pub passwords: Mutex<auth::PasswordStore>,
@@ -412,8 +446,14 @@ pub struct App {
 
 impl App {
     pub fn save(&self) {
-        let st = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = self.store.lock().unwrap_or_else(|e| e.into_inner());
+        let before_total = st.writes_total;
+        let before_skipped = st.writes_skipped;
         st.save();
+        self.state_writes
+            .fetch_add(st.writes_total - before_total, std::sync::atomic::Ordering::Relaxed);
+        self.state_writes_skipped
+            .fetch_add(st.writes_skipped - before_skipped, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -500,26 +540,60 @@ mod tests {
     fn save_rotates_previous_state_into_backup() {
         let dir = std::env::temp_dir().join(format!("roamway-save-{}", now()));
         let _ = fs::create_dir_all(&dir);
-        let store = Store {
+        let mut store = Store {
             dir: dir.clone(),
             state: State {
                 seq: 7,
                 ..Default::default()
             },
             loaded_ok: true,
+            last_write_hash: 0,
+            writes_total: 0,
+            writes_skipped: 0,
         };
-        store.save();
+        assert!(store.save());
         assert!(dir.join("state.json").exists());
-        let store2 = Store {
+        let mut store2 = Store {
             dir: dir.clone(),
             state: State {
                 seq: 9,
                 ..Default::default()
             },
             loaded_ok: true,
+            last_write_hash: 0,
+            writes_total: 0,
+            writes_skipped: 0,
         };
-        store2.save();
+        assert!(store2.save());
         assert!(dir.join("state.json.bak").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_skips_write_when_state_unchanged() {
+        let dir = std::env::temp_dir().join(format!("roamway-skip-{}", now()));
+        let _ = fs::create_dir_all(&dir);
+        let mut store = Store {
+            dir: dir.clone(),
+            state: State {
+                seq: 7,
+                ..Default::default()
+            },
+            loaded_ok: true,
+            last_write_hash: 0,
+            writes_total: 0,
+            writes_skipped: 0,
+        };
+        assert!(store.save());
+        let meta1 = fs::metadata(dir.join("state.json")).unwrap();
+        let bytes1 = fs::read(dir.join("state.json")).unwrap();
+        assert!(!store.save());
+        assert_eq!(store.writes_total, 1);
+        assert_eq!(store.writes_skipped, 1);
+        let meta2 = fs::metadata(dir.join("state.json")).unwrap();
+        let bytes2 = fs::read(dir.join("state.json")).unwrap();
+        assert_eq!(bytes1, bytes2);
+        assert_eq!(meta1.modified().unwrap(), meta2.modified().unwrap());
         let _ = fs::remove_dir_all(&dir);
     }
 

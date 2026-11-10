@@ -17,7 +17,8 @@
 | `allow_origins` | string[] | `[]` | — | 允许的 CORS 来源；`--allow-origin https://x` |
 | `require_approval` | bool | `false` | `ROAMWAY_REQUIRE_APPROVAL`（`1/true/0/false`） | 是否要求 run/admin 审批；`--require-approval run`（可重复） |
 | `token_env` | string | `ROAMWAY_TOKEN` | — | token 所在的环境变量名（只存名字，不存值） |
-| `keep_runs` | u64 | `500` | — | 保留的最新 terminal run 数；运行期与启动期同一阈值，`0`=不修剪 |
+| `keep_runs` | u64 | `500` | — | 保留的最新 terminal run 数；运行期与启动期同一阈值，`0`=不修剪；与 `keep_days` 共同构成保留策略，两者都在 `config::retention_plan` 一处判定 |
+| `keep_days` | u64 | `0` | — | 按时间保留：删除早于截止时间的 terminal run；`0`=不限；与 `keep_runs` 同时生效，先按时间再按条数 |
 | `max_log_bytes` | u64 | `4194304`（4 MiB） | — | 单 run 日志字节上限；`0`=不限 |
 
 `daemon config set` 用逗号分隔写数组（`allow_hosts=a,b`）；`daemon config unset <key>` 回到 env/default 生效。
