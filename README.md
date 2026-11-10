@@ -463,7 +463,7 @@ docs/architecture.md  设计取舍
 
 - [x] 参数面对齐完成（P15+P16）
 - [x] Windows 原生预编译产物
-- [ ] 任务依赖（A 成功后再跑 B）
+- [x] 任务依赖（A 成功后再跑 B）
 - [x] 并发上限（全局 / 每 agent）
 - [x] `/metrics`（Prometheus 文本格式）
 - [ ] 只读 Web 面板
