@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::agents::Agent;
+use crate::workspaces::WorktreeInfo;
 
 pub fn now() -> i64 {
     SystemTime::now()
@@ -171,6 +172,8 @@ pub struct Run {
     pub options: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeInfo>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -539,6 +542,7 @@ mod tests {
             cwd: None,
             options: BTreeMap::new(),
             images: Vec::new(),
+            worktree: None,
         };
         let state = State {
             runs: vec![run],

@@ -1,4 +1,5 @@
 use crate::types::*;
+use crate::workspaces::{WorktreeInfo, WorktreeSpec};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -189,6 +190,7 @@ fn push_run_locked(
     cwd: Option<String>,
     options: BTreeMap<String, String>,
     images: Vec<String>,
+    worktree: Option<WorktreeInfo>,
 ) -> Result<Run, String> {
     let id = st.next_id("run");
     let run = Run {
@@ -222,6 +224,7 @@ fn push_run_locked(
         cwd,
         options,
         images,
+        worktree,
     };
     st.state.runs.push(run.clone());
     agent.last_run_id = id;
@@ -248,6 +251,7 @@ pub fn create_agent_and_run(
     cwd: Option<String>,
     options: BTreeMap<String, String>,
     images: Vec<String>,
+    spec: WorktreeSpec,
 ) -> Result<(Agent, Run), String> {
     if !is_known_agent(kind) {
         return Err("unknown agent".into());
@@ -268,36 +272,59 @@ pub fn create_agent_and_run(
         }
         id
     };
-    let (agent_workspace, worktree, branch, base_path) = if worktree_mode.as_deref() == Some("checkout-pr") {
+    let mut stored_worktree_mode = worktree_mode.clone();
+    let (agent_workspace, worktree, branch, base_path, worktree_info) = if worktree_mode.as_deref() == Some("checkout-pr") {
         let pr = pr_number
             .as_deref()
             .ok_or_else(|| "checkout-pr requires --pr-number".to_string())?;
         crate::workspaces::gh_pr_checkout(&ws, pr)?;
-        (ws, false, None, None)
+        (ws, false, None, None, None)
     } else if use_worktree {
         let root = crate::workspaces::git_repo_root(&ws)?;
-        let path = crate::workspaces::worktree_path(&data_dir, &id);
-        if worktree_mode.as_deref() == Some("checkout-branch") {
+        crate::workspaces::validate_worktree_spec(&spec)?;
+        crate::workspaces::validate_worktree_git(&root, &spec)?;
+        let path = crate::workspaces::worktree_path_named(&data_dir, &id, spec.slug.as_deref());
+        let info = if spec.existing {
+            let branch = spec
+                .branch
+                .clone()
+                .ok_or_else(|| "run --branch: branch is required".to_string())?;
+            crate::workspaces::worktree_add_existing(&root, &path, &branch)?;
+            stored_worktree_mode = Some("checkout-branch".to_string());
+            crate::workspaces::WorktreeInfo {
+                path: path.to_string_lossy().to_string(),
+                branch: branch.clone(),
+                base: None,
+            }
+        } else if worktree_mode.as_deref() == Some("checkout-branch") {
             let branch = crate::workspaces::git_current_branch(&root)?;
             crate::workspaces::worktree_add_existing(&root, &path, &branch)?;
-            (
-                path.to_string_lossy().to_string(),
-                true,
-                Some(branch),
-                Some(root),
-            )
+            crate::workspaces::WorktreeInfo {
+                path: path.to_string_lossy().to_string(),
+                branch: branch.clone(),
+                base: None,
+            }
         } else {
-            let branch = crate::workspaces::worktree_branch(&id);
-            crate::workspaces::worktree_add(&root, &path, &branch)?;
-            (
-                path.to_string_lossy().to_string(),
-                true,
-                Some(branch),
-                Some(root),
-            )
-        }
+            let branch = spec
+                .branch
+                .clone()
+                .unwrap_or_else(|| crate::workspaces::worktree_branch(&id));
+            crate::workspaces::worktree_add_from(&root, &path, &branch, spec.base.as_deref())?;
+            crate::workspaces::WorktreeInfo {
+                path: path.to_string_lossy().to_string(),
+                branch: branch.clone(),
+                base: spec.base.clone(),
+            }
+        };
+        (
+            info.path.clone(),
+            true,
+            Some(info.branch.clone()),
+            Some(root),
+            Some(info),
+        )
     } else {
-        (ws, false, None, None)
+        (ws, false, None, None, None)
     };
     let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
     let mut agent = Agent {
@@ -318,7 +345,7 @@ pub fn create_agent_and_run(
         branch,
         base_path,
         labels: labels.clone(),
-        worktree_mode: worktree_mode.clone(),
+        worktree_mode: stored_worktree_mode,
     };
     let run = push_run_locked(
         &mut st,
@@ -332,6 +359,7 @@ pub fn create_agent_and_run(
         cwd,
         options,
         images,
+        worktree_info,
     )?;
     st.state.agents.push(agent.clone());
     st.save();
@@ -388,6 +416,7 @@ pub fn queue_agent_run(
         None,
         options,
         images,
+        None,
     )?;
     if let Some(a) = st.state.agents.iter_mut().find(|a| a.id == agent_id) {
         *a = agent.clone();
@@ -431,6 +460,7 @@ pub fn reload_agent(app: &Arc<App>, agent_id: &str, timeout_s: u64) -> Result<Ru
         None,
         BTreeMap::new(),
         Vec::new(),
+        None,
     )?;
     if let Some(a) = st.state.agents.iter_mut().find(|a| a.id == agent_id) {
         *a = agent.clone();
@@ -471,7 +501,7 @@ pub fn update_agent_meta(
 }
 
 pub fn archive_agent(app: &Arc<App>, agent_id: &str, keep_worktree: bool) -> Result<(), String> {
-    let (cleanup, keep_branch, data_dir) = {
+    let (cleanup, keep_branch, data_dir, recorded) = {
         let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
         let a = st
             .state
@@ -479,14 +509,22 @@ pub fn archive_agent(app: &Arc<App>, agent_id: &str, keep_worktree: bool) -> Res
             .iter()
             .find(|a| a.id == agent_id)
             .ok_or_else(|| "no such agent".to_string())?;
+        let recorded = st
+            .state
+            .runs
+            .iter()
+            .rev()
+            .find(|r| r.agent_id.as_deref() == Some(agent_id) && r.worktree.is_some())
+            .and_then(|r| r.worktree.clone());
         (
             !keep_worktree
                 && a.worktree
-                && a.branch.is_some()
                 && a.base_path.is_some()
-                && !a.workspace.is_empty(),
+                && !a.workspace.is_empty()
+                && (recorded.is_some() || a.branch.is_some()),
             a.worktree_mode.as_deref() == Some("checkout-branch"),
             st.dir.clone(),
+            recorded,
         )
     };
     if cleanup {
@@ -499,9 +537,15 @@ pub fn archive_agent(app: &Arc<App>, agent_id: &str, keep_worktree: bool) -> Res
                 a.workspace.clone(),
             )
         };
-        let wt = crate::workspaces::worktree_path(&data_dir, agent_id);
-        let path = std::path::Path::new(&workspace);
-        let path = if path.exists() { path.to_path_buf() } else { wt };
+        let (path, branch) = match recorded {
+            Some(info) => (std::path::PathBuf::from(info.path), info.branch),
+            None => {
+                let wt = crate::workspaces::worktree_path(&data_dir, agent_id);
+                let wp = std::path::Path::new(&workspace);
+                let path = if wp.exists() { wp.to_path_buf() } else { wt };
+                (path, branch)
+            }
+        };
         let result = if keep_branch {
             crate::workspaces::worktree_remove_keep_branch(&base_path, &path)
         } else {

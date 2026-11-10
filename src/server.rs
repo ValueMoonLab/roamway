@@ -752,6 +752,41 @@ fn reason(code: u16) -> &'static str {
 }
 
 #[derive(Deserialize)]
+#[serde(untagged)]
+enum WorktreeRequest {
+    Bool(bool),
+    Spec(WorktreeSpecRequest),
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorktreeSpecRequest {
+    #[serde(default)]
+    slug: Option<String>,
+    #[serde(default)]
+    branch: Option<String>,
+    #[serde(default)]
+    new_branch: Option<String>,
+    #[serde(default)]
+    base: Option<String>,
+}
+
+/// 把 HTTP 上的 `"worktree"` 字段收敛成 (是否启用 worktree, WorktreeSpec)。
+fn worktree_request_parts(
+    req: Option<WorktreeRequest>,
+) -> Result<(bool, workspaces::WorktreeSpec), String> {
+    match req {
+        None => Ok((false, workspaces::WorktreeSpec::default())),
+        Some(WorktreeRequest::Bool(b)) => Ok((b, workspaces::WorktreeSpec::default())),
+        Some(WorktreeRequest::Spec(s)) => {
+            let spec = workspaces::spec_from_parts(s.slug, s.new_branch, s.base, s.branch)?;
+            workspaces::validate_worktree_spec(&spec)?;
+            Ok((true, spec))
+        }
+    }
+}
+
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NewRun {
     #[serde(default)]
@@ -768,6 +803,8 @@ struct NewRun {
     options: Option<BTreeMap<String, String>>,
     #[serde(default)]
     images: Option<Vec<String>>,
+    #[serde(default)]
+    worktree: Option<WorktreeRequest>,
 }
 
 #[derive(Deserialize)]
@@ -831,7 +868,7 @@ struct NewAgent {
     #[serde(default)]
     timeout_s: Option<u64>,
     #[serde(default)]
-    worktree: Option<bool>,
+    worktree: Option<WorktreeRequest>,
     #[serde(default)]
     labels: Option<BTreeMap<String, String>>,
     #[serde(default)]
@@ -1605,7 +1642,7 @@ fn hub_hook_route(app: &Arc<App>, req: &Req, trigger_id: &str) -> (u16, Value) {
     }
 
     let spec = trigger.agent_spec.clone();
-    match agents::create_agent_and_run(app, &spec.provider, None, Some(spec.cwd.clone()), None, &spec.prompt, 1800, false, None, None, BTreeMap::new(), Vec::new(), None, BTreeMap::new(), Vec::new()) {
+    match agents::create_agent_and_run(app, &spec.provider, None, Some(spec.cwd.clone()), None, &spec.prompt, 1800, false, None, None, BTreeMap::new(), Vec::new(), None, BTreeMap::new(), Vec::new(), workspaces::WorktreeSpec::default()) {
         Ok((_agent, run)) => {
             agents::tag_run_trigger(app, &run.id, trigger_id);
             let mut rt = app.hub_rt.lock().unwrap_or_else(|e| e.into_inner());
@@ -1637,6 +1674,7 @@ fn agent_run_summary(r: &Run) -> Value {
         "ended_at": r.ended_at,
         "exit_code": r.exit_code,
         "error": r.error,
+        "worktree": r.worktree,
     })
 }
 
@@ -1758,6 +1796,17 @@ fn create_agent_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
     ) {
         return (400, json!({ "error": e }));
     }
+    let (use_worktree, worktree_spec) = match worktree_request_parts(spec.worktree) {
+        Ok(v) => v,
+        Err(e) => return (400, json!({ "error": e })),
+    };
+    if worktree_spec.slug.is_some() && !use_worktree {
+        return (400, json!({ "error": "run --worktree-slug requires --new-workspace worktree" }));
+    }
+    let worktree_mode_for_base = spec.worktree_mode.clone().unwrap_or_else(|| "branch-off".into());
+    if worktree_spec.base.is_some() && worktree_mode_for_base != "branch-off" {
+        return (400, json!({ "error": "run --base: only valid with branch-off" }));
+    }
     match agents::create_agent_and_run(
         app,
         &kind,
@@ -1766,7 +1815,7 @@ fn create_agent_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         spec.title,
         &spec.prompt,
         timeout_s,
-        spec.worktree.unwrap_or(false),
+        use_worktree,
         spec.worktree_mode,
         spec.pr_number,
         labels,
@@ -1774,6 +1823,7 @@ fn create_agent_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         cwd,
         options,
         images,
+        worktree_spec,
     ) {
         Ok((agent, run)) => (200, json!({ "agent": agent, "run": run })),
         Err(e) => (400, json!({ "error": e })),
@@ -2353,6 +2403,9 @@ fn create_run(app: &Arc<App>, req: &Req) -> (u16, Value) {
         Ok(v) => v,
         Err(e) => return (400, json!({"error": format!("bad json: {}", e)})),
     };
+    if let Err(e) = worktree_request_parts(spec.worktree) {
+        return (400, json!({ "error": e }));
+    }
     if !is_known_agent(&spec.agent) {
         return (400, json!({"error": "unknown agent"}));
     }
@@ -2424,6 +2477,7 @@ fn create_run(app: &Arc<App>, req: &Req) -> (u16, Value) {
             cwd: None,
             options: options.clone(),
             images: images.clone(),
+            worktree: None,
         };
         st.state.runs.push(r.clone());
         jobs::prune(&mut st);
@@ -3077,6 +3131,7 @@ mod tests {
             cwd: None,
             options: BTreeMap::new(),
             images: Vec::new(),
+            worktree: None,
         };
         let store = Store {
             dir: dir.clone(),
@@ -3169,6 +3224,7 @@ mod tests {
             cwd: None,
             options: BTreeMap::new(),
             images: Vec::new(),
+            worktree: None,
         };
         let store = Store {
             dir: dir.to_path_buf(),

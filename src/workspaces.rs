@@ -7,6 +7,30 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::hash::{BuildHasher, Hash, Hasher};
 
+/// 描述一次 worktree 创建请求，对应 `--worktree-slug/--new-branch/--base/--branch`。
+/// `branch` 兼作分支名；`existing=true` 表示检出已有分支（对应 `--branch`）。
+/// `existing=false` 时 `branch` 为 `--new-branch` 指定值，未指定时回落 `rw/<agent_id>`。
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct WorktreeSpec {
+    #[serde(default)]
+    pub slug: Option<String>,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub base: Option<String>,
+    #[serde(default)]
+    pub existing: bool,
+}
+
+/// run 上记录的 worktree 创建结果，供清理与 inspect 反查。
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+pub struct WorktreeInfo {
+    pub path: String,
+    pub branch: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Workspace {
     pub id: String,
@@ -251,8 +275,96 @@ pub fn worktree_path(data_dir: &Path, agent_id: &str) -> PathBuf {
     worktrees_dir(data_dir).join(agent_id)
 }
 
+/// worktree 目录：给定 `--worktree-slug` 时用 slug，否则回落到 agent_id。
+pub fn worktree_path_named(data_dir: &Path, agent_id: &str, slug: Option<&str>) -> PathBuf {
+    match slug {
+        Some(s) if !s.is_empty() => worktrees_dir(data_dir).join(s),
+        _ => worktree_path(data_dir, agent_id),
+    }
+}
+
 pub fn worktree_branch(agent_id: &str) -> String {
     format!("rw/{}", agent_id)
+}
+
+/// `--worktree-slug` 必须匹配 `[a-z0-9][a-z0-9-]{0,39}`（1..=40 字符），且首字符不能是 `-`。
+pub fn validate_worktree_slug(slug: &str) -> Result<(), String> {
+    let ok = !slug.is_empty()
+        && slug.len() <= 40
+        && slug.bytes().enumerate().all(|(i, b)| {
+            let alnum = b.is_ascii_lowercase() || b.is_ascii_digit();
+            if i == 0 {
+                alnum
+            } else {
+                alnum || b == b'-'
+            }
+        });
+    if ok {
+        Ok(())
+    } else {
+        Err("run --worktree-slug: expected [a-z0-9-], max 40".to_string())
+    }
+}
+
+/// `--new-branch` 必须匹配 `[A-Za-z0-9._/-]{1,100}`，且不以 `-`/`/` 开头或结尾（对齐 git check-ref-format 语义）。
+pub fn validate_new_branch_name(name: &str) -> Result<(), String> {
+    let ok = !name.is_empty()
+        && name.len() <= 100
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'/' | b'-'))
+        && !name.starts_with('-')
+        && !name.starts_with('/')
+        && !name.ends_with('-')
+        && !name.ends_with('/');
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("run --new-branch: invalid branch name: {}", name))
+    }
+}
+
+/// 把 4 个 flag 收敛成 WorktreeSpec；`--branch` 与 `--new-branch`/`--base` 互斥。
+/// `--new-branch` 走新建分支（existing=false），`--branch` 走已有分支（existing=true）。
+pub fn spec_from_parts(
+    slug: Option<String>,
+    new_branch: Option<String>,
+    base: Option<String>,
+    branch: Option<String>,
+) -> Result<WorktreeSpec, String> {
+    if branch.is_some() && (new_branch.is_some() || base.is_some()) {
+        return Err("run --branch conflicts with --new-branch/--base".to_string());
+    }
+    if let Some(s) = slug.as_deref() {
+        validate_worktree_slug(s)?;
+    }
+    if let Some(n) = new_branch.as_deref() {
+        validate_new_branch_name(n)?;
+    }
+    let (branch, existing) = if let Some(b) = branch {
+        (Some(b), true)
+    } else {
+        (new_branch, false)
+    };
+    Ok(WorktreeSpec {
+        slug,
+        branch,
+        base,
+        existing,
+    })
+}
+
+/// 在创建 worktree 之前校验 slug / new-branch 的形态，git 侧校验在 `validate_worktree_git`。
+pub fn validate_worktree_spec(spec: &WorktreeSpec) -> Result<(), String> {
+    if let Some(s) = spec.slug.as_deref() {
+        validate_worktree_slug(s)?;
+    }
+    if !spec.existing {
+        if let Some(n) = spec.branch.as_deref() {
+            validate_new_branch_name(n)?;
+        }
+    }
+    Ok(())
 }
 
 pub fn git_repo_root(workspace: &str) -> Result<String, String> {
@@ -271,13 +383,33 @@ pub fn git_repo_root(workspace: &str) -> Result<String, String> {
     Ok(root)
 }
 
-pub fn worktree_add(repo_root: &str, path: &Path, branch: &str) -> Result<(), String> {
+/// 构造 `git worktree add <path> -b <branch> [<base>]` 的 argv，后续由 `git -C <root>` 前缀执行。
+pub fn worktree_add_argv(path: &Path, branch: &str, base: Option<&str>) -> Vec<String> {
+    let mut argv = vec![
+        "worktree".to_string(),
+        "add".to_string(),
+        path.to_string_lossy().to_string(),
+        "-b".to_string(),
+        branch.to_string(),
+    ];
+    if let Some(b) = base {
+        argv.push(b.to_string());
+    }
+    argv
+}
+
+/// 创建 worktree：`git -C <root> worktree add <path> -b <branch> [<base>]`，缺省 base 为 HEAD。
+pub fn worktree_add_from(
+    repo_root: &str,
+    path: &Path,
+    branch: &str,
+    base: Option<&str>,
+) -> Result<(), String> {
+    let argv = worktree_add_argv(path, branch, base);
     let out = Command::new("git")
         .arg("-C")
         .arg(repo_root)
-        .args(["worktree", "add"])
-        .arg(path)
-        .args(["-b", branch])
+        .args(&argv)
         .output()
         .map_err(|e| format!("git worktree add failed: {}", e))?;
     if !out.status.success() {
@@ -286,7 +418,7 @@ pub fn worktree_add(repo_root: &str, path: &Path, branch: &str) -> Result<(), St
     Ok(())
 }
 
-fn branch_exists(repo_root: &str, branch: &str) -> bool {
+pub fn branch_exists(repo_root: &str, branch: &str) -> bool {
     Command::new("git")
         .arg("-C")
         .arg(repo_root)
@@ -297,18 +429,91 @@ fn branch_exists(repo_root: &str, branch: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// `git rev-parse --verify <ref>^{commit}` 解析 commit，失败返回 None。
+pub fn resolve_ref_commit(repo_root: &str, r: &str) -> Option<String> {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "--verify"])
+        .arg(format!("{}^{{commit}}", r))
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let hash = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if hash.is_empty() {
+        None
+    } else {
+        Some(hash)
+    }
+}
+
+/// slug 是否已被占用：分支同名，或 git worktree 列表中已有同名目录。
+pub fn worktree_slug_taken(repo_root: &str, slug: &str) -> bool {
+    if branch_exists(repo_root, slug) {
+        return true;
+    }
+    let out = match Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+    {
+        Ok(o) if o.status.success() => o,
+        _ => return false,
+    };
+    String::from_utf8_lossy(&out.stdout).lines().any(|line| {
+        line.strip_prefix("worktree ")
+            .and_then(|p| std::path::Path::new(p).file_name())
+            .and_then(|n| n.to_str())
+            == Some(slug)
+    })
+}
+
+/// 创建 worktree 前的 git 侧校验：slug 未占用 / 已有分支存在 / base 可解析。
+pub fn validate_worktree_git(repo_root: &str, spec: &WorktreeSpec) -> Result<(), String> {
+    if let Some(slug) = spec.slug.as_deref() {
+        if worktree_slug_taken(repo_root, slug) {
+            return Err(format!("run --worktree-slug: already exists: {}", slug));
+        }
+    }
+    if spec.existing {
+        if let Some(branch) = spec.branch.as_deref() {
+            if !branch_exists(repo_root, branch) {
+                return Err(format!("run --branch: no such branch: {}", branch));
+            }
+        }
+    }
+    if let Some(base) = spec.base.as_deref() {
+        if resolve_ref_commit(repo_root, base).is_none() {
+            return Err(format!("run --base: unknown ref: {}", base));
+        }
+    }
+    Ok(())
+}
+
+/// 生成删除前的 dry-run 行，打印删除 worktree 与分支的 git 命令。
+pub fn worktree_remove_plan(repo_root: &str, path: &Path, branch: &str) -> Vec<String> {
+    vec![
+        format!(
+            "[worktree] dry-run: git -C {} worktree remove --force {}",
+            repo_root,
+            path.display()
+        ),
+        format!(
+            "[worktree] dry-run: git -C {} branch -D {}",
+            repo_root, branch
+        ),
+    ]
+}
+
 /// Remove a per-agent worktree and its branch. Prints a dry-run line before each
 /// destructive command and propagates failures (never silently swallowed).
 pub fn worktree_remove(repo_root: &str, path: &Path, branch: &str) -> Result<(), String> {
-    println!(
-        "[worktree] dry-run: git -C {} worktree remove --force {}",
-        repo_root,
-        path.display()
-    );
-    println!(
-        "[worktree] dry-run: git -C {} branch -D {}",
-        repo_root, branch
-    );
+    for line in worktree_remove_plan(repo_root, path, branch) {
+        println!("{}", line);
+    }
     if path.exists() {
         let out = Command::new("git")
             .arg("-C")
@@ -507,5 +712,66 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.starts_with("rw/"));
         assert!(b.starts_with("rw/"));
+    }
+
+    #[test]
+    fn worktree_spec_parses_slug_branch_base() {
+        // 第 1 组：slug
+        let spec = spec_from_parts(Some("p16-a".into()), None, None, None).unwrap();
+        assert_eq!(spec.slug.as_deref(), Some("p16-a"));
+        assert_eq!(spec.branch, None);
+        assert_eq!(spec.base, None);
+        assert!(!spec.existing);
+
+        // 第 2 组：new-branch + base
+        let spec = spec_from_parts(None, Some("feat/p16".into()), Some("base1".into()), None).unwrap();
+        assert_eq!(spec.branch.as_deref(), Some("feat/p16"));
+        assert_eq!(spec.base.as_deref(), Some("base1"));
+        assert!(!spec.existing);
+
+        // 第 3 组：已有分支
+        let spec = spec_from_parts(None, None, None, Some("main".into())).unwrap();
+        assert_eq!(spec.branch.as_deref(), Some("main"));
+        assert!(spec.existing);
+
+        // 第 4 组：冲突与非法值
+        let conflict = spec_from_parts(None, Some("feat".into()), Some("base1".into()), Some("main".into()))
+            .unwrap_err();
+        assert!(conflict.contains("conflicts"), "{}", conflict);
+        let bad_slug = spec_from_parts(Some("Bad_Slug".into()), None, None, None).unwrap_err();
+        assert!(bad_slug.contains("expected [a-z0-9-]"), "{}", bad_slug);
+        let bad_branch = spec_from_parts(None, Some("-bad".into()), None, None).unwrap_err();
+        assert!(bad_branch.contains("invalid branch name"), "{}", bad_branch);
+    }
+
+    #[test]
+    fn worktree_add_from_argv_includes_base() {
+        let argv = worktree_add_argv(Path::new("/tmp/wt"), "feat/p16", Some("base1"));
+        assert_eq!(argv, vec!["worktree", "add", "/tmp/wt", "-b", "feat/p16", "base1"]);
+        let no_base = worktree_add_argv(Path::new("/tmp/wt"), "feat/p16", None);
+        assert_eq!(no_base, vec!["worktree", "add", "/tmp/wt", "-b", "feat/p16"]);
+    }
+
+    #[test]
+    fn worktree_path_named_uses_slug_and_falls_back_to_agent_id() {
+        let dir = temp_dir("wt-named");
+        let with_slug = worktree_path_named(&dir, "ag_1234", Some("p16-a"));
+        assert!(with_slug.starts_with(worktrees_dir(&dir)));
+        assert_eq!(with_slug.file_name().and_then(|n| n.to_str()), Some("p16-a"));
+        let fallback = worktree_path_named(&dir, "ag_1234", None);
+        assert_eq!(fallback, worktree_path(&dir, "ag_1234"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn worktree_remove_uses_recorded_path() {
+        let info = WorktreeInfo {
+            path: "/data/worktrees/p16-a".into(),
+            branch: "feat/p16".into(),
+            base: Some("base1".into()),
+        };
+        let lines = worktree_remove_plan("/tmp/repo", Path::new(&info.path), &info.branch);
+        assert!(lines[0].contains("/data/worktrees/p16-a"), "{}", lines[0]);
+        assert!(lines[1].contains("feat/p16"), "{}", lines[1]);
     }
 }

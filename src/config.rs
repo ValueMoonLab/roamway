@@ -611,6 +611,7 @@ mod tests {
             cwd: None,
             options: BTreeMap::new(),
             images: Vec::new(),
+            worktree: None,
         }
     }
 

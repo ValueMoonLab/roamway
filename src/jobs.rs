@@ -124,6 +124,7 @@ pub fn spawn_from_job(app: Arc<App>, job_id: &str) {
             cwd: None,
             options: BTreeMap::new(),
             images: Vec::new(),
+            worktree: None,
         });
         if let Some(jj) = st.state.jobs.iter_mut().find(|x| x.id == job_id) {
             jj.last_run = Some(iso(t));
@@ -277,6 +278,7 @@ mod tests {
             cwd: None,
             options: BTreeMap::new(),
             images: Vec::new(),
+            worktree: None,
         };
         let state = State {
             runs: vec![
@@ -325,6 +327,7 @@ mod tests {
             cwd: None,
             options: BTreeMap::new(),
             images: Vec::new(),
+            worktree: None,
         };
         let dir = std::env::temp_dir().join(format!("roamway-prune-{}", now()));
         let _ = std::fs::create_dir_all(&dir);

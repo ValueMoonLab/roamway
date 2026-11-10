@@ -884,6 +884,7 @@ mod tests {
             cwd: None,
             options: std::collections::BTreeMap::new(),
             images: Vec::new(),
+            worktree: None,
         }
     }
 

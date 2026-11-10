@@ -12,7 +12,7 @@
 |---|---|---|---|---|
 | 1 | `paseo host` | ✅ | `src/main.rs:fn cmd_host` | 主机注册表 add/ls/rm/enable/disable/probe 全量 |
 | 2 | `paseo ls` | ✅ | `src/main.rs:fn cmd_ls` / 测试：`ls_plan_switches_runs_and_global_limit_defaults` | 默认 agent 维度，列 `ID/STATE/KIND/MODEL/TITLE/UPDATED`；`--runs` 看 run 表；`--background` 不做（roamway 无后台列表模型，exit 2） |
-| 3 | `paseo run` | ⚠️ | `src/main.rs:fn run_plan` / `src/runner.rs:fn provider_args` / 测试：`provider_args_codex_maps_thinking_mode_provider_image_schema`、`run_plan_no_longer_rejects_provider_flags` | agent-backed，支持 worktree/cwd/env/label 与每 run 的 `--thinking/--mode/--provider/--image/--output-schema`（argv 映射见 `src/runner.rs:fn provider_args`，provider 无能力时显式 exit 2）；仅 `--worktree-slug/--new-branch/--base/--branch` 仍未对齐（P16），exit 2 |
+| 3 | `paseo run` | ✅ | `src/main.rs:fn run_plan` / `src/runner.rs:fn provider_args` / `src/workspaces.rs:fn worktree_add_from` / 测试：`provider_args_codex_maps_thinking_mode_provider_image_schema`、`run_plan_no_longer_rejects_provider_flags`、`worktree_spec_parses_slug_branch_base`、`worktree_add_from_argv_includes_base`、`run_plan_rejects_slug_without_worktree_workspace` | agent-backed，worktree/cwd/env/label 与每 run 的 `--thinking/--mode/--provider/--image/--output-schema`、`--worktree-slug/--new-branch/--base/--branch` 全部落地；参数集收口于 P15+P16 |
 | 4 | `paseo import` | ✅ | `src/main.rs:fn cmd_agent_import` | 导入已有 provider 会话 |
 | 5 | `paseo clone` | ✅ | `src/main.rs:fn cmd_clone` | 本地 `workspaces::clone_repo` 或远端 `/v1/workspaces/clone` |
 | 6 | `paseo attach` | ✅ | `src/main.rs:fn cmd_agent_attach` | SSE 长连接接输出流 |
@@ -60,7 +60,7 @@
 | 12 | `paseo agent detach` | ✅ | `src/main.rs:fn cmd_agent_detach` | subagent 转独立 |
 | 13 | `paseo agent update` | ✅ | `src/main.rs:fn cmd_agent_update` | 更新元数据 |
 | 14 | `paseo daemon start` | ✅ | `src/main.rs:fn cmd_daemon_start` | 后台拉起 + pid/bind |
-| 15 | `paseo daemon run` | ✅ | `src/main.rs:fn cmd_daemon_run` | 前台按 `resolve_config` 起生产 serve；`--foreground` 接受（serve 本就前台） |
+| 15 | `paseo daemon run` | ✅ | `src/main.rs:fn cmd_daemon_run` / `src/config.rs:fn resolve_config` / 文档：`docs/config.md` | 前台按 `resolve_config` 起生产 serve；`--foreground` 接受（serve 本就前台）；与 `docs/config.md` 的 12 键与优先级逐项一致 |
 | 16 | `paseo daemon status` | ✅ | `src/main.rs:fn cmd_daemon_status` | 读 pid/bind，offline 判断 |
 | 17 | `paseo daemon stop` | ✅ | `src/main.rs:fn cmd_daemon_stop` | SIGTERM/taskkill + 端口校验 |
 | 18 | `paseo daemon restart` | ✅ | `src/main.rs:fn cmd_daemon_restart` | stop+start |
@@ -174,6 +174,12 @@ P13 新增单测：`should_resume_requires_resumable_kind_and_session`（`src/ag
 | `token_env` | ✅ | file；只存环境变量名，token 值永不落盘 |
 | `keep_runs` | ✅ | file；0 不修剪，默认 500（roamway 扩展，Paseo 无对应项） |
 
-Paseo 未对齐项：`daemon run` 的 `--thinking/--mode/--provider` 等 agent 参数继续走 `run` 的既有不支持面（exit 2），不在 daemon 配置面内。
+`daemon run` 转发 `cmd_serve`，按 `src/config.rs:fn resolve_config` 读取 `docs/config.md` 的 12 键与优先级；agent 级参数走 `roamway run`，不在 daemon 配置面内。
 
 P14 新增单测（`src/config.rs`）：`resolve_priority_flag_over_env_over_file_over_default`、`resolve_env_comma_array_and_invalid_values`、`config_roundtrip_and_no_token_leak`、`config_load_bad_json_reports_line`、`config_rejects_forbidden_and_unknown_keys`、`config_key_whitelist`、`apply_set_validates_and_applies`、`trim_runs_keeps_newest_and_never_drops_running`。
+
+## 七、P16 worktree 参数 + 参数面收口
+
+- `--worktree-slug/--new-branch/--base/--branch` 落地于 `src/workspaces.rs:fn spec_from_parts`、`worktree_add_from`、`worktree_path_named` 与 `src/agents.rs:fn create_agent_and_run`；清理按 `run.worktree` 记录反查（`src/agents.rs:fn archive_agent`）。
+- 新增单测：`worktree_spec_parses_slug_branch_base`、`worktree_add_from_argv_includes_base`、`worktree_path_named_uses_slug_and_falls_back_to_agent_id`、`worktree_remove_uses_recorded_path`（`src/workspaces.rs`）；`run_plan_rejects_slug_without_worktree_workspace`（`src/main.rs`）。
+- PARITY #3 `paseo run` 参数集收口 → ✅；#15 `paseo daemon run` 已对照 `docs/config.md` 核验。

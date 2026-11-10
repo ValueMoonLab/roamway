@@ -10,3 +10,9 @@ config.local.*
 .cargo-test-home/
 .linker/
 .tmp-rust-lld.exe
+__pycache__/
+
+# codex scratch helpers — never commit these
+/_*.py
+/_enc_test*
+/_tmp*

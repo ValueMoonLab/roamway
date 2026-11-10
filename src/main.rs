@@ -28,6 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 use types::*;
+use crate::workspaces::WorktreeSpec;
 
 const BOOLS: &[&str] = &["no-wait", "quiet", "json", "allow-overlap", "disabled", "help", "force", "probe", "all", "worktree", "keep-worktree", "run-now", "overlap", "enabled", "enter", "no-enter", "stdin", "no-browser", "no-headers", "no-color", "runs", "background", "global", "resume", "continue", "version"];
 
@@ -49,7 +50,7 @@ fn usage() {
 核心：
   roamway serve  [--bind 127.0.0.1:8796] [--data DIR] [--token T] [--tz 8] [--max-concurrent 4] [--max-conn 64]
   roamway start                                  # = daemon start
-  roamway run    --agent codex [--model M] [--workspace DIR] [--title T] [--timeout 1800] [--no-wait] [--wait-timeout N] [--new-workspace local|worktree] [--worktree-mode branch-off|checkout-branch|checkout-pr] [--cwd DIR] [--env K=V] [--label k=v] [--host H] "prompt"
+  roamway run    --agent codex [--model M] [--workspace DIR] [--title T] [--timeout 1800] [--no-wait] [--wait-timeout N] [--new-workspace local|worktree] [--worktree-mode branch-off|checkout-branch|checkout-pr] [--worktree-slug SLUG] [--new-branch B] [--base REF] [--branch B] [--cwd DIR] [--env K=V] [--label k=v] [--host H] "prompt"
   roamway send   <agent-id> <prompt...>          # 续跑 agent
   roamway delete <id> [--yes]                    # 运行中先 stop 再硬删
   roamway ls     [--limit 50] [-a|--all] [-g|--global] [--label k=v] [--kind K] [--host H|all] [--json|--format table|json|yaml] [-q] [--no-headers] ; --runs 看运行记录
@@ -302,6 +303,7 @@ struct RunPlan {
     title: Option<String>,
     timeout_s: Option<u64>,
     worktree: bool,
+    spec: WorktreeSpec,
     worktree_mode: Option<String>,
     pr_number: Option<String>,
     labels: BTreeMap<String, String>,
@@ -314,11 +316,12 @@ struct RunPlan {
 
 /// 把 `run` 的 flags 收敛成 RunPlan；先校验不支持项，避免无效请求打到服务端
 fn run_plan(flags: &HashMap<String, String>) -> Result<RunPlan, String> {
-    for f in ["worktree-slug", "new-branch", "base", "branch"] {
-        if flags.contains_key(f) {
-            return Err(format!("run --{}: not supported by roamway", f));
-        }
-    }
+    let spec = workspaces::spec_from_parts(
+        flags.get("worktree-slug").cloned(),
+        flags.get("new-branch").cloned(),
+        flags.get("base").cloned(),
+        flags.get("branch").cloned(),
+    )?;
     let worktree_mode = flags.get("worktree-mode").cloned();
     if let Some(m) = worktree_mode.as_deref() {
         if !matches!(m, "branch-off" | "checkout-branch" | "checkout-pr") {
@@ -342,6 +345,17 @@ fn run_plan(flags: &HashMap<String, String>) -> Result<RunPlan, String> {
                 return Err(format!("run --new-workspace: expected local or worktree, got {}", other))
             }
         }
+    }
+    if spec.slug.is_some() && flags.get("new-workspace").map(String::as_str) != Some("worktree") {
+        return Err("run --worktree-slug requires --new-workspace worktree".to_string());
+    }
+    if spec.base.is_some()
+        && matches!(
+            worktree_mode.as_deref(),
+            Some("checkout-pr") | Some("checkout-branch")
+        )
+    {
+        return Err("run --base: only valid with branch-off".to_string());
     }
     let images = flag_many(flags, "image");
     for img in &images {
@@ -369,6 +383,7 @@ fn run_plan(flags: &HashMap<String, String>) -> Result<RunPlan, String> {
         title: flags.get("title").cloned(),
         timeout_s: flags.get("timeout").and_then(|v| v.parse::<u64>().ok()),
         worktree,
+        spec,
         worktree_mode,
         pr_number: flags.get("pr-number").cloned().filter(|p| !p.is_empty()),
         labels: parse_labels(&flag_many(flags, "label"))?,
@@ -382,6 +397,16 @@ fn run_plan(flags: &HashMap<String, String>) -> Result<RunPlan, String> {
 
 /// 构造 `POST /v1/agents` 的 body，避免字段所有权被 json! 移动
 fn run_body(plan: &RunPlan, prompt: &str) -> Value {
+    let worktree_value = if plan.spec.slug.is_some() || plan.spec.branch.is_some() || plan.spec.base.is_some() {
+        json!({
+            "slug": plan.spec.slug.clone(),
+            "branch": if plan.spec.existing { plan.spec.branch.clone() } else { None },
+            "new_branch": if plan.spec.existing { None } else { plan.spec.branch.clone() },
+            "base": plan.spec.base.clone(),
+        })
+    } else {
+        json!(plan.worktree)
+    };
     json!({
         "kind": plan.kind.clone(),
         "model": plan.model.clone(),
@@ -389,7 +414,7 @@ fn run_body(plan: &RunPlan, prompt: &str) -> Value {
         "title": plan.title.clone(),
         "prompt": prompt,
         "timeout_s": plan.timeout_s,
-        "worktree": plan.worktree,
+        "worktree": worktree_value,
         "labels": plan.labels.clone(),
         "env": plan.env.clone(),
         "cwd": plan.cwd.clone(),
@@ -398,6 +423,27 @@ fn run_body(plan: &RunPlan, prompt: &str) -> Value {
         "options": plan.options.clone(),
         "images": plan.images.clone(),
     })
+}
+
+/// 从 server 返回的错误文本里抽出 `error` 字段；抽不出就原样返回。
+fn server_error_message(raw: &str) -> String {
+    if let Some(idx) = raw.find('{') {
+        if let Ok(v) = serde_json::from_str::<Value>(&raw[idx..]) {
+            if let Some(msg) = v["error"].as_str() {
+                return msg.to_string();
+            }
+        }
+    }
+    raw.to_string()
+}
+
+/// worktree / checkout-pr 校验失败属于用法错误（exit 2），其余走 dispatch failed。
+fn is_run_usage_error(msg: &str) -> bool {
+    msg.starts_with("run --worktree-slug")
+        || msg.starts_with("run --new-branch")
+        || msg.starts_with("run --base")
+        || msg.starts_with("run --branch")
+        || msg == "checkout-pr requires gh in PATH"
 }
 
 #[derive(Debug)]
@@ -883,7 +929,7 @@ fn print_command_help(cmd: &str) -> bool {
         "usage" => "roamway usage [ls [--since 7d|24h|ISO] [--provider id]|inspect <run_id>] [--json]",
         "plugin" => "roamway plugin ls|init <name>|logs <name>|reload <name>|enable|disable <name> [--trust]|remove <name> [--keep-files]",
         "speech" => "roamway speech [transcribe <file>|say <text> [--out file]]",
-        "run" => "roamway run --agent codex [--model M] [--workspace DIR] [--title T] [--timeout 1800] [--no-wait] [--wait-timeout N] [--resume <agent-id> | --continue <agent-id>] [--new-workspace local|worktree] [--worktree-mode branch-off|checkout-branch|checkout-pr] [--pr-number N] [--cwd DIR] [--env K=V] [--label k=v] [--host H] \"prompt\"",
+        "run" => "roamway run --agent codex [--model M] [--workspace DIR] [--title T] [--timeout 1800] [--no-wait] [--wait-timeout N] [--resume <agent-id> | --continue <agent-id>] [--new-workspace local|worktree] [--worktree-mode branch-off|checkout-branch|checkout-pr] [--pr-number N] [--worktree-slug SLUG] [--new-branch B] [--base REF] [--branch B] [--cwd DIR] [--env K=V] [--label k=v] [--host H] \"prompt\"",
         "send" => "roamway send <agent-id> <prompt...>",
         "delete" => "roamway delete <id> [--yes]",
         "ls" | "list" => "roamway ls [--limit 50] [-a|--all] [-g|--global] [--label k=v] [--kind K] [--host H|all] [-q] [--no-headers] [--json|--format table|json|yaml] ; --runs 看运行记录",
@@ -1344,8 +1390,9 @@ fn cmd_run(flags: &HashMap<String, String>, pos: &[String]) {
     let v = match c.req("POST", "/v1/agents", Some(body)) {
         Ok(v) => v,
         Err(e) => {
-            if e.contains("checkout-pr requires gh in PATH") {
-                usage_error("checkout-pr requires gh in PATH");
+            let msg = server_error_message(&e);
+            if is_run_usage_error(&msg) {
+                usage_error(&msg);
             } else {
                 eprintln!("dispatch failed: {}", e);
             }
@@ -3008,8 +3055,9 @@ fn cmd_run_remote(h: &hosts::Host, flags: &HashMap<String, String>, pos: &[Strin
         }
     };
     if !(200..300).contains(&code) {
-        if text.contains("checkout-pr requires gh in PATH") {
-            usage_error("checkout-pr requires gh in PATH");
+        let msg = server_error_message(&text);
+        if is_run_usage_error(&msg) {
+            usage_error(&msg);
         } else {
             eprintln!("dispatch failed: HTTP {}: {}", code, text);
         }
@@ -3482,6 +3530,17 @@ fn cmd_agent_inspect(flags: &HashMap<String, String>, pos: &[String]) {
             println!("last_error: {}", if last_error.is_empty() { "-" } else { last_error });
             let empty = vec![];
             let runs = v["runs"].as_array().unwrap_or(&empty);
+            if let Some(run) = runs.first() {
+                if let Some(wt) = run["worktree"].as_object() {
+                    let path = wt["path"].as_str().unwrap_or("");
+                    let branch = wt["branch"].as_str().unwrap_or("");
+                    let base = wt["base"]
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "HEAD".into());
+                    println!("worktree:   {} ({}, base={})", path, branch, base);
+                }
+            }
             println!("runs (recent 5):");
             for r in runs.iter().take(5) {
                 println!(
@@ -5017,11 +5076,25 @@ mod tests {
 
         let mut f3: HashMap<String, String> = HashMap::new();
         f3.insert("worktree-slug".to_string(), "slug".to_string());
-        assert!(run_plan(&f3).unwrap_err().contains("not supported"));
+        assert!(run_plan(&f3).unwrap_err().contains("requires --new-workspace worktree"));
 
         let mut f4: HashMap<String, String> = HashMap::new();
         f4.insert("env".to_string(), "1BAD=x".to_string());
         assert!(run_plan(&f4).unwrap_err().contains("invalid env key"));
+    }
+
+    #[test]
+    fn run_plan_rejects_slug_without_worktree_workspace() {
+        let mut f: HashMap<String, String> = HashMap::new();
+        f.insert("worktree-slug".to_string(), "p16-a".to_string());
+        assert_eq!(
+            run_plan(&f).unwrap_err(),
+            "run --worktree-slug requires --new-workspace worktree"
+        );
+
+        f.insert("new-workspace".to_string(), "worktree".to_string());
+        let plan = run_plan(&f).unwrap();
+        assert_eq!(plan.spec.slug.as_deref(), Some("p16-a"));
     }
 
     #[test]
@@ -5127,6 +5200,6 @@ mod tests {
 
         let mut w: HashMap<String, String> = HashMap::new();
         w.insert("worktree-slug".to_string(), "slug".to_string());
-        assert!(run_plan(&w).unwrap_err().contains("not supported"));
+        assert!(run_plan(&w).unwrap_err().contains("requires --new-workspace worktree"));
     }
 }

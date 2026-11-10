@@ -504,6 +504,7 @@ pub fn create_run_for_schedule(app: &Arc<App>, schedule_id: &str) {
             cwd: None,
             options: BTreeMap::new(),
             images: Vec::new(),
+            worktree: None,
         });
         crate::jobs::prune(&mut st);
         st.save();
