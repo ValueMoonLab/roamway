@@ -177,10 +177,12 @@ pub fn sha256_hex(data: &[u8]) -> String {
 }
 
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-    let mut diff = (a.len() as u8) ^ (b.len() as u8);
+    // 长度差按 usize 全程累加，不能截断成 u8：否则长度差恰为 256 的倍数
+    // （且短串以 0 补齐）时 diff 归零，会把不等长输入误判为相等。
+    let mut diff = a.len() ^ b.len();
     let n = a.len().max(b.len());
     for i in 0..n {
-        diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
+        diff |= (a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0)) as usize;
     }
     diff == 0
 }
@@ -760,6 +762,23 @@ mod tests {
         assert!(ct_eq(b"", b""));
         assert!(ct_eq_str("tok", "tok"));
         assert!(!ct_eq_str("tok", "tik"));
+    }
+
+    /// 回归：长度差恰为 256 的倍数且短串以 0 补齐时，旧实现把长度差截断成
+    /// u8 会归零，误判不等长输入为相等。修复后必须判不等。
+    #[test]
+    fn ct_eq_rejects_length_diff_multiple_of_256() {
+        let short = vec![0u8; 0];
+        let long = vec![0u8; 256];
+        assert!(!ct_eq(&short, &long));
+        assert!(!ct_eq(&long, &short));
+        // 非零内容同样不能因长度差 256 而误判
+        let a = vec![7u8; 16];
+        let mut b = vec![7u8; 16];
+        b.extend_from_slice(&vec![0u8; 256]);
+        assert!(!ct_eq(&a, &b));
+        // 等长仍正确
+        assert!(ct_eq(&long, &vec![0u8; 256]));
     }
 
     #[test]
