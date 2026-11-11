@@ -387,6 +387,39 @@ fn respond_static<C: Conn>(
 fn count_failed(app: &App, code: u16) {
     if code >= 400 {
         app.req_failed.fetch_add(1, Ordering::Relaxed);
+        if code < 500 {
+            app.req_4xx.fetch_add(1, Ordering::Relaxed);
+        } else {
+            app.req_5xx.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+fn record_duration(app: &App, started: Instant) {
+    let micros = started.elapsed().as_micros() as u64;
+    app.req_us.fetch_add(micros, Ordering::Relaxed);
+    let mut current = app.req_max_us.load(Ordering::Relaxed);
+    while micros > current {
+        match app.req_max_us.compare_exchange_weak(
+            current,
+            micros,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => break,
+            Err(now) => current = now,
+        }
+    }
+}
+
+struct RequestTimer<'a> {
+    app: &'a App,
+    started: Instant,
+}
+
+impl Drop for RequestTimer<'_> {
+    fn drop(&mut self) {
+        record_duration(self.app, self.started);
     }
 }
 
@@ -483,6 +516,11 @@ fn logs_dir_stats(dir: &std::path::Path) -> (u64, u64) {
         bytes += std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     }
     (bytes, count)
+}
+
+/// 微秒 → 秒的十进制串，只做整数相除到 6 位小数，避免浮点误差。
+fn format_duration_seconds(micros: u64) -> String {
+    format!("{}.{:06}", micros / 1_000_000, micros % 1_000_000)
 }
 
 /// `/metrics` 的正文：Prometheus exposition 0.0.4 纯文本。
@@ -665,6 +703,47 @@ fn metrics_text(app: &Arc<App>) -> String {
         "roamway_http_requests_failed_total {}\n",
         app.req_failed.load(Ordering::Relaxed)
     ));
+
+    out.push_str("# HELP roamway_http_request_duration_seconds_sum Total time spent handling HTTP requests, in seconds.\n");
+    out.push_str("# TYPE roamway_http_request_duration_seconds_sum counter\n");
+    out.push_str(&format!(
+        "roamway_http_request_duration_seconds_sum {}\n",
+        format_duration_seconds(app.req_us.load(Ordering::Relaxed))
+    ));
+
+    out.push_str(
+        "# HELP roamway_http_request_duration_seconds_count HTTP requests timed since start.\n",
+    );
+    out.push_str("# TYPE roamway_http_request_duration_seconds_count counter\n");
+    out.push_str(&format!(
+        "roamway_http_request_duration_seconds_count {}\n",
+        app.req_total.load(Ordering::Relaxed)
+    ));
+
+    out.push_str("# HELP roamway_http_request_duration_seconds_max Slowest single HTTP request since start.\n");
+    out.push_str("# TYPE roamway_http_request_duration_seconds_max gauge\n");
+    out.push_str(&format!(
+        "roamway_http_request_duration_seconds_max {}\n",
+        format_duration_seconds(app.req_max_us.load(Ordering::Relaxed))
+    ));
+
+    out.push_str(
+        "# HELP roamway_http_requests_4xx_total HTTP responses with 4xx status since start.\n",
+    );
+    out.push_str("# TYPE roamway_http_requests_4xx_total counter\n");
+    out.push_str(&format!(
+        "roamway_http_requests_4xx_total {}\n",
+        app.req_4xx.load(Ordering::Relaxed)
+    ));
+
+    out.push_str(
+        "# HELP roamway_http_requests_5xx_total HTTP responses with 5xx status since start.\n",
+    );
+    out.push_str("# TYPE roamway_http_requests_5xx_total counter\n");
+    out.push_str(&format!(
+        "roamway_http_requests_5xx_total {}\n",
+        app.req_5xx.load(Ordering::Relaxed)
+    ));
     out
 }
 
@@ -673,6 +752,10 @@ fn handle<C: Conn>(app: Arc<App>, mut s: C) -> std::io::Result<()> {
     let _ = s.set_write_timeout_opt(Some(Duration::from_secs(30)));
     // /metrics 计数器：每进一次 handle 就算一次请求（读失败也算，运维关心的是流量）。
     app.req_total.fetch_add(1, Ordering::Relaxed);
+    let _request_timer = RequestTimer {
+        app: app.as_ref(),
+        started: Instant::now(),
+    };
     let req = match read_req(&mut s)? {
         ReadOutcome::Req(r) => r,
         ReadOutcome::Eof => return Ok(()),
@@ -3898,6 +3981,10 @@ mod tests {
             conns: std::sync::atomic::AtomicUsize::new(0),
             req_total: std::sync::atomic::AtomicU64::new(0),
             req_failed: std::sync::atomic::AtomicU64::new(0),
+            req_us: std::sync::atomic::AtomicU64::new(0),
+            req_max_us: std::sync::atomic::AtomicU64::new(0),
+            req_4xx: std::sync::atomic::AtomicU64::new(0),
+            req_5xx: std::sync::atomic::AtomicU64::new(0),
 
             tokens: std::sync::Mutex::new(auth::TokenStore::load(&dir)),
             approvals: std::sync::Mutex::new(auth::ApprovalStore::load(&dir)),
@@ -4002,6 +4089,10 @@ mod tests {
             conns: std::sync::atomic::AtomicUsize::new(0),
             req_total: std::sync::atomic::AtomicU64::new(0),
             req_failed: std::sync::atomic::AtomicU64::new(0),
+            req_us: std::sync::atomic::AtomicU64::new(0),
+            req_max_us: std::sync::atomic::AtomicU64::new(0),
+            req_4xx: std::sync::atomic::AtomicU64::new(0),
+            req_5xx: std::sync::atomic::AtomicU64::new(0),
 
             tokens: std::sync::Mutex::new(auth::TokenStore::load(dir)),
             approvals: std::sync::Mutex::new(auth::ApprovalStore::load(dir)),
@@ -4281,6 +4372,11 @@ mod tests {
             "roamway_http_concurrent_requests",
             "roamway_http_requests_total",
             "roamway_http_requests_failed_total",
+            "roamway_http_request_duration_seconds_sum",
+            "roamway_http_request_duration_seconds_count",
+            "roamway_http_request_duration_seconds_max",
+            "roamway_http_requests_4xx_total",
+            "roamway_http_requests_5xx_total",
             "roamway_data_bytes",
             "roamway_state_writes_total",
             "roamway_state_writes_skipped_total",
@@ -4582,6 +4678,176 @@ mod tests {
         assert!(
             app.req_failed.load(Ordering::Relaxed) >= 2,
             "req_failed must count 401/405"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 从 `/metrics` 正文里取某个指标的值（无标签指标，名字唯一）。
+    fn metric_value_f64(body: &str, name: &str) -> f64 {
+        let prefix = format!("{} ", name);
+        for line in body.lines() {
+            if let Some(rest) = line.strip_prefix(&prefix) {
+                return rest.trim().parse::<f64>().unwrap_or_else(|_| {
+                    panic!("metric {} has non-numeric value {:?}", name, rest)
+                });
+            }
+        }
+        panic!("metric {} not found in body", name);
+    }
+
+    /// 计时器起止：一次请求后 count>=1、sum>0、max>0 且 max <= sum。
+    #[test]
+    fn metrics_duration_tracks_single_request() {
+        let dir = std::env::temp_dir().join(format!("roamway-metrics-dur-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let app = test_app_with_max(&dir, "shell", RunStatus::Done, 1);
+
+        let before = metrics_text(&app);
+        assert_eq!(
+            metric_value_f64(&before, "roamway_http_request_duration_seconds_count"),
+            0.0,
+            "fresh app must start at count 0"
+        );
+        assert_eq!(
+            metric_value_f64(&before, "roamway_http_request_duration_seconds_sum"),
+            0.0,
+            "fresh app must start at sum 0"
+        );
+
+        let resp = http_roundtrip(
+            app.clone(),
+            "GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        );
+        assert!(
+            resp.starts_with("HTTP/1.1 200"),
+            "expected 200, got {}",
+            resp.lines().next().unwrap_or("")
+        );
+
+        let body = metrics_text(&app);
+        let count = metric_value_f64(&body, "roamway_http_request_duration_seconds_count");
+        let sum = metric_value_f64(&body, "roamway_http_request_duration_seconds_sum");
+        let max = metric_value_f64(&body, "roamway_http_request_duration_seconds_max");
+        assert!(count >= 1.0, "count must grow after a request: {}", body);
+        assert!(sum > 0.0, "sum must be > 0 after a request: {}", body);
+        assert!(max > 0.0, "max must be > 0 after a request: {}", body);
+        assert!(max <= sum, "max {} must not exceed sum {}", max, sum);
+        assert_eq!(
+            count,
+            app.req_total.load(Ordering::Relaxed) as f64,
+            "duration count must equal requests_total"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 分档恒等式：401 + 404 → 4xx+2；`4xx + 5xx == failed_total`。
+    #[test]
+    fn metrics_status_buckets_sum_to_failed_total() {
+        let dir = std::env::temp_dir().join(format!("roamway-metrics-4xx-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let app = test_app_with_max(&dir, "shell", RunStatus::Done, 1);
+        // A token must exist, otherwise the daemon runs open and /metrics answers 200.
+        {
+            let mut ts = app.tokens.lock().unwrap_or_else(|e| e.into_inner());
+            ts.create(
+                Some("prometheus".into()),
+                vec!["read".into(), "admin".into(), "run".into()],
+                None,
+            );
+        }
+
+        let anon = http_roundtrip(
+            app.clone(),
+            "GET /metrics HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        );
+        assert!(
+            anon.starts_with("HTTP/1.1 401"),
+            "expected 401, got {}",
+            anon.lines().next().unwrap_or("")
+        );
+        let miss = http_roundtrip(
+            app.clone(),
+            "GET /ui/missing.js HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        );
+        assert!(
+            miss.starts_with("HTTP/1.1 404"),
+            "expected 404, got {}",
+            miss.lines().next().unwrap_or("")
+        );
+
+        let body = metrics_text(&app);
+        let failed = metric_value_f64(&body, "roamway_http_requests_failed_total");
+        let b4 = metric_value_f64(&body, "roamway_http_requests_4xx_total");
+        let b5 = metric_value_f64(&body, "roamway_http_requests_5xx_total");
+        assert_eq!(b4, 2.0, "401 + 404 must land in the 4xx bucket: {}", body);
+        assert_eq!(b5, 0.0, "nothing returned 5xx: {}", body);
+        assert_eq!(
+            b4 + b5,
+            failed,
+            "4xx + 5xx must equal failed_total: {}",
+            body
+        );
+        assert_eq!(
+            failed,
+            app.req_failed.load(Ordering::Relaxed) as f64,
+            "failed_total must match the in-memory counter"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 契约锁：既有 http 指标的名字/类型/HELP 一字不变，P28 新增 5 个指标齐全且类型正确。
+    #[test]
+    fn metrics_text_locks_existing_names_and_adds_five() {
+        let dir = std::env::temp_dir().join(format!("roamway-metrics-contract-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let app = test_app_with_max(&dir, "shell", RunStatus::Done, 1);
+        let body = metrics_text(&app);
+
+        // 既有指标是 P4 起的对外契约：改名、改类型、改 HELP 文本都算破坏。
+        for line in [
+            "# HELP roamway_http_concurrent_requests Connections currently open.",
+            "# TYPE roamway_http_concurrent_requests gauge",
+            "# HELP roamway_http_requests_total HTTP requests handled since start (in-memory; resets on restart).",
+            "# TYPE roamway_http_requests_total counter",
+            "# HELP roamway_http_requests_failed_total HTTP responses with status >= 400 since start (in-memory; resets on restart).",
+            "# TYPE roamway_http_requests_failed_total counter",
+        ] {
+            assert!(
+                body.lines().any(|l| l == line),
+                "contract line missing or reworded: {:?}\n{}",
+                line,
+                body
+            );
+        }
+
+        for (name, kind) in [
+            ("roamway_http_request_duration_seconds_sum", "counter"),
+            ("roamway_http_request_duration_seconds_count", "counter"),
+            ("roamway_http_request_duration_seconds_max", "gauge"),
+            ("roamway_http_requests_4xx_total", "counter"),
+            ("roamway_http_requests_5xx_total", "counter"),
+        ] {
+            let type_line = format!("# TYPE {} {}", name, kind);
+            assert!(
+                body.lines().any(|l| l == type_line),
+                "missing {:?}\n{}",
+                type_line,
+                body
+            );
+            assert!(
+                body.lines()
+                    .any(|l| l.strip_prefix(name).is_some_and(|r| r.starts_with(' '))),
+                "missing sample line for {}\n{}",
+                name,
+                body
+            );
+        }
+
+        // spec §二 明确不做直方图桶（手写桶是伪精度）。
+        assert!(
+            !body.contains("roamway_http_request_duration_seconds_bucket"),
+            "no histogram buckets expected\n{}",
+            body
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -536,6 +536,11 @@ pub struct App {
     /// 每次请求 +1；响应码 >= 400 时 failed +1。
     pub req_total: AtomicU64,
     pub req_failed: AtomicU64,
+    /// 所有请求累计耗时（微秒）与单请求最大耗时（微秒，纯内存态）。
+    pub req_us: AtomicU64,
+    pub req_max_us: AtomicU64,
+    pub req_4xx: AtomicU64,
+    pub req_5xx: AtomicU64,
 
     pub tokens: Mutex<auth::TokenStore>,
     pub approvals: Mutex<auth::ApprovalStore>,

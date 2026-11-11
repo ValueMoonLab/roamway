@@ -23,7 +23,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{BufRead, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -62,6 +62,7 @@ const BOOLS: &[&str] = &[
     "version",
     "dry-run",
     "yes",
+    "strict",
 ];
 
 static FAIL_CODE: AtomicI32 = AtomicI32::new(0);
@@ -72,6 +73,7 @@ const USAGE_PRUNE: &str =
     "roamway prune [--dry-run] [--keep N] [--max-age-days N] [--data DIR] [--yes]";
 const USAGE_BACKUP: &str = "roamway backup [--out DIR] [--keep N] [--data DIR]";
 const USAGE_RESTORE: &str = "roamway restore --from DIR [--data DIR] [--force] [--yes]";
+const USAGE_DOCTOR: &str = "roamway doctor [--json] [--data DIR] [--strict] [--timeout N]";
 
 fn fail(code: i32) {
     FAIL_CODE.fetch_max(code, Ordering::SeqCst);
@@ -122,6 +124,7 @@ fn usage_text() -> String {
   roamway workspace ls | create <name> --path DIR | archive <name> | setup <name> | rm <name>
   roamway terminal create|ls|capture|send-keys|kill
   roamway script ls|add|rm|start|stop
+  roamway doctor [--json] [--data DIR] [--strict] [--timeout N]
   {prune_usage}
   {backup_usage}                 # 本地状态快照
   {restore_usage}                # 从快照回滚（仅本地）
@@ -847,8 +850,13 @@ impl Client {
 
     /// 同 req，但不把失败写进 FAIL_CODE，并把 HTTP 状态码交给调用方判定。
     fn req_status(&self, path: &str) -> (u16, Result<Value, String>) {
+        self.req_status_timeout(path, Duration::from_secs(60))
+    }
+
+    /// doctor 专用：`--timeout` 只作用于探活，避免宕机端口上挂住整个体检。
+    fn req_status_timeout(&self, path: &str, timeout: Duration) -> (u16, Result<Value, String>) {
         let url = format!("{}{}", self.base.trim_end_matches('/'), path);
-        let mut r = ureq::get(&url).timeout(Duration::from_secs(60));
+        let mut r = ureq::get(&url).timeout(timeout);
         if let Some(t) = &self.token {
             r = r.set("x-roamway-token", t);
         }
@@ -1126,6 +1134,7 @@ fn print_command_help(cmd: &str) -> bool {
         "prune" => USAGE_PRUNE,
         "backup" => USAGE_BACKUP,
         "restore" => USAGE_RESTORE,
+        "doctor" => USAGE_DOCTOR,
         "jobs" => "roamway jobs",
         "jobs-add" => "roamway jobs-add --agent shell --every 3600 | --daily 08:30 [--model M] [--workspace DIR] [--max-retries 2] [--after JOB]... \"prompt\"",
         "jobs-run" => "roamway jobs-run ID",
@@ -1156,6 +1165,11 @@ fn dispatch(argv: &[String]) -> i32 {
     let parsed = parse_args(argv);
     let (flags, pos) = (parsed.flags, parsed.pos);
     if let Some(first) = parsed.unknown.first() {
+        if pos.first().map(String::as_str) == Some("doctor") {
+            eprintln!("unknown flag: {}", first);
+            eprintln!("usage: {}", USAGE_DOCTOR);
+            return 4;
+        }
         eprintln!("unknown flag: {}", first);
         eprintln!("pass it after '--' if it is part of the prompt");
         eprintln!("run 'roamway help' for usage");
@@ -1259,6 +1273,7 @@ fn dispatch(argv: &[String]) -> i32 {
         "jobs-run" => cmd_jobs_run(&flags, &cmd_pos),
         "jobs-rm" => cmd_jobs_rm(&flags, &cmd_pos),
         "health" => cmd_health(&flags),
+        "doctor" => cmd_doctor(&flags, &cmd_pos),
         "host" => cmd_host(&flags, &cmd_pos),
         "token" => cmd_token(&flags, &cmd_pos),
         "pair" => cmd_pair(&flags),
@@ -1424,6 +1439,10 @@ fn cmd_serve(flags: &HashMap<String, String>) {
         conns: AtomicUsize::new(0),
         req_total: AtomicU64::new(0),
         req_failed: AtomicU64::new(0),
+        req_us: AtomicU64::new(0),
+        req_max_us: AtomicU64::new(0),
+        req_4xx: AtomicU64::new(0),
+        req_5xx: AtomicU64::new(0),
 
         tokens: Mutex::new(token_store),
         approvals: Mutex::new(approval_store),
@@ -4961,6 +4980,396 @@ fn cmd_daemon_status(flags: &HashMap<String, String>) {
     );
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DoctorStatus {
+    Pass,
+    Warn,
+    Fail,
+    Skip,
+}
+
+impl DoctorStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            DoctorStatus::Pass => "pass",
+            DoctorStatus::Warn => "warn",
+            DoctorStatus::Fail => "fail",
+            DoctorStatus::Skip => "skip",
+        }
+    }
+
+    fn upper(self) -> &'static str {
+        match self {
+            DoctorStatus::Pass => "PASS",
+            DoctorStatus::Warn => "WARN",
+            DoctorStatus::Fail => "FAIL",
+            DoctorStatus::Skip => "SKIP",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DoctorCheck {
+    id: String,
+    status: DoctorStatus,
+    detail: String,
+    hint: String,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct DoctorSummary {
+    pass: u32,
+    warn: u32,
+    fail: u32,
+    skip: u32,
+}
+
+impl DoctorSummary {
+    fn total(self) -> u32 {
+        self.pass + self.warn + self.fail + self.skip
+    }
+
+    fn ok(self) -> bool {
+        self.fail == 0
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct DoctorLiveInfo {
+    version: String,
+    uptime_s: i64,
+}
+
+fn doctor_check(id: &str, status: DoctorStatus, detail: &str, hint: &str) -> DoctorCheck {
+    DoctorCheck {
+        id: id.to_string(),
+        status,
+        detail: detail.to_string(),
+        hint: hint.to_string(),
+    }
+}
+
+fn doctor_summarize(checks: &[DoctorCheck]) -> DoctorSummary {
+    let mut s = DoctorSummary::default();
+    for c in checks {
+        match c.status {
+            DoctorStatus::Pass => s.pass += 1,
+            DoctorStatus::Warn => s.warn += 1,
+            DoctorStatus::Fail => s.fail += 1,
+            DoctorStatus::Skip => s.skip += 1,
+        }
+    }
+    s
+}
+
+fn doctor_exit_code(summary: DoctorSummary, strict: bool) -> i32 {
+    if summary.fail > 0 || (strict && summary.warn > 0) {
+        3
+    } else {
+        0
+    }
+}
+
+fn doctor_report_json(data: &Path, checks: &[DoctorCheck]) -> Value {
+    let summary = doctor_summarize(checks);
+    json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "data": data.to_string_lossy().to_string(),
+        "ok": summary.ok(),
+        "checks": checks.iter().map(|c| json!({
+            "id": c.id,
+            "status": c.status.as_str(),
+            "detail": c.detail,
+            "hint": c.hint,
+        })).collect::<Vec<_>>(),
+        "summary": {
+            "pass": summary.pass,
+            "warn": summary.warn,
+            "fail": summary.fail,
+            "skip": summary.skip,
+        },
+    })
+}
+
+fn doctor_text(data: &Path, checks: &[DoctorCheck]) -> String {
+    let binary = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "-".to_string());
+    let mut out = format!(
+        "roamway doctor {}    data {}    binary {}\n",
+        env!("CARGO_PKG_VERSION"),
+        data.display(),
+        binary
+    );
+    for c in checks {
+        out.push_str(&format!("{} {:<10} {}\n", c.status.upper(), c.id, c.detail));
+    }
+    let s = doctor_summarize(checks);
+    out.push_str(&format!(
+        "{} pass, {} warn, {} fail, {} skip\n",
+        s.pass, s.warn, s.fail, s.skip
+    ));
+    out
+}
+
+fn run_checks(
+    data: &Path,
+    cfg_bind: &str,
+    alive: &dyn Fn(u32) -> bool,
+    probe: &dyn Fn(&str) -> Option<DoctorLiveInfo>,
+) -> Vec<DoctorCheck> {
+    let mut checks = Vec::with_capacity(8);
+
+    checks.push(match config::load(data) {
+        Ok(_) => {
+            let detail = if data.join("config.json").is_file() {
+                "config.json ok".to_string()
+            } else {
+                "config.json missing (defaults)".to_string()
+            };
+            doctor_check("config", DoctorStatus::Pass, &detail, "")
+        }
+        Err(e) => doctor_check(
+            "config",
+            DoctorStatus::Fail,
+            &e,
+            "delete or fix config.json",
+        ),
+    });
+
+    let probe_file = data.join(".doctor-probe");
+    let created = if data.is_dir() {
+        std::fs::File::create(&probe_file).and_then(|mut f| f.write_all(b"doctor"))
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "data dir missing",
+        ))
+    };
+    let removed = std::fs::remove_file(&probe_file);
+    let data_detail = if created.is_ok() && removed.is_ok() {
+        "writable".to_string()
+    } else if !data.is_dir() {
+        "data dir does not exist".to_string()
+    } else {
+        "writable probe failed".to_string()
+    };
+    checks.push(doctor_check(
+        "data_dir",
+        if created.is_ok() && removed.is_ok() {
+            DoctorStatus::Pass
+        } else {
+            DoctorStatus::Fail
+        },
+        &data_detail,
+        &format!("chmod u+w {} / check disk full", data.display()),
+    ));
+
+    checks.push(match backup::writer_lock_owner(data) {
+        None => doctor_check(
+            "writer",
+            DoctorStatus::Pass,
+            "no writer lock (daemon not running)",
+            "",
+        ),
+        Some((pid, bind)) if alive(pid) => doctor_check(
+            "writer",
+            DoctorStatus::Pass,
+            &format!("writer pid {} bind {}", pid, bind),
+            "",
+        ),
+        Some((pid, _)) => doctor_check(
+            "writer",
+            DoctorStatus::Warn,
+            &format!("stale writer lock (pid {} not running)", pid),
+            "next serve can auto-recover; or rm <data>/roamway.lock",
+        ),
+    });
+
+    checks.push(match backup::pid_file_owner(data) {
+        None => doctor_check("pid_file", DoctorStatus::Pass, "no pid file", ""),
+        Some(pid) if alive(pid) => {
+            doctor_check("pid_file", DoctorStatus::Pass, &format!("pid {}", pid), "")
+        }
+        Some(pid) => doctor_check(
+            "pid_file",
+            DoctorStatus::Warn,
+            &format!("stale pid file (pid {} not running)", pid),
+            "roamway daemon stop or rm <data>/roamway.pid",
+        ),
+    });
+
+    checks.push(match inspect_store_health(data) {
+        StoreHealth::Fresh => doctor_check("store", DoctorStatus::Pass, "fresh", ""),
+        StoreHealth::Ok => doctor_check("store", DoctorStatus::Pass, "ok", ""),
+        StoreHealth::Recovered => doctor_check(
+            "store",
+            DoctorStatus::Warn,
+            "recovered",
+            "restore from <data>/state.json.bak or backups",
+        ),
+        StoreHealth::Unrecoverable => doctor_check(
+            "store",
+            DoctorStatus::Fail,
+            "unrecoverable",
+            "restore from <data>/state.json.bak or backups",
+        ),
+    });
+
+    let (effective_bind, bind_source, live_pid, _stale_pid) = status_target(data, cfg_bind, alive);
+    checks.push(if bind_parts(&effective_bind).is_some() {
+        doctor_check(
+            "bind",
+            DoctorStatus::Pass,
+            &format!("{} ({})", effective_bind, bind_source),
+            "",
+        )
+    } else {
+        doctor_check(
+            "bind",
+            DoctorStatus::Fail,
+            &format!("{} is not a usable host:port", effective_bind),
+            "fix config.json bind or --bind",
+        )
+    });
+
+    let probe_result: Option<Option<DoctorLiveInfo>> = live_pid.map(|_| probe(&effective_bind));
+    checks.push(match (live_pid, &probe_result) {
+        (None, _) => doctor_check(
+            "live",
+            DoctorStatus::Skip,
+            "no live pid",
+            "roamway daemon start",
+        ),
+        (Some(pid), Some(Some(info))) => doctor_check(
+            "live",
+            DoctorStatus::Pass,
+            &format!(
+                "pid {} live version {} uptime {}s",
+                pid, info.version, info.uptime_s
+            ),
+            "",
+        ),
+        (Some(_), _) => doctor_check(
+            "live",
+            DoctorStatus::Fail,
+            &format!("healthz unreachable at {}", effective_bind),
+            "check roamway logs / systemd journalctl",
+        ),
+    });
+    checks.push(match probe_result {
+        None => doctor_check("version", DoctorStatus::Skip, "no live pid", ""),
+        Some(None) => doctor_check("version", DoctorStatus::Skip, "no live health", ""),
+        Some(Some(info)) => {
+            if info.version == env!("CARGO_PKG_VERSION") {
+                doctor_check(
+                    "version",
+                    DoctorStatus::Pass,
+                    &format!("binary {} live {}", env!("CARGO_PKG_VERSION"), info.version),
+                    "",
+                )
+            } else {
+                doctor_check(
+                    "version",
+                    DoctorStatus::Fail,
+                    &format!("binary {} live {}", env!("CARGO_PKG_VERSION"), info.version),
+                    "redeploy then daemon restart",
+                )
+            }
+        }
+    });
+
+    checks
+}
+
+fn cmd_doctor(flags: &HashMap<String, String>, pos: &[String]) {
+    if !pos.is_empty() {
+        eprintln!("usage: {}", USAGE_DOCTOR);
+        fail(4);
+        return;
+    }
+    for key in flags.keys() {
+        match key.as_str() {
+            "data" | "home" | "json" | "strict" | "timeout" => {}
+            other => {
+                eprintln!("unknown flag: --{}", other);
+                eprintln!("usage: {}", USAGE_DOCTOR);
+                fail(4);
+                return;
+            }
+        }
+    }
+    let timeout_secs: u64 = match flags.get("timeout") {
+        None => 5,
+        Some(v) => match v.parse() {
+            Ok(n) if n > 0 => n,
+            _ => {
+                eprintln!("--timeout must be a positive integer");
+                eprintln!("usage: {}", USAGE_DOCTOR);
+                fail(4);
+                return;
+            }
+        },
+    };
+    let data = data_dir_for(flags);
+    if flags.contains_key("data") {
+        match std::fs::metadata(&data) {
+            Ok(meta) if meta.is_dir() => {}
+            _ => {
+                eprintln!("--data: no such directory: {}", data.display());
+                eprintln!("usage: {}", USAGE_DOCTOR);
+                fail(4);
+                return;
+            }
+        }
+    }
+    let cfg_bind = resolved_config(flags)
+        .ok()
+        .map(|c| c.bind)
+        .unwrap_or_default();
+    let probe = |bind: &str| -> Option<DoctorLiveInfo> {
+        let client = Client {
+            base: status_probe_base(bind),
+            token: None,
+        };
+        match client.req_status_timeout("/healthz", Duration::from_secs(timeout_secs)) {
+            (200, Ok(v)) => Some(DoctorLiveInfo {
+                version: v
+                    .get("version")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                uptime_s: v.get("uptime_s").and_then(Value::as_i64).unwrap_or(0),
+            }),
+            _ => None,
+        }
+    };
+    let checks = run_checks(
+        &data,
+        &cfg_bind,
+        &(backup::process_alive as fn(u32) -> bool),
+        &probe,
+    );
+    if flags.contains_key("json") {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&doctor_report_json(&data, &checks)).unwrap_or_default()
+        );
+    } else {
+        print!("{}", doctor_text(&data, &checks));
+    }
+    let summary = doctor_summarize(&checks);
+    debug_assert_eq!(
+        summary.total(),
+        checks.len() as u32,
+        "every check must be classified"
+    );
+    let code = doctor_exit_code(summary, flags.contains_key("strict"));
+    if code != 0 {
+        fail(code);
+    }
+}
+
 fn cmd_daemon_config(flags: &HashMap<String, String>, pos: &[String]) {
     let data = data_dir_for(flags);
     let sub = pos.get(1).map(String::as_str).unwrap_or("show");
@@ -5918,6 +6327,10 @@ pub mod test_support {
             conns: AtomicUsize::new(0),
             req_total: AtomicU64::new(0),
             req_failed: AtomicU64::new(0),
+            req_us: AtomicU64::new(0),
+            req_max_us: AtomicU64::new(0),
+            req_4xx: AtomicU64::new(0),
+            req_5xx: AtomicU64::new(0),
 
             tokens: Mutex::new(auth::TokenStore::load(dir)),
             approvals: Mutex::new(auth::ApprovalStore::load(dir)),
@@ -6647,5 +7060,197 @@ mod tests {
             "backup --keep -1 must be rejected with exit 2"
         );
         FAIL_CODE.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn doctor_temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("roamway-{}-{}", tag, now()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn doctor_check_by_id<'a>(checks: &'a [DoctorCheck], id: &str) -> &'a DoctorCheck {
+        checks
+            .iter()
+            .find(|c| c.id == id)
+            .unwrap_or_else(|| panic!("missing doctor check {}", id))
+    }
+
+    #[test]
+    fn doctor_bad_config_json_is_fail() {
+        let dir = doctor_temp_dir("doctor-bad-config");
+        std::fs::write(dir.join("config.json"), b"{").unwrap();
+        let checks = run_checks(&dir, "127.0.0.1:8796", &|_| false, &|_| None);
+        assert_eq!(
+            doctor_check_by_id(&checks, "config").status,
+            DoctorStatus::Fail
+        );
+        assert!(doctor_summarize(&checks).fail >= 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn doctor_unwritable_data_dir_is_fail_and_probe_removed() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = doctor_temp_dir("doctor-readonly-dir");
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+            let checks = run_checks(&dir, "127.0.0.1:8796", &|_| false, &|_| None);
+            assert_eq!(
+                doctor_check_by_id(&checks, "data_dir").status,
+                DoctorStatus::Fail
+            );
+            assert!(!dir.join(".doctor-probe").exists());
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        #[cfg(not(unix))]
+        {
+            let dir = std::env::temp_dir().join(format!(
+                "roamway-doctor-absent-{}-{}",
+                now(),
+                std::process::id()
+            ));
+            let checks = run_checks(&dir, "127.0.0.1:8796", &|_| false, &|_| None);
+            assert_eq!(
+                doctor_check_by_id(&checks, "data_dir").status,
+                DoctorStatus::Fail
+            );
+            assert!(!dir.join(".doctor-probe").exists());
+        }
+    }
+
+    #[test]
+    fn doctor_clean_dir_is_fresh_and_live_skipped() {
+        let dir = doctor_temp_dir("doctor-clean");
+        let checks = run_checks(&dir, "127.0.0.1:8796", &|_| false, &|_| None);
+        assert_eq!(doctor_check_by_id(&checks, "store").detail, "fresh");
+        assert_eq!(
+            doctor_check_by_id(&checks, "live").status,
+            DoctorStatus::Skip
+        );
+        assert_eq!(
+            doctor_check_by_id(&checks, "version").status,
+            DoctorStatus::Skip
+        );
+        let summary = doctor_summarize(&checks);
+        assert!(summary.pass >= 4);
+        assert_eq!(summary.fail, 0);
+        assert_eq!(summary.total(), 8);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn doctor_stale_pid_file_warns_without_failing() {
+        let dir = doctor_temp_dir("doctor-stale-pid");
+        std::fs::write(dir.join("roamway.pid"), b"4294967295\n").unwrap();
+        let alive = |pid: u32| pid != 4294967295;
+        let checks = run_checks(&dir, "127.0.0.1:8796", &alive, &|_| None);
+        assert_eq!(
+            doctor_check_by_id(&checks, "pid_file").status,
+            DoctorStatus::Warn
+        );
+        let summary = doctor_summarize(&checks);
+        assert_eq!(summary.fail, 0);
+        assert_eq!(doctor_exit_code(summary, false), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn doctor_bad_state_json_is_unrecoverable_fail() {
+        let dir = doctor_temp_dir("doctor-bad-state");
+        std::fs::write(dir.join("state.json"), b"{").unwrap();
+        let checks = run_checks(&dir, "127.0.0.1:8796", &|_| false, &|_| None);
+        let store = doctor_check_by_id(&checks, "store");
+        assert_eq!(store.detail, "unrecoverable");
+        assert_eq!(store.status, DoctorStatus::Fail);
+        assert!(doctor_summarize(&checks).fail >= 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn doctor_version_mismatch_is_fail_when_live() {
+        let dir = doctor_temp_dir("doctor-version-mismatch");
+        std::fs::write(dir.join("roamway.pid"), b"42\n").unwrap();
+        let alive = |pid: u32| pid == 42;
+        let probe = |_bind: &str| {
+            Some(DoctorLiveInfo {
+                version: "0.0.1".to_string(),
+                uptime_s: 1,
+            })
+        };
+        let checks = run_checks(&dir, "127.0.0.1:8796", &alive, &probe);
+        assert_eq!(
+            doctor_check_by_id(&checks, "live").status,
+            DoctorStatus::Pass
+        );
+        assert_eq!(
+            doctor_check_by_id(&checks, "version").status,
+            DoctorStatus::Fail
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn doctor_probe_unreachable_fails_live_and_skips_version() {
+        let dir = doctor_temp_dir("doctor-probe-none");
+        std::fs::write(dir.join("roamway.pid"), b"42\n").unwrap();
+        let alive = |pid: u32| pid == 42;
+        let probe = |_bind: &str| None;
+        let checks = run_checks(&dir, "127.0.0.1:8796", &alive, &probe);
+        assert_eq!(
+            doctor_check_by_id(&checks, "live").status,
+            DoctorStatus::Fail
+        );
+        assert_eq!(
+            doctor_check_by_id(&checks, "version").status,
+            DoctorStatus::Skip
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn doctor_exit_code_warn_only_depends_on_strict() {
+        let summary = DoctorSummary {
+            pass: 0,
+            warn: 1,
+            fail: 0,
+            skip: 7,
+        };
+        assert_eq!(doctor_exit_code(summary, false), 0);
+        assert_eq!(doctor_exit_code(summary, true), 3);
+    }
+
+    #[test]
+    fn doctor_summary_totals_eight_and_ok_matches_no_fail() {
+        let dir = doctor_temp_dir("doctor-summary-invariant");
+        let checks = run_checks(&dir, "127.0.0.1:8796", &|_| false, &|_| None);
+        let summary = doctor_summarize(&checks);
+        assert_eq!(summary.total(), 8);
+        assert_eq!(summary.ok(), summary.fail == 0);
+
+        std::fs::write(dir.join("state.json"), b"{bad").unwrap();
+        let checks = run_checks(&dir, "127.0.0.1:8796", &|_| false, &|_| None);
+        let summary = doctor_summarize(&checks);
+        assert_eq!(summary.total(), 8);
+        assert_eq!(summary.ok(), summary.fail == 0);
+        assert!(!summary.ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn doctor_json_report_has_expected_keys() {
+        let dir = doctor_temp_dir("doctor-json-report");
+        let checks = run_checks(&dir, "127.0.0.1:8796", &|_| false, &|_| None);
+        let text = serde_json::to_string(&doctor_report_json(&dir, &checks)).unwrap();
+        let value: Value = serde_json::from_str(&text).unwrap();
+        for key in ["version", "data", "ok", "checks", "summary"] {
+            assert!(value.get(key).is_some(), "missing key {}", key);
+        }
+        assert_eq!(value["version"], json!(env!("CARGO_PKG_VERSION")));
+        assert_eq!(value["data"], json!(dir.to_string_lossy()));
+        assert_eq!(value["checks"].as_array().map(Vec::len), Some(8));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
