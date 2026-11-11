@@ -973,7 +973,7 @@ fn finalize(
         .filter(|j| j.starts_with("sch_"))
         .map(str::to_string);
     if let Some(jid) = job_id {
-        let bad = matches!(status, RunStatus::Failed | RunStatus::Timeout);
+        let bad = matches!(result_status, RunStatus::Failed | RunStatus::Timeout);
         let t = now();
         let tz = st
             .state
@@ -984,8 +984,9 @@ fn finalize(
             .unwrap_or(app.tz_offset_hours);
         if let Some(j) = st.state.jobs.iter_mut().find(|j| j.id == jid) {
             if bad {
-                crate::jobs::apply_failure(j, t, tz, &format!("{:?}", status));
-            } else {
+                crate::jobs::apply_failure(j, t, tz, &format!("{:?}", result_status));
+            } else if result_status != RunStatus::Killed {
+                // Killed（用户 stop）既不记失败也不清历史计数，job 状态保持原样。
                 j.attempts = 0;
                 j.last_error = None;
             }
@@ -1040,6 +1041,92 @@ mod tests {
         assert!(build_command_with_session(&sample_run("rm -rf /"), None, None).is_err());
         assert!(build_command_with_session(&sample_run("shell"), None, None).is_ok());
         assert!(build_command_with_session(&sample_run("codex"), None, None).is_ok());
+    }
+
+    #[test]
+    fn finalize_killed_run_skips_failure_propagation() {
+        let dir = std::env::temp_dir().join(format!("roamway-killed-finalize-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut run = sample_run("shell");
+        run.status = RunStatus::Killed;
+        run.job_id = Some("job_000001".into());
+        let job = Job {
+            id: "job_000001".into(),
+            title: String::new(),
+            agent: "shell".into(),
+            model: None,
+            workspace: String::new(),
+            prompt: "echo hi".into(),
+            every_secs: Some(60),
+            daily: None,
+            tz_offset_hours: 8,
+            timeout_s: 60,
+            max_retries: 2,
+            enabled: true,
+            allow_overlap: false,
+            next_at: 0,
+            last_run: None,
+            last_error: None,
+            attempts: 0,
+            depends_on: vec![],
+            last_skip: None,
+        };
+        let store = Store {
+            dir: dir.clone(),
+            state: State {
+                runs: vec![run],
+                jobs: vec![job],
+                agents: vec![],
+                seq: 1,
+            },
+            loaded_ok: true,
+            store_health: StoreHealth::Ok,
+            preserve_backup: false,
+            last_write_hash: 0,
+            writes_total: 0,
+            writes_skipped: 0,
+        };
+        let app = Arc::new(App {
+            store: Mutex::new(store),
+            schedules: Mutex::new(Default::default()),
+            terms: Mutex::new(Default::default()),
+            term_rt: Mutex::new(Default::default()),
+            token: None,
+            started: now(),
+            cancels: Mutex::new(Default::default()),
+            tz_offset_hours: 8,
+            max_concurrent: 4,
+            max_conn: 64,
+            keep_runs: 500,
+            keep_days: 0,
+            max_log_bytes: 4_194_304,
+            conns: std::sync::atomic::AtomicUsize::new(0),
+            req_total: std::sync::atomic::AtomicU64::new(0),
+            req_failed: std::sync::atomic::AtomicU64::new(0),
+            req_us: std::sync::atomic::AtomicU64::new(0),
+            req_max_us: std::sync::atomic::AtomicU64::new(0),
+            req_4xx: std::sync::atomic::AtomicU64::new(0),
+            req_5xx: std::sync::atomic::AtomicU64::new(0),
+            tokens: Mutex::new(Default::default()),
+            approvals: Mutex::new(Default::default()),
+            passwords: Mutex::new(Default::default()),
+            pairings: Mutex::new(Default::default()),
+            hub_rt: Mutex::new(Default::default()),
+            allow_hosts: vec![],
+            allow_origins: vec![],
+            require_approval: vec![],
+            bind_host: "127.0.0.1".into(),
+            unix_socket: None,
+            tls_cert: None,
+            tls_key: None,
+        });
+        // 传入 status=Failed，但 run 已被 stop 判 Killed：不得触发失败重试。
+        finalize(&app, "run_000001", RunStatus::Failed, Some(1), Some("boom".into()), None);
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(st.state.jobs[0].attempts, 0, "Killed 的 run 不应触发失败重试");
+        assert_eq!(st.state.jobs[0].last_error, None);
+        assert_eq!(st.state.runs[0].status, RunStatus::Killed);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(target_os = "linux")]

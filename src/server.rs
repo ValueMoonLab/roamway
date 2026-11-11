@@ -22,6 +22,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 pub fn serve(app: Arc<App>, bind: &str) -> std::io::Result<()> {
+    if app.tls_cert.is_some() || app.tls_key.is_some() {
+        // TLS 未实现：明确拒绝启动，避免静默降级为明文 HTTP。
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--tls-cert/--tls-key requested but TLS is not implemented in this build; refusing to serve plain HTTP",
+        ));
+    }
     let listener = TcpListener::bind(bind)?;
     let actual = listener
         .local_addr()
@@ -41,13 +48,6 @@ pub fn serve(app: Arc<App>, bind: &str) -> std::io::Result<()> {
             eprintln!("roamway: write token failed: {}", e);
         }
     }
-    if app.tls_cert.is_some() || app.tls_key.is_some() {
-        // TODO: TLS is intentionally not implemented yet. rustls-pemfile is not
-        // available in the offline vendor cache; wiring rustls without it would
-        // risk the default build. Serving plain HTTP keeps previous behavior.
-        eprintln!("roamway: warning: --tls-cert/--tls-key requested but TLS is not implemented in this build; serving plain HTTP");
-    }
-
     #[cfg(unix)]
     if let Some(path) = app.unix_socket.clone() {
         let listener = match bind_unix_listener(&path) {
@@ -101,8 +101,13 @@ pub fn serve(app: Arc<App>, bind: &str) -> std::io::Result<()> {
 
 #[cfg(unix)]
 fn bind_unix_listener(path: &Path) -> std::io::Result<std::os::unix::net::UnixListener> {
-    let listener = std::os::unix::net::UnixListener::bind(path)?;
     use std::os::unix::fs::PermissionsExt;
+    // bind 前先收紧 umask，避免 bind→chmod 窗口内其他本地用户可连接（socket mode 受 umask 影响）。
+    let old_umask = unsafe { libc::umask(0o077) };
+    let res = std::os::unix::net::UnixListener::bind(path);
+    unsafe { libc::umask(old_umask) };
+    let listener = res?;
+    // 双保险：仍显式 chmod 0600（保持原行为）。
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     Ok(listener)
 }
@@ -147,6 +152,8 @@ enum ReadOutcome {
     Eof,
     HeaderTimeout,
     BodyTooLarge,
+    BodyTimeout,
+    BadRequest,
 }
 
 trait Conn: Read + Write {
@@ -181,6 +188,13 @@ fn find_sub(hay: &[u8], needle: &[u8]) -> Option<usize> {
 }
 
 fn read_req<C: Conn>(s: &mut C) -> std::io::Result<ReadOutcome> {
+    read_req_with_budget(s, Duration::from_secs(30))
+}
+
+fn read_req_with_budget<C: Conn>(
+    s: &mut C,
+    body_budget: Duration,
+) -> std::io::Result<ReadOutcome> {
     const MAX_HEADER: usize = 64 * 1024;
     const MAX_BODY: usize = 1024 * 1024;
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -224,9 +238,15 @@ fn read_req<C: Conn>(s: &mut C) -> std::io::Result<ReadOutcome> {
     let target = parts.next().unwrap_or("/").to_string();
 
     let mut headers = HashMap::new();
+    let mut content_lengths: Vec<String> = Vec::new();
     for l in lines {
         if let Some((k, v)) = l.split_once(':') {
-            headers.insert(k.trim().to_lowercase(), v.trim().to_string());
+            let key = k.trim().to_lowercase();
+            let val = v.trim().to_string();
+            if key == "content-length" {
+                content_lengths.push(val.clone());
+            }
+            headers.insert(key, val);
         }
     }
 
@@ -235,22 +255,55 @@ fn read_req<C: Conn>(s: &mut C) -> std::io::Result<ReadOutcome> {
         None => (target.clone(), String::new(), HashMap::new()),
     };
 
-    let len: usize = headers
-        .get("content-length")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    // Content-Length：重复头值不一致或非法值都拒绝（400），不再静默当 0。
+    let len: usize = if content_lengths.is_empty() {
+        0
+    } else {
+        let mut parsed: Option<usize> = None;
+        for v in &content_lengths {
+            let n: usize = match v.parse() {
+                Ok(n) => n,
+                Err(_) => return Ok(ReadOutcome::BadRequest),
+            };
+            match parsed {
+                None => parsed = Some(n),
+                Some(p) if p != n => return Ok(ReadOutcome::BadRequest),
+                Some(_) => {}
+            }
+        }
+        parsed.unwrap()
+    };
     if len > MAX_BODY {
         return Ok(ReadOutcome::BodyTooLarge);
     }
-    s.set_read_timeout_opt(Some(Duration::from_secs(30)))?;
+    // body 读取设总 deadline：不再让每 29s 发 1 字节的慢速客户端无限占用连接槽。
+    let body_deadline = Instant::now() + body_budget;
     let want = len;
     let mut body = buf[head_end + 4..].to_vec();
     while body.len() < want {
-        let n = s.read(&mut tmp)?;
-        if n == 0 {
-            break;
+        let remaining = body_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(ReadOutcome::BodyTimeout);
         }
-        body.extend_from_slice(&tmp[..n]);
+        s.set_read_timeout_opt(Some(remaining))?;
+        match s.read(&mut tmp) {
+            Ok(n) => {
+                if n == 0 {
+                    break;
+                }
+                body.extend_from_slice(&tmp[..n]);
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::TimedOut
+                    || e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                if Instant::now() >= body_deadline {
+                    return Ok(ReadOutcome::BodyTimeout);
+                }
+                continue;
+            }
+            Err(e) => return Err(e),
+        }
     }
     body.truncate(want);
 
@@ -764,6 +817,12 @@ fn handle<C: Conn>(app: Arc<App>, mut s: C) -> std::io::Result<()> {
         }
         ReadOutcome::BodyTooLarge => {
             return fail_json(&app, &mut s, 413, &json!({"error": "body too large"}), &[])
+        }
+        ReadOutcome::BodyTimeout => {
+            return fail_json(&app, &mut s, 408, &json!({"error": "request timeout"}), &[])
+        }
+        ReadOutcome::BadRequest => {
+            return fail_json(&app, &mut s, 400, &json!({"error": "bad request"}), &[])
         }
     };
 
@@ -4196,6 +4255,98 @@ mod tests {
         let outcome = read_req(&mut s).unwrap();
         assert!(matches!(outcome, ReadOutcome::HeaderTimeout));
         sender.join().unwrap();
+    }
+
+    #[test]
+    fn invalid_content_length_reads_as_bad_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sender = thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            c.write_all(b"POST /v1/runs HTTP/1.1\r\nHost: x\r\nContent-Length: abc\r\n\r\n")
+                .unwrap();
+            let _ = c.shutdown(std::net::Shutdown::Write);
+        });
+        let (mut s, _) = listener.accept().unwrap();
+        let outcome = read_req(&mut s).unwrap();
+        assert!(matches!(outcome, ReadOutcome::BadRequest));
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn conflicting_duplicate_content_length_reads_as_bad_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sender = thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            c.write_all(
+                b"POST /v1/runs HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello",
+            )
+            .unwrap();
+            let _ = c.shutdown(std::net::Shutdown::Write);
+        });
+        let (mut s, _) = listener.accept().unwrap();
+        let outcome = read_req(&mut s).unwrap();
+        assert!(matches!(outcome, ReadOutcome::BadRequest));
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn consistent_duplicate_content_length_is_accepted() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sender = thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            c.write_all(
+                b"POST /v1/runs HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello",
+            )
+            .unwrap();
+            let _ = c.shutdown(std::net::Shutdown::Write);
+        });
+        let (mut s, _) = listener.accept().unwrap();
+        match read_req(&mut s).unwrap() {
+            ReadOutcome::Req(r) => assert_eq!(r.body, b"hello".to_vec()),
+            _ => panic!("expected Req"),
+        }
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn body_read_has_total_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let sender = thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            c.write_all(b"POST /v1/runs HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\npartial")
+                .unwrap();
+            // 不关闭连接也不再发数据：慢速客户端必须被总 deadline 断开，
+            // 而不是等对端关闭或每次 read 重置 30s。
+            thread::sleep(Duration::from_millis(1500));
+        });
+        let (mut s, _) = listener.accept().unwrap();
+        let start = Instant::now();
+        // 生产路径时限 30s；测试注入 300ms 验证同一逻辑。
+        let outcome = read_req_with_budget(&mut s, Duration::from_millis(300)).unwrap();
+        assert!(matches!(outcome, ReadOutcome::BodyTimeout));
+        assert!(
+            start.elapsed() < Duration::from_millis(1400),
+            "应在总时限内超时，而非等到对端关闭"
+        );
+        sender.join().unwrap();
+    }
+
+    #[test]
+    fn serve_rejects_tls_args() {
+        let dir = std::env::temp_dir().join(format!("roamway-tls-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut app = match Arc::try_unwrap(test_app(&dir, "shell", RunStatus::Queued)) {
+            Ok(a) => a,
+            Err(_) => panic!("fresh arc has single owner"),
+        };
+        app.tls_cert = Some(std::path::PathBuf::from("/tmp/cert.pem"));
+        let res = serve(Arc::new(app), "127.0.0.1:0");
+        assert!(res.is_err(), "--tls-cert 给了参数必须报错退出而非明文");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
