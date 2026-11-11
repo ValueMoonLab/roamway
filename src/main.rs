@@ -4681,6 +4681,12 @@ fn cmd_daemon(flags: &HashMap<String, String>, pos: &[String]) {
     }
 }
 
+/// status 探活要连的 base URL：bind 可能是通配监听地址（`0.0.0.0`/`::`），
+/// 原样当 Host 会被服务端 421 misdirected request，必须映射到 loopback 再连。
+fn status_probe_base(bind: &str) -> String {
+    hosts::client_base_from_bind(bind)
+}
+
 /// status 的 bind/pid 判定抽成纯函数：alive 只回答 pid 是否存活，不碰端口。
 /// 返回 (effective_bind, bind_source, pid, stale_pid)；pid 为 None 表示不要联网。
 fn status_target(
@@ -4866,7 +4872,7 @@ fn cmd_daemon_status(flags: &HashMap<String, String>) {
             None => Value::Null,
         };
         let client = Client {
-            base: hosts::endpoint_normalize(&effective_bind),
+            base: status_probe_base(&effective_bind),
             token: local_token(flags),
         };
         match client.req_status("/health") {
@@ -6122,6 +6128,17 @@ mod tests {
         assert_eq!(pid, None);
         assert_eq!(stale, None);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_probe_base_maps_wildcard_bind_to_loopback() {
+        // 生产 bind 是 0.0.0.0:8796：拿它当 Host 会被 421，必须换 loopback。
+        assert_eq!(status_probe_base("0.0.0.0:8796"), "http://127.0.0.1:8796");
+        assert_eq!(status_probe_base("[::]:8796"), "http://127.0.0.1:8796");
+        assert_eq!(
+            status_probe_base("127.0.0.1:18812"),
+            "http://127.0.0.1:18812"
+        );
     }
 
     #[test]
