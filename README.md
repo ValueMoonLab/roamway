@@ -292,6 +292,24 @@ curl -s -H "x-roamway-token: $TOK" -H 'content-type: application/json' \
 | 单次不超时 | `timeout_s` 到点 kill，标 `timeout` |
 | 可观测 | `~/.roamway/heartbeat` 每 5 秒刷新；`/health` 与 `/v1/health` 汇总计数 |
 
+### `daemon status` 自证
+
+`roamway daemon status [--json]` 先读本地 `<data>`（writer lock / pid 文件 / 配置）再决定要不要联网，不猜端口。JSON 键：
+
+| 键 | 含义 |
+|---|---|
+| `ok` | 探活成功（`/health` 200 且 `/readyz` 未报 `state_unreadable`）；pid 文件陈旧恒 `false` |
+| `version` / `uptime_s` / `running` / `queued` | 活体 `/health` 真值，离线时为 `null` / `0` |
+| `pid` | 存活 daemon 的 pid；只有陈旧 pid 文件时为 `null` |
+| `stale_pid` | pid 文件里已死进程号（配合 `error: stale pid file (pid N not running)`） |
+| `effective_bind` / `bind_source` | 实际探活的监听地址及来源：`writer`（数据目录 writer lock，优先）/ `config`（`config.json`）/ `default` |
+| `ready` / `ready_reason` | `/readyz` 判定；`ready_reason` 形如 `state_unreadable` / `busy` |
+| `store` / `store_source` / `store_error` | 状态存储健康度 `fresh|ok|recovered|unrecoverable`；`store_source=live` 取自 `/readyz`，`offline` 表示仅本地体检 |
+| `writer` | `{pid, bind}`：数据目录单写者；`null` 表示无存活写者 |
+| `error` | 探活失败原因（离线、Host 被拒、pid 陈旧等） |
+
+探活 base 一律走 `hosts::client_base_from_bind`（wildcard `0.0.0.0`/`::` → loopback），否则会把 `Host: 0.0.0.0` 发出去吃 `421`，把活着的 daemon 报成离线。
+
 ## 部署
 
 ### systemd
