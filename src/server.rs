@@ -191,10 +191,7 @@ fn read_req<C: Conn>(s: &mut C) -> std::io::Result<ReadOutcome> {
     read_req_with_budget(s, Duration::from_secs(30))
 }
 
-fn read_req_with_budget<C: Conn>(
-    s: &mut C,
-    body_budget: Duration,
-) -> std::io::Result<ReadOutcome> {
+fn read_req_with_budget<C: Conn>(s: &mut C, body_budget: Duration) -> std::io::Result<ReadOutcome> {
     const MAX_HEADER: usize = 64 * 1024;
     const MAX_BODY: usize = 1024 * 1024;
     let deadline = Instant::now() + Duration::from_secs(10);

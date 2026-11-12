@@ -1121,9 +1121,19 @@ mod tests {
             tls_key: None,
         });
         // 传入 status=Failed，但 run 已被 stop 判 Killed：不得触发失败重试。
-        finalize(&app, "run_000001", RunStatus::Failed, Some(1), Some("boom".into()), None);
+        finalize(
+            &app,
+            "run_000001",
+            RunStatus::Failed,
+            Some(1),
+            Some("boom".into()),
+            None,
+        );
         let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
-        assert_eq!(st.state.jobs[0].attempts, 0, "Killed 的 run 不应触发失败重试");
+        assert_eq!(
+            st.state.jobs[0].attempts, 0,
+            "Killed 的 run 不应触发失败重试"
+        );
         assert_eq!(st.state.jobs[0].last_error, None);
         assert_eq!(st.state.runs[0].status, RunStatus::Killed);
         let _ = std::fs::remove_dir_all(&dir);
