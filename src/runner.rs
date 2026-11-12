@@ -1100,6 +1100,7 @@ mod tests {
             keep_runs: 500,
             keep_days: 0,
             max_log_bytes: 4_194_304,
+            queued_limit: 100,
             conns: std::sync::atomic::AtomicUsize::new(0),
             req_total: std::sync::atomic::AtomicU64::new(0),
             req_failed: std::sync::atomic::AtomicU64::new(0),

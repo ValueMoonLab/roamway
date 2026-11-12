@@ -168,6 +168,14 @@ pub fn spawn_from_job(app: Arc<App>, job_id: &str) {
             Some(j) => j,
             None => return,
         };
+        // queued 积压触顶：跳过本轮触发，记录原因，不无界新增 run。
+        if queued_full(&st.state, app.queued_limit) {
+            if let Some(jj) = st.state.jobs.iter_mut().find(|x| x.id == job_id) {
+                jj.last_skip = Some("queued_full".into());
+            }
+            st.save();
+            return;
+        }
         let id = st.next_id("run");
         st.state.runs.push(Run {
             id: id.clone(),
@@ -209,6 +217,19 @@ pub fn spawn_from_job(app: Arc<App>, job_id: &str) {
         st.save();
     };
     drain_queued(&app);
+}
+
+/// queued run 数是否已触顶（allow_overlap 积压防护）。limit=0 表示不限制。
+pub fn queued_full(state: &State, limit: usize) -> bool {
+    if limit == 0 {
+        return false;
+    }
+    state
+        .runs
+        .iter()
+        .filter(|r| r.status == RunStatus::Queued)
+        .count()
+        >= limit
 }
 
 /// 每轮从 Queued 里拾取，直到跑满 max_concurrent；手动 run 与 job run 一视同仁。
@@ -313,6 +334,29 @@ mod tests {
         assert_eq!(backoff(2), 60);
         assert_eq!(backoff(3), 120);
         assert_eq!(backoff(9), 3600);
+    }
+
+    #[test]
+    fn queued_full_counts_only_queued_and_zero_is_unlimited() {
+        let dir = std::env::temp_dir().join(format!("roamway-queuedfull-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut runs = vec![
+            mk_run("q1", RunStatus::Queued, 0),
+            mk_run("q2", RunStatus::Queued, 0),
+            mk_run("running", RunStatus::Running, 0),
+            mk_run("done", RunStatus::Done, 0),
+            mk_run("killed", RunStatus::Killed, 0),
+            mk_run("interrupted", RunStatus::Interrupted, 0),
+        ];
+        let st = store_with(dir.clone(), runs.clone());
+        assert!(!queued_full(&st.state, 3)); // 只有 2 条 queued
+        assert!(queued_full(&st.state, 2));
+        assert!(queued_full(&st.state, 1));
+        assert!(!queued_full(&st.state, 0)); // 0 = 不限制
+        runs.push(mk_run("q3", RunStatus::Queued, 0));
+        let st2 = store_with(dir.clone(), runs);
+        assert!(queued_full(&st2.state, 3));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn sample_job(max_retries: u32) -> Job {

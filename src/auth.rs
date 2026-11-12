@@ -451,22 +451,57 @@ pub struct TokenRecord {
 pub struct TokenStore {
     pub path: PathBuf,
     pub tokens: Vec<TokenRecord>,
+    /// tokens.json 落盘时的 mtime；读取路径检测到磁盘变化即重载，
+    /// 使 CLI revoke / 外部改文件无需重启立即生效。
+    mtime: Option<std::time::SystemTime>,
 }
 
 impl TokenStore {
     pub fn load(dir: &Path) -> TokenStore {
         let path = dir.join("tokens.json");
+        let mtime = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         let tokens = std::fs::read(&path)
             .ok()
             .and_then(|b| serde_json::from_slice::<Vec<TokenRecord>>(&b).ok())
             .unwrap_or_default();
-        TokenStore { path, tokens }
+        TokenStore {
+            path,
+            tokens,
+            mtime,
+        }
     }
 
-    pub fn save(&self) {
-        if let Ok(bytes) = serde_json::to_vec_pretty(&self.tokens) {
-            let _ = write_private(&self.path, &bytes);
+    /// 磁盘 mtime 与内存不一致时重载。重载后保留内存里更新的 last_used_at，
+    /// 不丢未落盘的新鲜度；删除的 token 随磁盘消失（revoke 立即生效）。
+    fn reload_if_changed(&mut self) {
+        let disk_mtime = std::fs::metadata(&self.path)
+            .and_then(|m| m.modified())
+            .ok();
+        if disk_mtime == self.mtime {
+            return;
         }
+        let mut disk = std::fs::read(&self.path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Vec<TokenRecord>>(&b).ok())
+            .unwrap_or_default();
+        for t in disk.iter_mut() {
+            if let Some(old) = self.tokens.iter().find(|o| o.id == t.id) {
+                if old.last_used_at > t.last_used_at {
+                    t.last_used_at = old.last_used_at;
+                }
+            }
+        }
+        self.tokens = disk;
+        self.mtime = disk_mtime;
+    }
+
+    pub fn save(&mut self) -> Result<(), String> {
+        let bytes = serde_json::to_vec_pretty(&self.tokens).map_err(|e| e.to_string())?;
+        write_private(&self.path, &bytes).map_err(|e| e.to_string())?;
+        self.mtime = std::fs::metadata(&self.path)
+            .and_then(|m| m.modified())
+            .ok();
+        Ok(())
     }
 
     pub fn create(
@@ -474,7 +509,7 @@ impl TokenStore {
         name: Option<String>,
         scopes: Vec<String>,
         ttl_secs: Option<i64>,
-    ) -> (String, String) {
+    ) -> Result<(String, String), String> {
         let plain = random_hex(32);
         let id = format!("tok_{}_{}", now(), &random_hex(4)[..6]);
         let name = name.unwrap_or_else(|| format!("token-{}", id));
@@ -488,25 +523,30 @@ impl TokenStore {
             expires_at: ttl_secs.and_then(|s| if s > 0 { Some(now() + s) } else { None }),
         };
         self.tokens.push(record);
-        self.save();
-        (id, plain)
+        if let Err(e) = self.save() {
+            self.tokens.pop();
+            return Err(e);
+        }
+        Ok((id, plain))
     }
 
-    pub fn revoke(&mut self, id: &str) -> bool {
+    pub fn revoke(&mut self, id: &str) -> Result<bool, String> {
         let before = self.tokens.len();
         self.tokens.retain(|t| t.id != id);
         let changed = self.tokens.len() != before;
         if changed {
-            self.save();
+            self.save()?;
         }
-        changed
+        Ok(changed)
     }
 
-    pub fn list(&self) -> Vec<TokenRecord> {
+    pub fn list(&mut self) -> Vec<TokenRecord> {
+        self.reload_if_changed();
         self.tokens.clone()
     }
 
     pub fn resolve(&mut self, plain: &str) -> Option<TokenRecord> {
+        self.reload_if_changed();
         let sha = sha256_hex(plain.as_bytes());
         let current = now();
         let mut found: Option<TokenRecord> = None;
@@ -523,7 +563,9 @@ impl TokenStore {
             }
         }
         if found.is_some() {
-            self.save();
+            if let Err(e) = self.save() {
+                eprintln!("roamway: token save failed: {}", e);
+            }
         }
         found
     }
@@ -866,7 +908,9 @@ mod tests {
         let mut store = TokenStore::load(&dir);
         // TTL 给足 60 秒：create 与 resolve 之间若跨秒（并行测试 + 慢 IO 的 CI runner），
         // 1 秒 TTL 会造成假过期。过期路径下面用手写 expires_at 覆盖，语义不变。
-        let (id, plain) = store.create(Some("n".into()), vec!["run".into()], Some(60));
+        let (id, plain) = store
+            .create(Some("n".into()), vec!["run".into()], Some(60))
+            .unwrap();
         assert!(id.starts_with("tok_"));
         assert!(store.resolve(&plain).is_some());
         assert!(store.resolve("wrong").is_none());
@@ -883,10 +927,42 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("roamway-auth-revoke-{}", now()));
         let _ = std::fs::create_dir_all(&dir);
         let mut store = TokenStore::load(&dir);
-        let (id, plain) = store.create(Some("n".into()), vec!["read".into()], None);
-        assert!(store.revoke(&id));
-        assert!(!store.revoke("missing"));
+        let (id, plain) = store
+            .create(Some("n".into()), vec!["read".into()], None)
+            .unwrap();
+        assert!(store.revoke(&id).unwrap());
+        assert!(!store.revoke("missing").unwrap());
         assert!(store.resolve(&plain).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn token_store_reloads_after_external_change() {
+        let dir = std::env::temp_dir().join(format!("roamway-auth-reload-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut store = TokenStore::load(&dir);
+        let (_id, plain) = store
+            .create(Some("n".into()), vec!["read".into()], None)
+            .unwrap();
+        assert!(store.resolve(&plain).is_some());
+        // 外部直接改写 tokens.json：删掉该 token（等价 CLI revoke）。
+        std::fs::write(dir.join("tokens.json"), "[]").unwrap();
+        // 不重启：再次 resolve 必须失败（热重载生效）。
+        assert!(store.resolve(&plain).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn token_store_save_fails_on_unwritable_path() {
+        let dir = std::env::temp_dir().join(format!("roamway-auth-noparent-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        // 父目录不存在：write_private 无法创建文件，save 必须返回 Err。
+        let mut store = TokenStore {
+            path: dir.join("missing-subdir").join("tokens.json"),
+            tokens: vec![],
+            mtime: None,
+        };
+        assert!(store.save().is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

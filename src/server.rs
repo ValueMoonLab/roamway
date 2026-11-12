@@ -1543,11 +1543,19 @@ fn login_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         return (401, json!({"error": "invalid password"}));
     }
     let mut st = app.tokens.lock().unwrap_or_else(|e| e.into_inner());
-    let (id, plain) = st.create(
+    let (id, plain) = match st.create(
         Some("login".into()),
         auth::ALL_SCOPES.iter().map(|s| s.to_string()).collect(),
         Some(auth::LOGIN_TTL_SECS),
-    );
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                500,
+                json!({ "error": format!("token persist failed: {}", e) }),
+            )
+        }
+    };
     (
         200,
         json!({
@@ -1571,11 +1579,19 @@ fn pair_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         return (401, json!({"error": e}));
     }
     let mut st = app.tokens.lock().unwrap_or_else(|e| e.into_inner());
-    let (id, plain) = st.create(
+    let (id, plain) = match st.create(
         Some("pair".into()),
         auth::ALL_SCOPES.iter().map(|s| s.to_string()).collect(),
         None,
-    );
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                500,
+                json!({ "error": format!("token persist failed: {}", e) }),
+            )
+        }
+    };
     (200, json!({"token": plain, "token_id": id}))
 }
 
@@ -2771,7 +2787,7 @@ fn providers_route(app: &Arc<App>) -> (u16, Value) {
 }
 
 fn list_tokens_route(app: &Arc<App>) -> (u16, Value) {
-    let st = app.tokens.lock().unwrap_or_else(|e| e.into_inner());
+    let mut st = app.tokens.lock().unwrap_or_else(|e| e.into_inner());
     (200, json!({ "tokens": st.list() }))
 }
 
@@ -2797,16 +2813,27 @@ fn create_token_route(app: &Arc<App>, req: &Req) -> (u16, Value) {
         spec.scopes
     };
     let mut st = app.tokens.lock().unwrap_or_else(|e| e.into_inner());
-    let (id, plain) = st.create(spec.name, scopes, spec.ttl_secs);
+    let (id, plain) = match st.create(spec.name, scopes, spec.ttl_secs) {
+        Ok(v) => v,
+        Err(e) => {
+            return (
+                500,
+                json!({ "error": format!("token persist failed: {}", e) }),
+            )
+        }
+    };
     (201, json!({ "token": plain, "id": id }))
 }
 
 fn revoke_token_route(app: &Arc<App>, id: &str) -> (u16, Value) {
     let mut st = app.tokens.lock().unwrap_or_else(|e| e.into_inner());
-    if st.revoke(id) {
-        (200, json!({ "ok": true, "revoked": id }))
-    } else {
-        (404, json!({ "error": "no such token" }))
+    match st.revoke(id) {
+        Ok(true) => (200, json!({ "ok": true, "revoked": id })),
+        Ok(false) => (404, json!({ "error": "no such token" })),
+        Err(e) => (
+            500,
+            json!({ "error": format!("token persist failed: {}", e) }),
+        ),
     }
 }
 
@@ -2929,6 +2956,19 @@ fn v1_health(app: &Arc<App>) -> Value {
         .iter()
         .filter(|r| matches!(r.status, RunStatus::Failed | RunStatus::Timeout))
         .count();
+    // 独立计数的 killed / interrupted；timeout 并入 failed（见文档）。
+    let killed = st
+        .state
+        .runs
+        .iter()
+        .filter(|r| r.status == RunStatus::Killed)
+        .count();
+    let interrupted = st
+        .state
+        .runs
+        .iter()
+        .filter(|r| r.status == RunStatus::Interrupted)
+        .count();
     json!({
         "ok": true,
         "version": env!("CARGO_PKG_VERSION"),
@@ -2936,7 +2976,7 @@ fn v1_health(app: &Arc<App>) -> Value {
         "uptime_s": now() - app.started,
         "running": running,
         "queued": queued,
-        "runs": {"total": st.state.runs.len(), "running": running, "queued": queued, "done": done, "failed": failed},
+        "runs": {"total": st.state.runs.len(), "running": running, "queued": queued, "done": done, "failed": failed, "killed": killed, "interrupted": interrupted},
         "jobs": {"total": st.state.jobs.len(), "enabled": st.state.jobs.iter().filter(|j| j.enabled).count()},
         "data_dir": st.dir.to_string_lossy(),
     })
@@ -3147,6 +3187,12 @@ fn create_run(app: &Arc<App>, req: &Req) -> (u16, Value) {
     };
     let run = {
         let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        if crate::jobs::queued_full(&st.state, app.queued_limit) {
+            return (
+                429,
+                json!({ "error": format!("queued run limit reached ({})", app.queued_limit) }),
+            );
+        }
         let id = st.next_id("run");
         let r = Run {
             id: id.clone(),
@@ -4033,6 +4079,7 @@ mod tests {
             keep_runs: 500,
             keep_days: 0,
             max_log_bytes: 4_194_304,
+            queued_limit: 100,
             max_conn: 64,
             conns: std::sync::atomic::AtomicUsize::new(0),
             req_total: std::sync::atomic::AtomicU64::new(0),
@@ -4141,6 +4188,7 @@ mod tests {
             keep_runs: 500,
             keep_days: 0,
             max_log_bytes: 4_194_304,
+            queued_limit: 100,
             max_conn: 64,
             conns: std::sync::atomic::AtomicUsize::new(0),
             req_total: std::sync::atomic::AtomicU64::new(0),
@@ -4749,6 +4797,7 @@ mod tests {
                 vec!["read".into(), "admin".into(), "run".into()],
                 None,
             )
+            .unwrap()
             .1
         };
 
@@ -4901,7 +4950,8 @@ mod tests {
                 Some("prometheus".into()),
                 vec!["read".into(), "admin".into(), "run".into()],
                 None,
-            );
+            )
+            .unwrap();
         }
 
         let anon = http_roundtrip(
@@ -5045,6 +5095,60 @@ mod tests {
                 post.lines().next().unwrap_or("")
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v1_health_counts_killed_and_interrupted() {
+        let dir = std::env::temp_dir().join(format!("roamway-health-counts-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let app = test_app(&dir, "shell", RunStatus::Done);
+        {
+            let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+            st.state.runs.push(mk_run_json("r_killed", "killed"));
+            st.state
+                .runs
+                .push(mk_run_json("r_interrupted", "interrupted"));
+        }
+        let v = v1_health(&app);
+        assert_eq!(v["runs"]["killed"], json!(1));
+        assert_eq!(v["runs"]["interrupted"], json!(1));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn mk_run_json(id: &str, status: &str) -> Run {
+        serde_json::from_value(json!({
+            "id": id,
+            "title": "",
+            "agent": "shell",
+            "workspace": "",
+            "prompt": "x",
+            "status": status,
+            "created_at": 0,
+            "timeout_s": 60,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn create_run_returns_429_when_queued_full() {
+        let dir = std::env::temp_dir().join(format!("roamway-queued-429-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut app = test_app_with_max(&dir, "shell", RunStatus::Queued, 1);
+        Arc::get_mut(&mut app).unwrap().queued_limit = 1;
+        let body = "{\"agent\":\"shell\",\"prompt\":\"echo hi\"}";
+        let raw = format!(
+            "POST /v1/runs HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = http_roundtrip(app.clone(), &raw);
+        assert!(
+            resp.starts_with("HTTP/1.1 429"),
+            "expected 429, got {}",
+            resp.lines().next().unwrap_or("")
+        );
+        assert!(resp.contains("queued run limit"), "{}", resp);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -26,6 +26,7 @@ pub const CONFIG_KEYS: &[&str] = &[
     "require_approval",
     "token_env",
     "keep_runs",
+    "queued_limit",
     "keep_days",
     "max_log_bytes",
 ];
@@ -60,6 +61,8 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_runs: Option<usize>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queued_limit: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_days: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_log_bytes: Option<usize>,
@@ -80,6 +83,7 @@ pub struct EffectiveConfig {
     pub require_approval: Vec<String>,
     pub token_env: String,
     pub keep_runs: usize,
+    pub queued_limit: usize,
     pub keep_days: u64,
     pub max_log_bytes: usize,
     pub sources: BTreeMap<String, String>,
@@ -111,6 +115,7 @@ impl EffectiveConfig {
             "require_approval": self.require_approval_enabled(),
             "token_env": self.token_env.clone(),
             "keep_runs": self.keep_runs,
+            "queued_limit": self.queued_limit,
             "keep_days": self.keep_days,
             "max_log_bytes": self.max_log_bytes,
         })
@@ -134,6 +139,7 @@ impl EffectiveConfig {
             "require_approval" => self.require_approval_enabled().to_string(),
             "token_env" => self.token_env.clone(),
             "keep_runs" => self.keep_runs.to_string(),
+            "queued_limit" => self.queued_limit.to_string(),
             "keep_days" => self.keep_days.to_string(),
             "max_log_bytes" => self.max_log_bytes.to_string(),
             _ => String::new(),
@@ -313,6 +319,14 @@ pub fn apply_set(cfg: &mut Config, key: &str, value: &str) -> Result<(), String>
                     .map_err(|_| invalid(key, value.trim()))?,
             )
         }
+        "queued_limit" => {
+            cfg.queued_limit = Some(
+                value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|_| invalid(key, value.trim()))?,
+            )
+        }
         "keep_days" => {
             cfg.keep_days = Some(
                 value
@@ -352,6 +366,7 @@ pub fn apply_unset(cfg: &mut Config, key: &str) -> Result<(), String> {
         "require_approval" => cfg.require_approval = None,
         "token_env" => cfg.token_env = None,
         "keep_runs" => cfg.keep_runs = None,
+        "queued_limit" => cfg.queued_limit = None,
         "keep_days" => cfg.keep_days = None,
         "max_log_bytes" => cfg.max_log_bytes = None,
         _ => return Err(format!("unknown config key '{}'", key)),
@@ -539,6 +554,15 @@ pub fn resolve_config(
     } else {
         c.keep_runs = 500;
         sources.insert("keep_runs".into(), "default".into());
+    }
+
+    // queued_limit（无 flag / env）：0 表示不限制。
+    if let Some(v) = file.queued_limit {
+        c.queued_limit = v;
+        sources.insert("queued_limit".into(), "file".into());
+    } else {
+        c.queued_limit = 100;
+        sources.insert("queued_limit".into(), "default".into());
     }
 
     // keep_days（无 flag / env）：0 表示不限。

@@ -271,6 +271,26 @@ pub struct Store {
     pub writes_skipped: u64,
 }
 
+/// prompt 持久化上限：超过则截断并追加标记，防止 state.json 无界膨胀。
+/// 运行期内存中的 `Run.prompt` 仍保留全文，不影响执行；仅落盘时截断。
+const PROMPT_PERSIST_LIMIT: usize = 8192;
+
+fn truncate_prompt(p: &str) -> String {
+    if p.len() <= PROMPT_PERSIST_LIMIT {
+        return p.to_string();
+    }
+    let dropped = p.len() - PROMPT_PERSIST_LIMIT;
+    let marker = format!(" ...[truncated {} bytes]", dropped);
+    let mut cut = PROMPT_PERSIST_LIMIT.saturating_sub(marker.len());
+    while cut > 0 && !p.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut out = String::with_capacity(PROMPT_PERSIST_LIMIT);
+    out.push_str(&p[..cut]);
+    out.push_str(&marker);
+    out
+}
+
 impl Store {
     pub fn load(dir: &Path) -> Store {
         let _ = fs::create_dir_all(dir);
@@ -335,7 +355,11 @@ impl Store {
         let p = self.dir.join("state.json");
         let bak = self.dir.join("state.json.bak");
         let tmp = self.dir.join("state.json.tmp");
-        let s = match serde_json::to_string_pretty(&self.state) {
+        let mut view = self.state.clone();
+        for r in &mut view.runs {
+            r.prompt = truncate_prompt(&r.prompt);
+        }
+        let s = match serde_json::to_string_pretty(&view) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("roamway: serialize state failed: {}", e);
@@ -531,6 +555,8 @@ pub struct App {
     pub keep_runs: usize,
     pub keep_days: u64,
     pub max_log_bytes: usize,
+    /// queued run 数上限（allow_overlap 积压防护），0 = 不限制。
+    pub queued_limit: usize,
     pub conns: AtomicUsize,
     /// `/metrics` 用的 HTTP 计数（纯内存，不参与 state.json 持久化）。
     /// 每次请求 +1；响应码 >= 400 时 failed +1。
@@ -685,6 +711,52 @@ mod tests {
         };
         assert!(store2.save());
         assert!(dir.join("state.json.bak").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_truncates_oversized_prompt_to_bounded_state() {
+        let dir = std::env::temp_dir().join(format!("roamway-trunc-{}", now()));
+        let _ = fs::create_dir_all(&dir);
+        let big = "x".repeat(200_000);
+        let run: Run = serde_json::from_value(serde_json::json!({
+            "id": "run_1",
+            "title": "",
+            "agent": "shell",
+            "workspace": "",
+            "prompt": big,
+            "status": "done",
+            "created_at": 0,
+            "timeout_s": 60,
+        }))
+        .unwrap();
+        let mut store = Store {
+            dir: dir.clone(),
+            state: State {
+                runs: vec![run],
+                ..Default::default()
+            },
+            loaded_ok: true,
+            store_health: StoreHealth::Ok,
+            preserve_backup: false,
+            last_write_hash: 0,
+            writes_total: 0,
+            writes_skipped: 0,
+        };
+        assert!(store.save());
+        let bytes = fs::read(dir.join("state.json")).unwrap();
+        assert!(
+            bytes.len() < 20_000,
+            "state.json 尺寸应有界，实际 {}",
+            bytes.len()
+        );
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("[truncated"), "应含截断标记");
+        // 往返一致：再 load + save 不膨胀。
+        let mut store2 = Store::load(&dir);
+        assert!(store2.save());
+        let bytes2 = fs::read(dir.join("state.json")).unwrap();
+        assert!(bytes2.len() < 20_000);
         let _ = fs::remove_dir_all(&dir);
     }
 

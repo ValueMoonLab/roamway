@@ -1435,6 +1435,7 @@ fn cmd_serve(flags: &HashMap<String, String>) {
         keep_runs: cfg.keep_runs,
         keep_days: cfg.keep_days,
         max_log_bytes: cfg.max_log_bytes,
+        queued_limit: cfg.queued_limit,
         max_conn,
         conns: AtomicUsize::new(0),
         req_total: AtomicU64::new(0),
@@ -5705,10 +5706,13 @@ fn cmd_token(flags: &HashMap<String, String>, pos: &[String]) {
                 return;
             }
             let mut store = auth::TokenStore::load(&data);
-            if store.revoke(&id) {
-                println!("revoked {}", id);
-            } else {
-                eprintln!("no such token: {}", id);
+            match store.revoke(&id) {
+                Ok(true) => println!("revoked {}", id),
+                Ok(false) => eprintln!("no such token: {}", id),
+                Err(e) => {
+                    eprintln!("revoke failed: {}", e);
+                    fail(1);
+                }
             }
         }
         _ => usage_error("usage: roamway token add|create --name N [--scope read|run|admin] [--ttl 24h] | ls|list | revoke <id>"),
@@ -5729,7 +5733,15 @@ fn cmd_token_create(flags: &HashMap<String, String>, data: &std::path::Path) {
     }
     let ttl = flags.get("ttl").and_then(|v| auth::parse_ttl(v));
     let mut store = auth::TokenStore::load(data);
-    let (id, plain) = store.create(name_opt.clone(), scopes.clone(), ttl);
+    let (id, plain) = match store.create(name_opt.clone(), scopes.clone(), ttl) {
+        Ok(v) => v,
+        Err(e) => {
+            // 持久化失败绝不打印明文 token，非零退出让调用方感知失败。
+            eprintln!("create token failed: {}", e);
+            fail(1);
+            return;
+        }
+    };
     let name = name_opt.unwrap_or_else(|| format!("token-{}", id));
     if flags.contains_key("json") {
         println!(
@@ -5756,7 +5768,7 @@ fn cmd_token_create(flags: &HashMap<String, String>, data: &std::path::Path) {
 }
 
 fn cmd_token_ls(flags: &HashMap<String, String>, data: &std::path::Path) {
-    let store = auth::TokenStore::load(data);
+    let mut store = auth::TokenStore::load(data);
     let tokens = store.list();
     if flags.contains_key("json") {
         println!(
@@ -6323,6 +6335,7 @@ pub mod test_support {
             keep_runs: 500,
             keep_days: 0,
             max_log_bytes: 4_194_304,
+            queued_limit: 100,
             max_conn: 64,
             conns: AtomicUsize::new(0),
             req_total: AtomicU64::new(0),
