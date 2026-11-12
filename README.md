@@ -26,7 +26,7 @@
 - 同一任务上一轮没跑完，下一轮会不会**叠上来**；
 - 日志和状态记录会不会**无限膨胀**把磁盘吃满。
 
-roamway 只做这些，外加一个够用的调度器和 HTTP 接口。约 1,000 行 Rust，2 MB 二进制，没有 Node、没有 Python、没有数据库。
+roamway 只做这些，外加一个够用的调度器和 HTTP 接口。约 2.5 万行 Rust，2 MB 二进制，没有 Node、没有 Python、没有数据库。
 
 ## 特性
 
@@ -204,7 +204,7 @@ roamway run --agent codex --thinking high --mode read-only \
 
 不支持面：`claude` 没有 provider / image / output-schema 的能力，带上是 `run --provider: not supported for agent claude` 一类错误；它的 `--thinking` 走环境变量 `MAX_THINKING_TOKENS`（low=2048 / medium=8192 / high=24576，`none` 不设），`--mode` 走 `--permission-mode`。`shell`、`hermes`、`api:*` 带任何选项一律 `run --<k>: not supported for agent <kind>`。所有被拒的参数在派发前就判掉，不会出现「跑完了才发现参数没生效」。
 
-HTTP 侧同构：`POST /v1/runs` 与 `POST /v1/agents/{id}/run` 接受 `"options": {"thinking":"high","mode":"read-only","provider":"ollama","output_schema":"/abs/schema.json"}` 与 `"images": ["/abs/a.png"]`，非法时 400 `{"error": "<同上文本>"}`；`GET /v1/runs/{id}` 与 `run --json` 原样回显这两项。daemon 日志每 run 打一行 `[runopts] agent=<kind> keys=<k1,k2> images=<n>`（只打 key，不打值）。
+HTTP 侧同构：`POST /v1/runs` 与 `POST /v1/agents/{id}/run` 接受 `"options": {"thinking":"high","mode":"read-only","provider":"ollama","output_schema":"/abs/schema.json"}` 与 `"images": ["/abs/a.png"]`，非法时 400 `{"error": "<同上文本>"}`；`GET /v1/runs/{id}` 与 `run --json` 原样回显这两项。daemon 日志每 run 打一行 `[runopts] agent=<kind> keys=<k1,k2> images=<n>`（只打 key，不打值）。注意：HTTP JSON 字段名是 `images`（复数）；CLI 标志是 `--image`（单数），两者别混——API 里写 `"image"` 会被静默忽略。
 
 ## 环境变量
 
@@ -288,7 +288,7 @@ curl -s -H "x-roamway-token: $TOK" -H 'content-type: application/json' \
 | 不重放半截任务 | 启动时把所有 `queued/running` 改判 `interrupted` |
 | 不无限重试 | 指数退避 + 上限后自停 |
 | 不重叠 | scheduler 检查同 job 是否有未结束的 run |
-| 不撑爆磁盘 | 只保留最近 800 条 run，日志随之删除；单次读取封顶 200 KB |
+| 不撑爆磁盘 | 只保留最近 500 条 run，日志随之删除；单次读取封顶 200 KB |
 | 单次不超时 | `timeout_s` 到点 kill，标 `timeout` |
 | 可观测 | `~/.roamway/heartbeat` 每 5 秒刷新；`/health` 与 `/v1/health` 汇总计数 |
 
