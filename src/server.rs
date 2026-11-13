@@ -1854,6 +1854,7 @@ fn create_schedule(app: &Arc<App>, req: &Req) -> (u16, Value) {
         last_status: String::new(),
         consecutive_failures: 0,
         overlap,
+        last_error: None,
     };
     {
         let mut ss = app.schedules.lock().unwrap_or_else(|e| e.into_inner());

@@ -112,8 +112,8 @@ pub fn load(dir: &Path) -> Option<Hub> {
 }
 
 pub fn save(dir: &Path, hub: &Hub) -> Result<(), String> {
-    let bytes = serde_json::to_vec_pretty(hub).map_err(|e| e.to_string())?;
-    crate::auth::write_private(&hub_path(dir), &bytes).map_err(|e| e.to_string())
+    let bytes = serde_json::to_vec_pretty(hub).map_err(|e| format!("hub serialize: {}", e))?;
+    crate::auth::write_private(&hub_path(dir), &bytes).map_err(|e| format!("hub write: {}", e))
 }
 
 pub fn init(dir: &Path, name: Option<String>, force: bool) -> Result<Hub, String> {

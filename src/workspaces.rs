@@ -200,9 +200,9 @@ pub fn cleanup_partial_dir(target: &Path) {
 }
 
 fn git_clone(url: &str, target: &Path) -> Result<std::process::Output, String> {
+    // 完整克隆：git 拒绝 --depth 0（"depth must be positive"），不加 --depth 即全量
     Command::new("git")
         .arg("clone")
-        .args(["--depth", "0"])
         .arg(url)
         .arg(target)
         .output()
@@ -250,9 +250,18 @@ pub fn clone_repo(
         }
     }
     let mut reg = Registry::load(data_dir);
-    let ws = reg.add(&target, &url)?;
-    reg.save()
-        .map_err(|e| format!("save workspaces.json failed: {}", e))?;
+    let ws = match reg.add(&target, &url) {
+        Ok(ws) => ws,
+        Err(e) => {
+            cleanup_partial_dir(&target);
+            return Err(e);
+        }
+    };
+    if let Err(e) = reg.save() {
+        // 注册失败不能留下孤立克隆目录（与 clone 失败路径同一清理契约）
+        cleanup_partial_dir(&target);
+        return Err(format!("save workspaces.json failed: {}", e));
+    }
     Ok(ws)
 }
 
@@ -482,24 +491,22 @@ pub fn validate_worktree_git(repo_root: &str, spec: &WorktreeSpec) -> Result<(),
     Ok(())
 }
 
-/// 生成删除前的 dry-run 行，打印删除 worktree 与分支的 git 命令。
+/// 生成删除前打印的命令计划行（实际会执行删除，不是 dry-run）。
 pub fn worktree_remove_plan(repo_root: &str, path: &Path, branch: &str) -> Vec<String> {
     vec![
         format!(
-            "[worktree] dry-run: git -C {} worktree remove --force {}",
+            "[worktree] plan: git -C {} worktree remove --force {}",
             repo_root,
             path.display()
         ),
-        format!(
-            "[worktree] dry-run: git -C {} branch -D {}",
-            repo_root, branch
-        ),
+        format!("[worktree] plan: git -C {} branch -D {}", repo_root, branch),
     ]
 }
 
-/// Remove a per-agent worktree and its branch. Prints a dry-run line before each
+/// Remove a per-agent worktree and its branch. Prints the command plan before each
 /// destructive command and propagates failures (never silently swallowed).
 pub fn worktree_remove(repo_root: &str, path: &Path, branch: &str) -> Result<(), String> {
+    // 先打印将执行的命令（实际删除，不是 dry-run——旧标签误导操作者以为无副作用）
     for line in worktree_remove_plan(repo_root, path, branch) {
         println!("{}", line);
     }

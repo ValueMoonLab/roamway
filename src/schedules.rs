@@ -55,6 +55,9 @@ pub struct Schedule {
     pub consecutive_failures: u32,
     #[serde(default)]
     pub overlap: bool,
+    /// 最近一次失败的错误摘要（截断 200 字符）；成功时清空
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -386,6 +389,7 @@ pub fn migrate_jobs(jobs: Vec<Job>, now_ts: i64) -> Vec<Schedule> {
             last_status: String::new(),
             consecutive_failures: 0,
             overlap: j.allow_overlap,
+            last_error: None,
         });
     }
     out
@@ -596,6 +600,14 @@ pub fn record_result(app: &Arc<App>, schedule_id: &str, status: RunStatus, err: 
         s.last_run_at = Some(t);
         if bad {
             s.consecutive_failures += 1;
+            s.last_error = err.map(|e| {
+                let t = e.trim();
+                if t.chars().count() > 200 {
+                    t.chars().take(200).collect::<String>()
+                } else {
+                    t.to_string()
+                }
+            });
             s.last_status = if status == RunStatus::Timeout {
                 "timeout".into()
             } else {
@@ -610,6 +622,7 @@ pub fn record_result(app: &Arc<App>, schedule_id: &str, status: RunStatus, err: 
             s.next_run_at = Some(next);
         } else {
             s.consecutive_failures = 0;
+            s.last_error = None;
             s.last_status = match status {
                 RunStatus::Done => "ok".into(),
                 other => format!("{:?}", other).to_lowercase(),
@@ -620,7 +633,6 @@ pub fn record_result(app: &Arc<App>, schedule_id: &str, status: RunStatus, err: 
     if dirty {
         ss.save();
     }
-    let _ = err;
 }
 
 #[cfg(test)]
@@ -649,6 +661,7 @@ mod tests {
             last_status: String::new(),
             consecutive_failures: 0,
             overlap: false,
+            last_error: None,
         }
     }
 

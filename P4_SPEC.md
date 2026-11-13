@@ -10,7 +10,7 @@ roamway clone <owner/repo | git url> [--dir <parent>] [--protocol https|ssh] [--
 
 - `owner/repo` 简写按 `--protocol`（默认 https）拼成 `https://github.com/owner/repo.git` / `git@github.com:owner/repo.git`
 - 目标目录：`<dir>/<repo basename>`，`--dir` 缺省用 `<data>/workspaces`
-- 执行 `git clone --depth 0`（即完整克隆）；非 git 环境或网络失败 → 明确报错，不留半成品目录
+- 执行完整 `git clone`（不带 `--depth`；git 拒绝 `--depth 0`）；非 git 环境或网络失败 → 明确报错，不留半成品目录
 - 成功后登记到 `<data>/workspaces.json`：`{id: ws_xxxx, name, path, remote, host: "local", created_at}`
 - 输出：`cloned <name> → <path>`；`--json` 输出登记记录
 

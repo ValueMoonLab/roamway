@@ -694,8 +694,13 @@ impl ApprovalStore {
     }
 
     pub fn save(&self) {
-        if let Ok(bytes) = serde_json::to_vec_pretty(&self.records) {
-            let _ = write_private(&self.path, &bytes);
+        match serde_json::to_vec_pretty(&self.records) {
+            Ok(bytes) => {
+                if let Err(e) = write_private(&self.path, &bytes) {
+                    eprintln!("roamway: approvals.json save failed: {}", e);
+                }
+            }
+            Err(e) => eprintln!("roamway: approvals.json serialize failed: {}", e),
         }
     }
 

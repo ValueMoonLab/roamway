@@ -84,8 +84,9 @@ pub fn is_valid_env_key(key: &str) -> bool {
 /// 下一次「本地钟点」的时间戳（用固定时区偏移，不依赖系统 tz 数据）
 pub fn next_daily(after: i64, hhmm: &str, tz_offset_hours: i64) -> Option<i64> {
     let (h, m) = parse_hhmm(hhmm)?;
-    let off = tz_offset_hours * 3600;
-    let local = after + off;
+    // checked：极端 tz/after 输入不在 debug 构建 panic
+    let off = tz_offset_hours.checked_mul(3600)?;
+    let local = after.checked_add(off)?;
     let day_start = local.div_euclid(86400) * 86400;
     let mut at = day_start + h * 3600 + m * 60 - off;
     if at <= after {
@@ -345,7 +346,9 @@ impl Store {
             writes_skipped: 0,
         };
         if dirty {
-            store.save();
+            if !store.save() {
+                eprintln!("roamway: state.json initial save failed");
+            }
         }
         prune_corrupt_snapshots(dir, 5);
         store

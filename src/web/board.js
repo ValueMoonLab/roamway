@@ -48,11 +48,6 @@
     });
   }
 
-  function fmtTs(ts) {
-    if (!ts) return '-';
-    return new Date(ts * 1000).toLocaleString();
-  }
-
   function fmtIso(v) {
     if (!v) return '-';
     var t = Date.parse(v);

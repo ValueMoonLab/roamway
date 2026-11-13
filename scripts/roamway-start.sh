@@ -7,6 +7,7 @@ TOKEN="${ROAMWAY_TOKEN:-}"
 LOG="${ROAMWAY_LOG:-$HOME/.roamway/serve.log}"
 
 pgrep -f "roamway serve --bind $BIND" >/dev/null && exit 0
+[ -x "$BIN" ] || { echo "roamway-start: binary not found or not executable: $BIN" >&2; exit 1; }
 mkdir -p "$DATA"
 [ -n "$TOKEN" ] && export ROAMWAY_TOKEN="$TOKEN"
 setsid nohup "$BIN" serve --bind "$BIND" --data "$DATA" "$@" >>"$LOG" 2>&1 </dev/null &

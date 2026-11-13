@@ -302,8 +302,10 @@ fn child_command(cmd: &mut Command) {
     {
         use std::os::unix::process::CommandExt;
         unsafe {
+            // SAFETY: pre_exec 回调运行在 fork 之后、exec 之前的子进程里，
+            // 单线程上下文，只调用 async-signal-safe 的 setpgid(2)。
             cmd.pre_exec(|| {
-                // 自成进程组，kill 时能整树收掉
+                // 自成进程组，kill 时能整树收掉；失败则回落父进程组（仍可 kill 单 pid）
                 let _ = libc::setpgid(0, 0);
                 Ok(())
             });
@@ -638,8 +640,8 @@ pub fn script_stop(app: &Arc<App>, name: &str) -> Result<Script, String> {
         if let Some(rt) = rts.get(&format!("script:{}", s.name)) {
             let pid = rt.child.lock().map(|c| c.id()).unwrap_or(0);
             if rt.alive() && pid > 1 {
+                // kill 内部已含 SIGTERM→等待→SIGKILL 升级，不再持锁 sleep 阻塞其他终端操作
                 crate::runner::kill_process_group(pid);
-                thread::sleep(Duration::from_millis(150));
             }
             let mut c = rt.child.lock().unwrap_or_else(|e| e.into_inner());
             if let Ok(Some(st)) = c.try_wait() {

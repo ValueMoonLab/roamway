@@ -45,6 +45,10 @@ fn default_true() -> bool {
 /// 都归一化为 `http://192.0.2.10:8796`。
 pub fn endpoint_normalize(s: &str) -> String {
     let s = s.trim();
+    // 拒绝控制字符（含 CR/LF）：进入 HTTP 头会造成头注入/请求走私
+    if s.chars().any(|c| c.is_control()) {
+        return String::new();
+    }
     let s = if let Some(rest) = s.strip_prefix("tcp://") {
         format!("http://{}", rest)
     } else if s.starts_with("http://") || s.starts_with("https://") {
@@ -176,10 +180,14 @@ impl Registry {
                     }
                 }
             },
-            Err(_) => Registry {
-                path,
-                hosts: Vec::new(),
-            },
+            Err(e) => {
+                // 权限/IO 错误不能静默当"无主机"——否则配置无声丢失
+                eprintln!("roamway: hosts.json read failed: {}", e);
+                Registry {
+                    path,
+                    hosts: Vec::new(),
+                }
+            }
         }
     }
 

@@ -554,6 +554,9 @@ pub fn kill_process_group(pid: u32) {
     if pid <= 1 {
         return;
     }
+    // SAFETY: pid 来自我们 spawn 的子进程（Child::id），且 >1 已校验。
+    // kill(-pid, sig) 只作用于该进程组；子进程由 runner 以独立进程组启动，
+    // 不会波及 daemon 自身。signal 0 仅探测存在性，不发送实际信号。
     unsafe {
         let _ = libc::kill(-pid, libc::SIGTERM);
         for _ in 0..20 {

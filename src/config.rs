@@ -206,10 +206,8 @@ pub fn save(cfg: &Config, dir: &Path) -> Result<(), String> {
             use std::os::unix::fs::PermissionsExt;
             fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600))?;
         }
-        #[cfg(windows)]
-        if path.exists() {
-            fs::remove_file(&path)?;
-        }
+        // rename 直接覆盖：delete-then-rename 在两步之间崩溃会丢配置。
+        // Windows MoveFileEx(MOVEFILE_REPLACE_EXISTING) 支持覆盖，std::fs::rename 即此语义。
         fs::rename(&tmp, &path)?;
         Ok(())
     })();
@@ -498,7 +496,7 @@ pub fn resolve_config(
     if !flag_hosts.is_empty() {
         c.allow_hosts = flag_hosts;
         sources.insert("allow_hosts".into(), "flag".into());
-    } else if let Some(v) = env.get("ROAMWAY_ALLOW_HOSTS") {
+    } else if let Some(v) = env.get("ROAMWAY_ALLOW_HOSTS").filter(|v| non_empty(v)) {
         c.allow_hosts = split_list(v);
         sources.insert("allow_hosts".into(), "env".into());
     } else if let Some(v) = file.allow_hosts.clone() {

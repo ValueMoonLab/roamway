@@ -138,8 +138,9 @@ impl CronExpr {
     /// 从 `now` 之后逐分钟找下一次命中（固定时区偏移），最多向前搜 366 天。
     pub fn next_after(&self, now: i64, tz_offset_secs: i32) -> Option<i64> {
         let off = tz_offset_secs as i64;
-        let deadline = now + 366 * 86400;
-        let mut local_min = (now + off).div_euclid(60) + 1;
+        // 极端输入（i64::MAX 附近）用 checked 运算，debug 构建不 panic
+        let deadline = now.checked_add(366 * 86400)?;
+        let mut local_min = now.checked_add(off)?.div_euclid(60).checked_add(1)?;
         loop {
             let epoch = local_min * 60 - off;
             if epoch > deadline {
