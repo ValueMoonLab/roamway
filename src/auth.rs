@@ -197,10 +197,12 @@ pub fn random_hex(nbytes: usize) -> String {
     // getrandom is already in the tree via ureq -> rustls -> ring, so this
     // keeps offline builds working with no new downloads.
     let mut buf = vec![0u8; nbytes];
-    getrandom::getrandom(&mut buf).expect("OS CSPRNG unavailable");
+    getrandom::getrandom(&mut buf).unwrap_or_else(|e| panic!("OS CSPRNG unavailable: {e}"));
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(nbytes * 2);
     for b in buf {
-        out.push_str(&format!("{:02x}", b));
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
     }
     out
 }
