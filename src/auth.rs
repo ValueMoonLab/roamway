@@ -1,9 +1,8 @@
-// P6 auth primitives and on-disk stores. No external crypto crates: SHA-256,
-// HMAC-SHA256 and PBKDF2-HMAC-SHA256 are implemented here for offline builds.
+// P6 auth primitives and on-disk stores. SHA-256, HMAC-SHA256 and PBKDF2-HMAC-SHA256
+// are implemented here (no external crypto crates); OS entropy comes from getrandom,
+// which is already in the tree via ureq -> rustls -> ring, keeping builds offline.
 
 use serde::{Deserialize, Serialize};
-use std::collections::hash_map::RandomState;
-use std::hash::{BuildHasher, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -192,37 +191,16 @@ pub fn ct_eq_str(a: &str, b: &str) -> bool {
 }
 
 pub fn random_hex(nbytes: usize) -> String {
-    // Entropy = OS-seeded RandomState + wall-clock nanos + a process-wide atomic
-    // counter. The counter guarantees no two calls in this process ever produce
-    // the same bytes, even inside one clock tick (the old code hashed only a
-    // per-call counter against one RandomState, and callers truncated IDs to 6
-    // hex chars = 24 bits, so token/approval IDs collided under load).
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let rs = RandomState::new();
+    // OS CSPRNG (getrandom): unpredictable, collision-resistant. Replaces the
+    // old SipHash+nanos+counter construction — SipHash is a keyed hash, not a
+    // CSPRNG, and its output must not back token plaintext / salts / OTP codes.
+    // getrandom is already in the tree via ureq -> rustls -> ring, so this
+    // keeps offline builds working with no new downloads.
+    let mut buf = vec![0u8; nbytes];
+    getrandom::getrandom(&mut buf).expect("OS CSPRNG unavailable");
     let mut out = String::with_capacity(nbytes * 2);
-    let mut i = 0u64;
-    let mut written = 0usize;
-    while written < nbytes {
-        let mut hasher = rs.build_hasher();
-        hasher.write_u64(i);
-        hasher.write_u64(nbytes as u64);
-        hasher.write_u64(nanos);
-        hasher.write_u64(SEQ.fetch_add(1, Ordering::Relaxed));
-        let v = hasher.finish();
-        for shift in (0..64).step_by(8) {
-            if written == nbytes {
-                break;
-            }
-            out.push_str(&format!("{:02x}", (v >> shift) as u8));
-            written += 1;
-        }
-        i += 1;
+    for b in buf {
+        out.push_str(&format!("{:02x}", b));
     }
     out
 }
@@ -941,6 +919,24 @@ mod tests {
             "expired token must be rejected"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn random_hex_csprng_format_and_uniqueness() {
+        // 回归：random_hex 必须输出精确长度的小写 hex，且批量调用不重复
+        // （CSPRNG 替换 SipHash 构造后，格式与唯一性契约不变）。
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..500 {
+            let s = random_hex(16);
+            assert_eq!(s.len(), 32);
+            assert!(s
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)));
+            assert!(seen.insert(s));
+        }
+        assert_eq!(random_hex(0).len(), 0);
+        assert_eq!(random_hex(1).len(), 2);
+        assert_eq!(random_hex(32).len(), 64);
     }
 
     #[test]

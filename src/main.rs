@@ -1032,16 +1032,8 @@ fn retry_secs(h: &hosts::Host) -> i64 {
 }
 
 fn gen_token() -> String {
-    use std::hash::{BuildHasher, Hasher};
-    let rs = std::collections::hash_map::RandomState::new();
-    let mut out = String::with_capacity(32);
-    for i in 0u64..16 {
-        let mut hasher = rs.build_hasher();
-        hasher.write_u64(i);
-        let v = hasher.finish();
-        out.push_str(&format!("{:02x}", (v >> 56) as u8));
-    }
-    out
+    // Same CSPRNG path as auth::random_hex (16 bytes = 32 hex chars).
+    crate::auth::random_hex(16)
 }
 
 fn bind_parts(bind: &str) -> Option<(String, u16)> {
