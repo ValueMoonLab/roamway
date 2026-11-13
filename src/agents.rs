@@ -3,11 +3,9 @@ use crate::workspaces::{WorktreeInfo, WorktreeSpec};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
-use std::hash::{BuildHasher, Hash, Hasher};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Msg {
@@ -45,17 +43,8 @@ pub struct Agent {
 static AGENT_SEQ: AtomicU64 = AtomicU64::new(0);
 
 pub fn gen_agent_id() -> String {
-    let n = AGENT_SEQ.fetch_add(1, Ordering::SeqCst);
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-    n.hash(&mut hasher);
-    t.hash(&mut hasher);
-    let h = hasher.finish();
-    let seed = (n.wrapping_add(t).wrapping_add(h)) as u32;
-    format!("ag_{:08x}", seed)
+    // 64bit 随机后缀（原 32bit seed 在高频建 agent 时可碰撞，与 tok_/apr_ 同源修复）
+    format!("ag_{}", crate::auth::random_hex(8))
 }
 
 pub fn gen_session_id() -> String {

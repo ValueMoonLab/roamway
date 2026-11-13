@@ -14,7 +14,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -265,15 +265,8 @@ impl Runtime {
     }
 }
 
-static SEQ: AtomicU64 = AtomicU64::new(0);
-
 fn gen_id(prefix: &str) -> String {
-    use std::hash::{BuildHasher, Hasher};
-    let rs = std::collections::hash_map::RandomState::new();
-    let mut h = rs.build_hasher();
-    h.write_i64(now());
-    h.write_u64(SEQ.fetch_add(1, Ordering::Relaxed));
-    format!("{}_{:08x}", prefix, (h.finish() & 0xffff_ffff) as u32)
+    format!("{}_{}", prefix, crate::auth::random_hex(8))
 }
 
 fn default_shell() -> String {

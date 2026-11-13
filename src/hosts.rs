@@ -1,10 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Host {
@@ -152,20 +150,8 @@ pub fn valid_name(name: &str) -> bool {
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-static HOST_SEQ: AtomicU64 = AtomicU64::new(0);
-
 pub fn gen_host_id() -> String {
-    let n = HOST_SEQ.fetch_add(1, Ordering::SeqCst);
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-    n.hash(&mut hasher);
-    t.hash(&mut hasher);
-    let h = hasher.finish();
-    let seed = (n.wrapping_add(t).wrapping_add(h)) as u32;
-    format!("host_{:08x}", seed)
+    format!("host_{}", crate::auth::random_hex(8))
 }
 
 impl Registry {

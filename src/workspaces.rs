@@ -1,11 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::hash::{BuildHasher, Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 /// 描述一次 worktree 创建请求，对应 `--worktree-slug/--new-branch/--base/--branch`。
 /// `branch` 兼作分支名；`existing=true` 表示检出已有分支（对应 `--branch`）。
@@ -48,20 +45,8 @@ pub struct Registry {
     pub workspaces: Vec<Workspace>,
 }
 
-static WS_SEQ: AtomicU64 = AtomicU64::new(0);
-
 pub fn gen_workspace_id() -> String {
-    let n = WS_SEQ.fetch_add(1, Ordering::SeqCst);
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0);
-    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
-    n.hash(&mut hasher);
-    t.hash(&mut hasher);
-    let h = hasher.finish();
-    let seed = (n.wrapping_add(t).wrapping_add(h)) as u32;
-    format!("ws_{:08x}", seed)
+    format!("ws_{}", crate::auth::random_hex(8))
 }
 
 impl Registry {
