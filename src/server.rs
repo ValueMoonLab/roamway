@@ -2177,6 +2177,8 @@ fn hub_triggers_route(app: &Arc<App>) -> (u16, Value) {
 
 fn hub_trigger_enabled_route(app: &Arc<App>, id: &str, enabled: bool) -> (u16, Value) {
     let dir = hub_data_dir(app);
+    // hub.json 读-改-写必须串行：并发 enable/disable 会互相覆盖（丢更新）。
+    let _guard = app.hub_lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut hub = match hub::load(&dir) {
         Some(h) => h,
         None => return (404, json!({"error": "hub not initialized"})),
@@ -2242,6 +2244,9 @@ fn hub_hook_route(app: &Arc<App>, req: &Req, trigger_id: &str) -> (u16, Value) {
         }
     }
 
+    // 准入锁覆盖 busy 检查 + create_agent_and_run 全程：
+    // 否则两个并发 webhook 都能通过检查， queued 总量超过 max_concurrent。
+    let _adm = app.hub_lock.lock().unwrap_or_else(|e| e.into_inner());
     let busy = {
         let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
         let running = st
@@ -2838,10 +2843,13 @@ fn revoke_token_route(app: &Arc<App>, id: &str) -> (u16, Value) {
 }
 
 fn agent_diff_route(app: &Arc<App>, id: &str) -> (u16, Value) {
-    let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
-    let agent = match st.state.agents.iter().find(|a| a.id == id) {
-        Some(a) => a.clone(),
-        None => return (404, json!({ "error": "no such agent" })),
+    // 只在锁内克隆 agent；git diff 可能很慢，绝不能在 store 锁内执行子进程。
+    let agent = {
+        let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        match st.state.agents.iter().find(|a| a.id == id) {
+            Some(a) => a.clone(),
+            None => return (404, json!({ "error": "no such agent" })),
+        }
     };
     if !agent.worktree {
         return (400, json!({ "error": "worktree not enabled" }));
@@ -4094,6 +4102,7 @@ mod tests {
             passwords: std::sync::Mutex::new(auth::PasswordStore::load(&dir)),
             pairings: std::sync::Mutex::new(auth::PairingStore::load(&dir)),
             hub_rt: std::sync::Mutex::new(Default::default()),
+            hub_lock: std::sync::Mutex::new(()),
             allow_hosts: vec![],
             allow_origins: vec![],
             require_approval: vec![],
@@ -4203,6 +4212,7 @@ mod tests {
             passwords: std::sync::Mutex::new(auth::PasswordStore::load(dir)),
             pairings: std::sync::Mutex::new(auth::PairingStore::load(dir)),
             hub_rt: std::sync::Mutex::new(Default::default()),
+            hub_lock: std::sync::Mutex::new(()),
             allow_hosts: vec![],
             allow_origins: vec![],
             require_approval: vec![],

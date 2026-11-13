@@ -573,6 +573,9 @@ pub struct App {
     pub passwords: Mutex<auth::PasswordStore>,
     pub pairings: Mutex<auth::PairingStore>,
     pub hub_rt: Mutex<crate::hub::HubRuntime>,
+    /// hub.json 读-改-写与 webhook 准入的串行锁。
+    /// 加锁顺序恒为 hub_lock → store，禁止反向。
+    pub hub_lock: Mutex<()>,
     pub allow_hosts: Vec<String>,
     pub allow_origins: Vec<String>,
     pub require_approval: Vec<String>,

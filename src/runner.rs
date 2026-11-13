@@ -1113,6 +1113,7 @@ mod tests {
             passwords: Mutex::new(Default::default()),
             pairings: Mutex::new(Default::default()),
             hub_rt: Mutex::new(Default::default()),
+            hub_lock: Mutex::new(()),
             allow_hosts: vec![],
             allow_origins: vec![],
             require_approval: vec![],

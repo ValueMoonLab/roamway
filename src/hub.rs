@@ -81,11 +81,11 @@ pub fn hub_path(dir: &Path) -> PathBuf {
 }
 
 pub fn gen_hub_id() -> String {
-    format!("hub_{}", crate::auth::random_hex(4))
+    format!("hub_{}", crate::auth::random_hex(8))
 }
 
 pub fn gen_trigger_id() -> String {
-    format!("trg_{}", crate::auth::random_hex(4))
+    format!("trg_{}", crate::auth::random_hex(8))
 }
 
 pub fn secret_env_for(id: &str) -> String {
@@ -333,7 +333,7 @@ mod tests {
         let dir = tmp("lifecycle");
         let hub = init(&dir, Some("team".into()), false).unwrap();
         assert!(hub.hub_id.starts_with("hub_"));
-        assert_eq!(hub.hub_id.len(), 4 + 8);
+        assert_eq!(hub.hub_id.len(), 4 + 16);
         assert_eq!(hub.name, "team");
         let reloaded = load(&dir).unwrap();
         assert_eq!(reloaded.hub_id, hub.hub_id);
@@ -471,6 +471,16 @@ mod tests {
         assert_eq!(mask_ip("192.0.2.7"), "192.0.2.*");
         assert_eq!(mask_ip("2001:db8::1"), "2001:***");
         assert_eq!(mask_ip(""), "unknown");
+    }
+
+    #[test]
+    fn generated_ids_are_unique_in_burst() {
+        // 回归：旧实现同一时钟刻内可产生相同 ID（24bit 截断 + 弱熵）。
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..2000 {
+            assert!(ids.insert(gen_trigger_id()));
+            assert!(ids.insert(gen_hub_id()));
+        }
     }
 
     #[test]

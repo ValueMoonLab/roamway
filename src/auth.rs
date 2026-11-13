@@ -192,6 +192,18 @@ pub fn ct_eq_str(a: &str, b: &str) -> bool {
 }
 
 pub fn random_hex(nbytes: usize) -> String {
+    // Entropy = OS-seeded RandomState + wall-clock nanos + a process-wide atomic
+    // counter. The counter guarantees no two calls in this process ever produce
+    // the same bytes, even inside one clock tick (the old code hashed only a
+    // per-call counter against one RandomState, and callers truncated IDs to 6
+    // hex chars = 24 bits, so token/approval IDs collided under load).
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
     let rs = RandomState::new();
     let mut out = String::with_capacity(nbytes * 2);
     let mut i = 0u64;
@@ -200,6 +212,8 @@ pub fn random_hex(nbytes: usize) -> String {
         let mut hasher = rs.build_hasher();
         hasher.write_u64(i);
         hasher.write_u64(nbytes as u64);
+        hasher.write_u64(nanos);
+        hasher.write_u64(SEQ.fetch_add(1, Ordering::Relaxed));
         let v = hasher.finish();
         for shift in (0..64).step_by(8) {
             if written == nbytes {
@@ -511,7 +525,7 @@ impl TokenStore {
         ttl_secs: Option<i64>,
     ) -> Result<(String, String), String> {
         let plain = random_hex(32);
-        let id = format!("tok_{}_{}", now(), &random_hex(4)[..6]);
+        let id = format!("tok_{}_{}", now(), random_hex(8));
         let name = name.unwrap_or_else(|| format!("token-{}", id));
         let record = TokenRecord {
             id: id.clone(),
@@ -684,7 +698,7 @@ impl ApprovalStore {
         token_id: &str,
     ) -> ApprovalRecord {
         let record = ApprovalRecord {
-            id: format!("apr_{}_{}", now(), &random_hex(4)[..6]),
+            id: format!("apr_{}_{}", now(), random_hex(8)),
             ts: now(),
             method: method.to_string(),
             path: path.to_string(),
@@ -919,6 +933,26 @@ mod tests {
             store.resolve(&plain).is_none(),
             "expired token must be rejected"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn token_and_approval_ids_unique_in_burst() {
+        // 回归：旧 ID 后缀只有 24bit 且同刻可重复，token 吊销/审批查找会被碰撞破坏。
+        let dir = std::env::temp_dir().join(format!("roamway-idburst-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut tokens = TokenStore::load(&dir);
+        let mut ids = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let (_plain, id) = tokens.create(None, vec!["read".into()], None).unwrap();
+            assert!(ids.insert(id));
+        }
+        let mut approvals = ApprovalStore::load(&dir);
+        let mut aids = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let rec = approvals.create("POST", "/v1/runs", b"{}", "tok");
+            assert!(aids.insert(rec.id));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
