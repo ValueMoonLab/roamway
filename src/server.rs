@@ -1050,8 +1050,8 @@ fn legacy_token_on_disk(app: &App) -> Option<String> {
 
 fn authenticate(app: &Arc<App>, presented: Option<&str>) -> AuthOutcome {
     let has_tokens = {
-        let st = app.tokens.lock().unwrap_or_else(|e| e.into_inner());
-        !st.tokens.is_empty()
+        let mut st = app.tokens.lock().unwrap_or_else(|e| e.into_inner());
+        st.has_tokens()
     };
     if app.token.as_deref().map(|t| t.is_empty()).unwrap_or(true) && !has_tokens {
         return AuthOutcome::Open;

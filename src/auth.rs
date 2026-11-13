@@ -554,6 +554,13 @@ impl TokenStore {
         Ok(changed)
     }
 
+    /// 是否存在有效 token（先触发热重载）。daemon 启动时为空、之后 CLI 建 token
+    /// 的场景必须靠它刷新，否则 authenticate 的 Open 判定会永久放行。
+    pub fn has_tokens(&mut self) -> bool {
+        self.reload_if_changed();
+        !self.tokens.is_empty()
+    }
+
     pub fn list(&mut self) -> Vec<TokenRecord> {
         self.reload_if_changed();
         self.tokens.clone()
@@ -983,6 +990,26 @@ mod tests {
         std::fs::write(dir.join("tokens.json"), "[]").unwrap();
         // 不重启：再次 resolve 必须失败（热重载生效）。
         assert!(store.resolve(&plain).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn has_tokens_tracks_external_create_and_revoke() {
+        // 回归：daemon 以空 token 库启动（Open 模式），之后 CLI 建 token，
+        // has_tokens 必须经热重载变 true，否则 authenticate 永久放行任意请求。
+        let dir = std::env::temp_dir().join(format!("roamway-auth-hastokens-{}", now()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut daemon_view = TokenStore::load(&dir);
+        assert!(!daemon_view.has_tokens());
+        // 另一进程（CLI）建 token 落盘。
+        let mut cli = TokenStore::load(&dir);
+        let (id, _plain) = cli
+            .create(Some("n".into()), vec!["read".into()], None)
+            .unwrap();
+        assert!(daemon_view.has_tokens());
+        // CLI revoke 后，daemon 视图必须回到 false。
+        assert!(cli.revoke(&id).unwrap());
+        assert!(!daemon_view.has_tokens());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
