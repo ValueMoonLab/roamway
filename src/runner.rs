@@ -596,14 +596,18 @@ pub fn pid_is_our_run(pid: u32, _started_at: Option<i64>) -> bool {
         return false;
     }
     #[cfg(target_os = "linux")]
+    let mut alive = true;
+    #[cfg(not(target_os = "linux"))]
+    let alive = true;
+    #[cfg(target_os = "linux")]
     {
         if let Some(ts) = _started_at {
             if let Some(proc_ts) = proc_start_epoch(pid) {
-                return start_times_near(proc_ts, ts);
+                alive = start_times_near(proc_ts, ts);
             }
         }
     }
-    true
+    alive
 }
 
 #[cfg(target_os = "linux")]

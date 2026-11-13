@@ -345,10 +345,8 @@ impl Store {
             writes_total: 0,
             writes_skipped: 0,
         };
-        if dirty {
-            if !store.save() {
-                eprintln!("roamway: state.json initial save failed");
-            }
+        if dirty && !store.save() {
+            eprintln!("roamway: state.json initial save failed");
         }
         prune_corrupt_snapshots(dir, 5);
         store
