@@ -1,5 +1,51 @@
 # Changelog
 
+## 1.5.0
+
+全仓 AI 代码审查（ocr，117 条 findings 逐条核实）+ 36 处修复，叠加 P21–P28 特性交付。
+门禁：cargo fmt + 315 tests 全绿（新增路径穿越 / cron 语义 / 日期范围 / ID 唯一性回归测试）。
+
+### Security
+
+- **SSE 日志路径穿越（critical）**：`types.rs log_path` 白名单校验，拒绝 `../` 任意文件读取。
+- **backup restore manifest 穿越（high）**：manifest 文件名攻击者可控，sha256 自洽不足以防御；
+  拒绝路径穿越 + 非白名单文件。`plugins.rs plugin_dir` 同族防护。
+- **token/salt/OTP 熵源（high）**：SipHash 可预测 → OS CSPRNG（getrandom，已在依赖树内，离线可建）；
+  统一 ID 生成为 `auth::random_hex(8)`（24bit→64bit 防碰撞）。
+- **auth 热重载（high）**：daemon 空库启动后 CLI 建 token 不生效，Open 模式永久放行；附回归测试。
+- `hosts.rs endpoint_normalize` 拒绝控制字符（HTTP 头注入）；`ct_eq` 长度差截断误判修复。
+- TLS 假参数 / body 慢速攻击 / Content-Length 解析 / unix socket 权限窗口修复。
+
+### Fixed
+
+- **`git clone --depth 0` 被 git 拒绝**：clone 功能整体失效，去掉该参数改为完整克隆；P4_SPEC 同错一并修正。
+- **speech / plugins 管道死锁（critical）**：顺序读管道在 stderr >64KB 时永久挂起；
+  改并发 drain + 120s 超时 + 进程组 kill（先等退出后 join，避免 scope 提前 join 阻塞）。
+- `auth.rs write_private` 原地 truncate → tmp+fsync+rename 原子写（0o600）；
+  `config.rs` 去掉 Windows delete-then-rename 崩溃丢配置窗口。
+- `schedules.rs save` 失败回滚 .bak；Schedule 新增 `last_error`（失败原因不再被丢弃）。
+- cron `field_is_star`：`*/1`、`1-31` 不再误判破坏标准 day/weekday 语义；`next_after`/`next_daily` checked 算术。
+- agents archive TOCTOU（持锁标记再清理，失败回滚）；terminals script_start 持锁防并发泄漏子进程；
+  删持锁 sleep；hub 并发 hub_lock 统管 RMW + webhook 准入。
+- usage 日期范围校验（y/m/d/h/min/sec）；providers PATHEXT 解析；hub/hosts/state 持久化失败告警不再静默。
+- workspaces 注册失败清理孤立目录；`--depth 0` 之外的 dry-run 误导标签改为 plan（命令实际执行）。
+
+### Changed
+
+- 前端：离开页面统一清理 agents/terminals 轮询定时器；board 局部请求失败保留旧数据（unauthorized 仍冒泡）。
+- CI：least-privilege `permissions: contents: read` + `timeout-minutes` + concurrency 取消被取代的 run。
+- `smoke.sh` trap 清理（Ctrl+C 不再泄漏 daemon+tmpdir）；`roamway-start.sh` 二进制缺失快速失败。
+- 移除 UTF-8 BOM（style.css/index.html）、死代码 fmtTs；unsafe 块补 SAFETY 注释。
+
+### Added（P21–P28，自 v1.1.0 累积）
+
+- 只读 Web 面板（P21）；时间维度保留 + 日志上限 + prune + 字节指标（P22）。
+- backup/restore + 写盘去重 + 写计数单一真源 + pid 生命周期（P23/P24）。
+- liveness/readiness 探针分离（/healthz 不取锁、/readyz try_lock）+ usage 收口（P25）。
+- 数据目录单写者锁 + StoreHealth 四值可观测（P26）。
+- clippy/fmt 硬门禁 + `daemon status` 说真话（bind 单一真源/活体校验）（P27）。
+- doctor 自检 + http latency 探针（P28）。
+
 ## 1.4.0
 
 clippy / fmt 门禁转正与 `daemon status` 说真话（P27）：`cargo clippy --all-targets -- -D warnings`
