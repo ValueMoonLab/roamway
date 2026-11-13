@@ -180,6 +180,13 @@ impl Registry {
                     }
                 }
             },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // 文件不存在 = 全新安装的正常初始状态，静默当"无主机"。
+                Registry {
+                    path,
+                    hosts: Vec::new(),
+                }
+            }
             Err(e) => {
                 // 权限/IO 错误不能静默当"无主机"——否则配置无声丢失
                 eprintln!("roamway: hosts.json read failed: {}", e);
