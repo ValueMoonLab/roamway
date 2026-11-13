@@ -80,14 +80,28 @@ fn run_command(args: &[String]) -> Result<String, String> {
     let mut child = cmd
         .spawn()
         .map_err(|e| format!("spawn {}: {}", args[0], e))?;
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut out) = child.stdout.take() {
-        let _ = out.read_to_string(&mut stdout);
-    }
-    if let Some(mut err) = child.stderr.take() {
-        let _ = err.read_to_string(&mut stderr);
-    }
+    // Drain both pipes concurrently: reading stdout to EOF before touching
+    // stderr deadlocks any child that writes >64KB to stderr (pipe buffer
+    // full -> child blocks on write -> parent blocks on stdout read).
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let (stdout, stderr) = std::thread::scope(|sc| {
+        let h1 = sc.spawn(move || {
+            let mut s = String::new();
+            if let Some(mut p) = stdout_pipe {
+                let _ = p.read_to_string(&mut s);
+            }
+            s
+        });
+        let h2 = sc.spawn(move || {
+            let mut s = String::new();
+            if let Some(mut p) = stderr_pipe {
+                let _ = p.read_to_string(&mut s);
+            }
+            s
+        });
+        (h1.join().unwrap_or_default(), h2.join().unwrap_or_default())
+    });
     let status = child.wait().map_err(|e| e.to_string())?;
     if status.success() {
         Ok(stdout.trim().to_string())

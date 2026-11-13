@@ -395,7 +395,17 @@ impl Store {
     }
 
     pub fn log_path(&self, id: &str) -> PathBuf {
-        self.dir.join("logs").join(format!("{}.log", id))
+        // Security: `id` can reach here from user-controlled SSE fallback
+        // (server.rs stream_agent_events). Reject anything outside the ID
+        // charset so `../` or absolute paths can never escape logs/ and turn
+        // the event stream into an arbitrary-file read.
+        let safe = !id.is_empty()
+            && id.len() <= 128
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+        let name = if safe { id } else { "invalid" };
+        self.dir.join("logs").join(format!("{}.log", name))
     }
 
     pub fn next_id(&mut self, prefix: &str) -> String {
@@ -596,6 +606,30 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_path_rejects_traversal() {
+        // 回归：SSE fallback 会把用户可控 id 直接传给 log_path，
+        // 路径穿越字符必须被拒，不能逃出 logs/ 目录。
+        let dir = std::env::temp_dir().join(format!("roamway-logpath-{}", now()));
+        let _ = fs::create_dir_all(&dir);
+        let store = Store::load(&dir);
+        let logs = dir.join("logs");
+        for bad in ["../../etc/passwd", "..", "a/b", "a\\b", "/abs", "", "x\0y"] {
+            let p = store.log_path(bad);
+            assert!(p.starts_with(&logs), "escaped logs dir for {:?}", bad);
+            assert_eq!(p.file_name().unwrap(), "invalid.log");
+        }
+        assert_eq!(
+            store.log_path("run_000001").file_name().unwrap(),
+            "run_000001.log"
+        );
+        assert_eq!(
+            store.log_path("ag_1a2b3c4d5e6f7890").file_name().unwrap(),
+            "ag_1a2b3c4d5e6f7890.log"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn iso_epoch_and_known() {

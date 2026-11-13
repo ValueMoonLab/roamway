@@ -258,10 +258,18 @@ impl ScheduleStore {
             f.write_all(s.as_bytes())?;
             f.sync_all()?;
             drop(f);
-            if p.exists() {
+            let backed_up = p.exists();
+            if backed_up {
                 fs::rename(&p, &bak)?;
             }
-            fs::rename(&tmp, &p)?;
+            if let Err(e) = fs::rename(&tmp, &p) {
+                // 关键窗口：旧文件已移到 .bak 而新文件落位失败。
+                // 不恢复的话 load() 会走迁移分支得到空 store，调度全丢。
+                if backed_up {
+                    let _ = fs::rename(&bak, &p);
+                }
+                return Err(e);
+            }
             Ok(())
         })();
         if let Err(e) = result {

@@ -334,6 +334,21 @@ pub fn origin_allowed(allow_origins: &[String], origin: Option<&str>) -> Option<
 }
 
 pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    // Atomic replace: write a sibling temp file, fsync, then rename over the
+    // target. A crash mid-write can no longer leave a truncated tokens.json /
+    // approvals.json — readers see either the old or the new file, never a
+    // half-written one. The temp name carries pid+seq so concurrent writers
+    // (CLI + daemon) never clobber each other's temp file.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_file_name(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "state".into()),
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -341,10 +356,17 @@ pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut f = opts.open(path)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    drop(f);
+    let result = (|| -> std::io::Result<()> {
+        let mut f = opts.open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

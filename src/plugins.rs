@@ -283,6 +283,26 @@ pub fn run_one(dir: &Path, plugin: &Plugin, hook: &str, payload: &Value) -> Resu
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = cmd.spawn().map_err(|e| format!("spawn: {}", e))?;
+    // Drain both pipes on background threads for the whole lifetime of the
+    // child: the try_wait loop below never reads them, so a plugin writing
+    // >64KB to stdout or stderr would fill the pipe buffer and block forever
+    // (parent waits for exit, child waits for a reader) until the timeout.
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let out_handle = thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(mut p) = stdout_pipe {
+            let _ = p.read_to_string(&mut s);
+        }
+        s
+    });
+    let err_handle = thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(mut p) = stderr_pipe {
+            let _ = p.read_to_string(&mut s);
+        }
+        s
+    });
     let line = serde_json::to_string(&json!({ "hook": hook, "payload": payload }))
         .map_err(|e| format!("json: {}", e))?;
     if let Some(mut stdin) = child.stdin.take() {
@@ -297,17 +317,22 @@ pub fn run_one(dir: &Path, plugin: &Plugin, hook: &str, payload: &Value) -> Resu
             Ok(None) => {
                 if Instant::now() >= deadline {
                     kill_child(&mut child);
+                    let _ = out_handle.join();
+                    let _ = err_handle.join();
                     return Err(format!("timeout after {}s", timeout));
                 }
                 thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(format!("wait: {}", e)),
+            Err(e) => {
+                kill_child(&mut child);
+                let _ = out_handle.join();
+                let _ = err_handle.join();
+                return Err(format!("wait: {}", e));
+            }
         }
     }
-    let mut out = String::new();
-    if let Some(mut stdout) = child.stdout.take() {
-        let _ = stdout.read_to_string(&mut out);
-    }
+    let out = out_handle.join().unwrap_or_default();
+    let _ = err_handle.join();
     let first = out.lines().next().unwrap_or("").trim().to_string();
     if first.is_empty() {
         return Err("plugin produced no output".into());
