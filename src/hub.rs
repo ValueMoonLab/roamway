@@ -97,9 +97,18 @@ pub fn valid_scope(scope: &str) -> bool {
 }
 
 pub fn load(dir: &Path) -> Option<Hub> {
-    std::fs::read(hub_path(dir))
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Hub>(&b).ok())
+    let bytes = match std::fs::read(hub_path(dir)) {
+        Ok(b) => b,
+        Err(_) => return None,
+    };
+    match serde_json::from_slice::<Hub>(&bytes) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            // 损坏的 hub.json 不能静默当作"无 hub"——否则 hooks 全失效且无告警
+            eprintln!("roamway: hub.json parse failed: {}", e);
+            None
+        }
+    }
 }
 
 pub fn save(dir: &Path, hub: &Hub) -> Result<(), String> {

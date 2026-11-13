@@ -212,23 +212,55 @@ pub fn which_in_path(bin: &str) -> bool {
     }
     let path = std::env::var("PATH").unwrap_or_default();
     let sep = if cfg!(windows) { ';' } else { ':' };
+    // Windows 可执行查找依赖 PATHEXT：裸名 `foo` 要试 foo.exe/foo.cmd/...
+    let exts: Vec<String> = if cfg!(windows) {
+        let pe = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into());
+        let mut v: Vec<String> = pe
+            .split(';')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
+        if !v.iter().any(|e| e == ".exe") {
+            v.push(".exe".into());
+        }
+        v
+    } else {
+        Vec::new()
+    };
     for dir in path.split(sep) {
         if dir.is_empty() {
             continue;
         }
-        let candidate = PathBuf::from(dir).join(bin);
-        if candidate.is_file() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(meta) = fs::metadata(&candidate) {
-                    if meta.permissions().mode() & 0o111 != 0 {
-                        return true;
-                    }
+        let base = PathBuf::from(dir).join(bin);
+        let mut candidates = vec![base.clone()];
+        if cfg!(windows) {
+            let has_ext = base
+                .extension()
+                .map(|e| {
+                    let e = format!(".{}", e.to_string_lossy().to_ascii_lowercase());
+                    exts.contains(&e)
+                })
+                .unwrap_or(false);
+            if !has_ext {
+                for ext in &exts {
+                    candidates.push(PathBuf::from(format!("{}{}", base.display(), ext)));
                 }
             }
-            #[cfg(not(unix))]
-            return true;
+        }
+        for candidate in candidates {
+            if candidate.is_file() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(meta) = fs::metadata(&candidate) {
+                        if meta.permissions().mode() & 0o111 != 0 {
+                            return true;
+                        }
+                    }
+                }
+                #[cfg(not(unix))]
+                return true;
+            }
         }
     }
     false

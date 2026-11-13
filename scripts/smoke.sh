@@ -6,7 +6,7 @@ PORT="${PORT:-18796}"
 TOK="smoke-$$"
 DIR="$(mktemp -d)"
 BASE="http://127.0.0.1:$PORT"
-fail() { echo "FAIL: $*"; kill "$PID" 2>/dev/null; rm -rf "$DIR"; exit 1; }
+fail() { echo "FAIL: $*"; kill "${PID:-}" 2>/dev/null; rm -rf "$DIR"; exit 1; }
 
 [ -x "$BIN" ] || fail "binary not found: $BIN (run cargo build --release first)"
 

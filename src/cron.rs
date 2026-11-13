@@ -37,15 +37,24 @@ pub fn parse_cron(expr: &str) -> Result<CronExpr, String> {
     if *weekday.last().unwrap_or(&false) {
         weekday[0] = true;
     }
+    let day_star = field_is_star(&day, 1, 31);
+    let weekday_star = field_is_star(&weekday, 0, 7);
     Ok(CronExpr {
         minute,
         hour,
         day,
         month,
         weekday,
-        day_star: parts[2].trim() == "*",
-        weekday_star: parts[4].trim() == "*",
+        day_star,
+        weekday_star,
     })
+}
+
+/// 语义上的 `*`：全范围位都置位（`*/1`、`1-31` 等写法与 `*` 等价）。
+/// cron 的 day/weekday 是 OR 语义，只有两者都为星号才退化为 AND，
+/// 仅字符串比较会漏掉等价写法导致触发日错误。
+fn field_is_star(bits: &[bool], min: u32, max: u32) -> bool {
+    (min..=max).all(|i| bits[i as usize])
 }
 
 fn parse_field(field: &str, min: u32, max: u32) -> Result<Vec<bool>, String> {
@@ -217,6 +226,31 @@ mod tests {
     fn parse_and_match_single_values() {
         let c = parse_cron("30 8 1 1 *").unwrap();
         let t = epoch(2023, 1, 1, 8, 30);
+        assert_eq!(c.next_after(t - 60, 0), Some(t));
+    }
+
+    #[test]
+    fn star_equivalents_are_semantic() {
+        // `*/1`、`1-31` 与 `*` 语义等价；仅字符串比较会误判 day_star=false，
+        // 使 `0 0 */1 * 1` 走 OR 分支变成每天触发（标准 cron 应为仅周一）。
+        for expr in ["0 0 * * 1", "0 0 */1 * 1", "0 0 1-31 * 1"] {
+            let c = parse_cron(expr).unwrap();
+            assert!(c.day_star, "day_star wrong for {}", expr);
+            assert!(!c.weekday_star);
+            // day 为星号时只按 weekday 过滤：2023-01-03 是周二，下一次应为 01-09 周一
+            let t = epoch(2023, 1, 3, 0, 0);
+            assert_eq!(
+                c.next_after(t - 60, 0),
+                Some(epoch(2023, 1, 9, 0, 0)),
+                "weekday-only semantics broken for {}",
+                expr
+            );
+        }
+        let c = parse_cron("0 0 * * */1").unwrap();
+        assert!(c.weekday_star);
+        assert!(c.day_star);
+        // 双星号：每天触发
+        let t = epoch(2023, 1, 3, 0, 0);
         assert_eq!(c.next_after(t - 60, 0), Some(t));
     }
 

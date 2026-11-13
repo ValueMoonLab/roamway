@@ -583,20 +583,11 @@ pub fn script_rm(app: &Arc<App>, name: &str) -> Result<usize, String> {
 }
 
 pub fn script_start(app: &Arc<App>, name: &str) -> Result<Script, String> {
-    let store = app.terms.lock().unwrap_or_else(|e| e.into_inner());
+    let mut store = app.terms.lock().unwrap_or_else(|e| e.into_inner());
     let s = store
         .script(name)
         .cloned()
         .ok_or_else(|| format!("no such script: {}", name))?;
-    drop(store);
-    {
-        let rts = app.term_rt.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(rt) = rts.get(&format!("script:{}", s.name)) {
-            if rt.alive() {
-                return Err(format!("script {} is already running", s.name));
-            }
-        }
-    }
     let dir = workspace_dir(&s.workspace)?;
     let mut cmd = if cfg!(windows) {
         let mut c = Command::new("cmd.exe");
@@ -608,13 +599,19 @@ pub fn script_start(app: &Arc<App>, name: &str) -> Result<Script, String> {
         c
     };
     cmd.current_dir(&dir);
+    // TOCTOU 修复：检查+spawn+insert 全程持 term_rt 锁，否则并发 script_start
+    // 都能通过 alive 检查，各自 spawn 后互相覆盖 map 项，泄漏子进程。
+    // 锁序统一 terms → term_rt（terms 锁上面已持有，Mutex 不可重入，不能再取）。
+    let mut rts = app.term_rt.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(rt) = rts.get(&format!("script:{}", s.name)) {
+        if rt.alive() {
+            return Err(format!("script {} is already running", s.name));
+        }
+    }
     let rt = spawn_runtime(cmd, DEFAULT_BUFFER_KB)?;
     let pid = rt.child.lock().map(|c| c.id()).ok();
-    app.term_rt
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .insert(format!("script:{}", s.name), rt);
-    let mut store = app.terms.lock().unwrap_or_else(|e| e.into_inner());
+    rts.insert(format!("script:{}", s.name), rt);
+    drop(rts);
     let out = if let Some(x) = store.script_mut(&s.name) {
         x.state = "running".into();
         x.pid = pid;

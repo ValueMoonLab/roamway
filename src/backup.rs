@@ -605,6 +605,18 @@ pub fn restore(data: &Path, from: &Path, force: bool) -> Result<RestoreResult, B
     // 逐文件校验：存在、bytes、sha256 三项必须全部匹配，任何一项不符都不写。
     let mut validated: Vec<(String, Vec<u8>)> = Vec::new();
     for f in &manifest.files {
+        // 安全：manifest 来自外部备份目录，name 不可信。拒绝穿越/绝对路径，
+        // 且只允许恢复白名单文件——否则 sha256 校验形同虚设（攻击者可自洽）。
+        let name_path = std::path::Path::new(&f.name);
+        let traverses = name_path
+            .components()
+            .any(|c| !matches!(c, std::path::Component::Normal(_)));
+        if traverses || !RESTORE_ORDER.contains(&f.name.as_str()) {
+            return Err(err(
+                1,
+                format!("restore: illegal file name in manifest: {}", f.name),
+            ));
+        }
         let p = from.join(&f.name);
         let bytes = fs::read(&p).map_err(|e| {
             err(

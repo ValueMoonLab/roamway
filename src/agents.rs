@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -40,18 +39,14 @@ pub struct Agent {
     pub worktree_mode: Option<String>,
 }
 
-static AGENT_SEQ: AtomicU64 = AtomicU64::new(0);
-
 pub fn gen_agent_id() -> String {
     // 64bit 随机后缀（原 32bit seed 在高频建 agent 时可碰撞，与 tok_/apr_ 同源修复）
     format!("ag_{}", crate::auth::random_hex(8))
 }
 
 pub fn gen_session_id() -> String {
-    let t = now() as u64;
-    let n = AGENT_SEQ.fetch_add(1, Ordering::SeqCst);
-    let v = t.rotate_left(17) ^ n.wrapping_mul(0x9e37_79b9);
-    format!("claude_{:016x}", v)
+    // 与 gen_agent_id 同源：OS CSPRNG，不再用时间×弱常数混合（可预测且高频可碰撞）
+    format!("claude_{}", crate::auth::random_hex(8))
 }
 
 pub fn title_from_prompt(prompt: &str) -> String {
@@ -502,7 +497,7 @@ pub fn update_agent_meta(
 }
 
 pub fn archive_agent(app: &Arc<App>, agent_id: &str, keep_worktree: bool) -> Result<(), String> {
-    let (cleanup, keep_branch, data_dir, recorded) = {
+    let (cleanup, keep_branch, data_dir, recorded, prev_state, prev_updated) = {
         let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
         let a = st
             .state
@@ -526,12 +521,33 @@ pub fn archive_agent(app: &Arc<App>, agent_id: &str, keep_worktree: bool) -> Res
             a.worktree_mode.as_deref() == Some("checkout-branch"),
             st.dir.clone(),
             recorded,
+            a.state.clone(),
+            a.updated_at,
         )
     };
+    // TOCTOU 修复：先持锁标记 archived 再做文件清理。否则并发 delete 可在
+    // 清理窗口内删掉 agent，导致 worktree 泄漏或末尾 unwrap panic。
+    {
+        let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+        let a = st
+            .state
+            .agents
+            .iter_mut()
+            .find(|a| a.id == agent_id)
+            .ok_or_else(|| "no such agent".to_string())?;
+        a.state = "archived".into();
+        a.updated_at = now();
+        st.save();
+    }
     if cleanup {
         let (branch, base_path, workspace) = {
             let st = app.store.lock().unwrap_or_else(|e| e.into_inner());
-            let a = st.state.agents.iter().find(|a| a.id == agent_id).unwrap();
+            let a = st
+                .state
+                .agents
+                .iter()
+                .find(|a| a.id == agent_id)
+                .ok_or_else(|| "no such agent".to_string())?;
             (
                 a.branch.clone().unwrap_or_default(),
                 a.base_path.clone().unwrap_or_default(),
@@ -553,19 +569,16 @@ pub fn archive_agent(app: &Arc<App>, agent_id: &str, keep_worktree: bool) -> Res
             crate::workspaces::worktree_remove(&base_path, &path, &branch)
         };
         if let Err(e) = result {
+            // 清理失败：回滚状态，保持与修复前一致的语义（报错且不 archived）
+            let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(a) = st.state.agents.iter_mut().find(|a| a.id == agent_id) {
+                a.state = prev_state;
+                a.updated_at = prev_updated;
+                st.save();
+            }
             return Err(format!("archive failed: {}", e));
         }
     }
-    let mut st = app.store.lock().unwrap_or_else(|e| e.into_inner());
-    let a = st
-        .state
-        .agents
-        .iter_mut()
-        .find(|a| a.id == agent_id)
-        .ok_or_else(|| "no such agent".to_string())?;
-    a.state = "archived".into();
-    a.updated_at = now();
-    st.save();
     Ok(())
 }
 

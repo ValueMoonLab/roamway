@@ -214,7 +214,7 @@ impl Registry {
             return Err(format!("host '{}' already exists", name));
         }
         let ep = endpoint_normalize(endpoint);
-        if !ep.starts_with("http://") {
+        if !ep.starts_with("http://") && !ep.starts_with("https://") {
             return Err(format!("invalid endpoint: {}", endpoint));
         }
         self.hosts.push(Host {

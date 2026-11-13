@@ -32,13 +32,20 @@ pub fn parse_iso_to_ts(s: &str) -> Option<i64> {
     let y: i64 = it.next()?.parse().ok()?;
     let m: u32 = it.next()?.parse().ok()?;
     let d: u32 = it.next()?.parse().ok()?;
+    // 范围校验：无效日期（13月/32日）不能静默算成错误时间戳
+    if !(1970..=2100).contains(&y) || !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
     let days = days_from_civil(y, m, d);
     let secs = if let Some(rest) = s.split('T').nth(1) {
         let rest = rest.trim_end_matches('Z');
         let mut parts = rest.split(':');
-        let h: i64 = parts.next().unwrap_or("0").parse().unwrap_or(0);
-        let min: i64 = parts.next().unwrap_or("0").parse().unwrap_or(0);
-        let sec: i64 = parts.next().unwrap_or("0").parse().unwrap_or(0);
+        let h: i64 = parts.next().unwrap_or("0").parse().ok()?;
+        let min: i64 = parts.next().unwrap_or("0").parse().ok()?;
+        let sec: i64 = parts.next().unwrap_or("0").parse().ok()?;
+        if !(0..=23).contains(&h) || !(0..=59).contains(&min) || !(0..=60).contains(&sec) {
+            return None;
+        }
         h * 3600 + min * 60 + sec
     } else {
         0
@@ -361,5 +368,24 @@ mod tests {
         assert!(joined.contains("tokens: in=7 out=8 total=15"));
         assert!(joined.contains("retried: yes (attempts=1)"));
         assert!(joined.contains("duration: 5s"));
+    }
+
+    #[test]
+    fn parse_iso_rejects_out_of_range() {
+        // 无效日期/时间不能静默算成错误时间戳
+        for bad in [
+            "2026-13-01T00:00:00Z",
+            "2026-01-32T00:00:00Z",
+            "2026-00-10T00:00:00Z",
+            "1899-01-01T00:00:00Z",
+            "2026-01-01T24:00:00Z",
+            "2026-01-01T12:60:00Z",
+            "2026-01-01T12:00:61Z",
+            "2026-01-01Tab:cd:efZ",
+        ] {
+            assert!(parse_iso_to_ts(bad).is_none(), "accepted invalid {:?}", bad);
+        }
+        assert!(parse_iso_to_ts("2026-11-09T00:00:00Z").is_some());
+        assert!(parse_iso_to_ts("2026-11-09").is_some());
     }
 }

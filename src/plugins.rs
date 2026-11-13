@@ -52,6 +52,10 @@ pub fn plugins_dir(dir: &Path) -> PathBuf {
 }
 
 pub fn plugin_dir(dir: &Path, name: &str) -> PathBuf {
+    // 安全：name 可能来自注册表/CLI，拒绝穿越字符，防止 remove_dir_all 等
+    // 文件操作逃出 plugins/ 目录。
+    let safe = valid_name(name);
+    let name = if safe { name } else { "invalid" };
     plugins_dir(dir).join(name)
 }
 

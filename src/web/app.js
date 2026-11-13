@@ -147,6 +147,7 @@
   }
 
   /* ---------- Agents 列表 ---------- */
+  var agentsTimer = null;
   function agentsPage() {
     var root = el('div');
     var head = el('div', 'spread');
@@ -219,7 +220,8 @@
     search.addEventListener('input', draw);
     status.addEventListener('change', draw);
     load();
-    setInterval(load, 30000);
+    if (agentsTimer) clearInterval(agentsTimer);
+    agentsTimer = setInterval(load, 30000);
     return root;
   }
 
@@ -775,6 +777,9 @@
       return;
     }
     renderNav();
+    // 页面级定时器统一清理：离开页面后不再发无效请求（agents 30s / terminals 2s）
+    if (agentsTimer) { clearInterval(agentsTimer); agentsTimer = null; }
+    if (termTimer) { clearInterval(termTimer); termTimer = null; }
     clear(view());
     var route = parseRoute();
     if (route.page === 'agents' && route.id === 'new') view().appendChild(canWrite(state.scopes) ? agentNewPage() : agentsPage());

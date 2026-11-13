@@ -217,6 +217,11 @@
     refreshAll();
   }
 
+  // 局部请求失败不拖垮整个刷新（保留旧数据）；unauthorized 必须冒泡到外层清 token
+  function swallowUnlessUnauthorized(err) {
+    if (err && err.message === 'unauthorized') throw err;
+  }
+
   function refreshAll() {
     if (state.inflight) return;
     state.inflight = true;
@@ -224,10 +229,10 @@
       state.health = h;
       state.connected = true;
       return Promise.all([
-        getJson('/v1/runs?limit=20').then(function (d) { state.runs = (d && d.runs) || []; }),
-        getJson('/v1/agents?limit=20').then(function (d) { state.agents = (d && d.agents) || []; }),
-        getJson('/v1/jobs').then(function (d) { state.jobs = (d && d.jobs) || []; }),
-        getText('/metrics').then(function (t) { state.metricsText = t || ''; })
+        getJson('/v1/runs?limit=20').then(function (d) { state.runs = (d && d.runs) || []; }, swallowUnlessUnauthorized),
+        getJson('/v1/agents?limit=20').then(function (d) { state.agents = (d && d.agents) || []; }, swallowUnlessUnauthorized),
+        getJson('/v1/jobs').then(function (d) { state.jobs = (d && d.jobs) || []; }, swallowUnlessUnauthorized),
+        getText('/metrics').then(function (t) { state.metricsText = t || ''; }, swallowUnlessUnauthorized)
       ]);
     }).then(function () {
       state.lastRefresh = new Date();
